@@ -3,8 +3,8 @@
 Reusable, domain-agnostic runtime for tool-using LLM agents.
 
 `agent-core` provides the orchestration layer that applications can compose with
-their own prompts, tools, policy rules and domain memory. It intentionally does
-not ship pentest-specific prompts, checklists or C2 integrations.
+their own prompts, tools, policy rules and domain memory. It intentionally keeps
+domain-specific prompts, checklists and integrations outside the core package.
 
 ## Features
 
@@ -27,9 +27,42 @@ python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git
 For local development:
 
 ```bash
-python -m pip install -e ".[dev]"
-python -m pytest
+python -m venv .venv
+.venv/bin/python -m pip install -e ".[dev]"
+.venv/bin/python -m pytest
 ```
+
+## Quickstart
+
+The repository includes a minimal working example with two small tools:
+`get_current_time` and `echo`.
+
+```bash
+python -m venv .venv
+.venv/bin/python -m pip install -e .
+cp .env.example .env
+```
+
+Set `OPENAI_API_KEY` in `.env`, then run:
+
+```bash
+.venv/bin/python examples/quickstart.py
+```
+
+Use a custom one-shot prompt:
+
+```bash
+.venv/bin/python examples/quickstart.py "Echo hello through the echo tool."
+```
+
+Or run a small REPL:
+
+```bash
+.venv/bin/python examples/quickstart.py --interactive
+```
+
+See [examples/README.md](examples/README.md) for the pending tool result /
+resume example.
 
 ## Public API
 

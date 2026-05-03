@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 venv/
 env/
+.env
+.agent-core-demo/
 
 build/
 dist/
