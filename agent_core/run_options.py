@@ -40,7 +40,7 @@ class RunOptions:
     def investigate(cls, **overrides: Any) -> "RunOptions":
         defaults: dict[str, Any] = {
             "mode": "investigate",
-            "max_iterations": 4,
+            "max_iterations": 10,
             "max_tool_calls": 8,
             "max_no_progress_iterations": 2,
             "require_initial_plan": True,
@@ -53,7 +53,7 @@ class RunOptions:
     def deep_investigate(cls, **overrides: Any) -> "RunOptions":
         defaults: dict[str, Any] = {
             "mode": "deep_investigate",
-            "max_iterations": 8,
+            "max_iterations": 20,
             "max_tool_calls": 20,
             "max_no_progress_iterations": 3,
             "require_initial_plan": True,

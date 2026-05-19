@@ -19,13 +19,13 @@ def test_run_options_defaults_and_presets() -> None:
 
     investigate = RunOptions.investigate()
     assert investigate.mode == "investigate"
-    assert investigate.max_iterations > 1
+    assert investigate.max_iterations == 10
     assert investigate.max_tool_calls > 0
 
     deep = RunOptions.deep_investigate()
     assert deep.mode == "deep_investigate"
     assert deep.require_final_critique is True
-    assert deep.max_iterations > investigate.max_iterations
+    assert deep.max_iterations == 20
 
 
 def test_run_options_reject_invalid_budgets_and_confidence() -> None:
