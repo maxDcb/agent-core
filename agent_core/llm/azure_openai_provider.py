@@ -16,6 +16,7 @@ from openai import (
 from agent_core.logging_utils import get_logger
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
+from agent_core.llm.openai_compat import create_chat_completion_with_reasoning_fallback
 
 logger = get_logger(__name__)
 
@@ -172,7 +173,12 @@ class AzureOpenAIProvider:
                     request["max_tokens"] = options.max_output_tokens
                 if options.reasoning_effort:
                     request["reasoning_effort"] = options.reasoning_effort
-            response = client.chat.completions.create(**request)
+            response = create_chat_completion_with_reasoning_fallback(
+                completions=client.chat.completions,
+                request=request,
+                provider_name="Azure OpenAI",
+                logger=logger,
+            )
         except AuthenticationError as exc:
             logger.exception("Azure OpenAI authentication failed")
             raise LLMProviderError(

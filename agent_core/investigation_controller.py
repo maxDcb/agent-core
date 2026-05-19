@@ -106,7 +106,18 @@ class InvestigationController:
     ) -> AgentTurnResult:
         state = InvestigationState.create_template(objective=user_input)
         if options.require_initial_plan:
-            state = self._synthesize_initial_plan(user_input=user_input, state=state, options=options)
+            try:
+                state = self._synthesize_initial_plan(user_input=user_input, state=state, options=options)
+            except LLMProviderError as exc:
+                failure_result = self.handle_provider_failure(error=exc, user_input=user_input, turn_index=turn_index)
+                return self._attach_metadata(
+                    failure_result,
+                    options=options,
+                    iterations_used=0,
+                    tool_calls_used=0,
+                    stop_reason="provider_failure",
+                    state=state,
+                )
 
         return self._run_loop(
             user_input=user_input,
