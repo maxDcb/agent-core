@@ -67,6 +67,39 @@ class ProviderFailureHandler(Protocol):
         ...
 
 
+class TraceRecorder(Protocol):
+    def __call__(
+        self,
+        *,
+        event_type: str,
+        summary: str,
+        iteration: int | None = None,
+        payload: dict[str, Any] | None = None,
+        related_tool_call_id: str | None = None,
+    ) -> None:
+        ...
+
+
+def with_investigation_guidance(messages: list[LLMMessage], *, options: RunOptions) -> list[LLMMessage]:
+    if any(
+        message.role == "system" and message.content.startswith(f"Run mode: {options.mode}.")
+        for message in messages
+    ):
+        return list(messages)
+
+    guidance = LLMMessage(
+        role="system",
+        content=(
+            f"Run mode: {options.mode}. Work within the bounded investigation loop. "
+            "Use tools only when useful and in scope. Do not expose chain-of-thought; "
+            "final responses should summarize auditable findings and uncertainty."
+        ),
+    )
+    if messages and messages[-1].role == "user":
+        return [*messages[:-1], guidance, messages[-1]]
+    return [*messages, guidance]
+
+
 class InvestigationController:
     """Bounded, domain-agnostic investigation loop.
 
@@ -85,6 +118,7 @@ class InvestigationController:
         persist_conversation_turn_once: ConversationPersister,
         refresh_memory_after_turn: MemoryRefresher,
         handle_provider_failure: ProviderFailureHandler,
+        record_event: TraceRecorder | None = None,
     ) -> None:
         self.settings = settings
         self.structured_synthesizer = structured_synthesizer
@@ -93,6 +127,26 @@ class InvestigationController:
         self.persist_conversation_turn_once = persist_conversation_turn_once
         self.refresh_memory_after_turn = refresh_memory_after_turn
         self.handle_provider_failure = handle_provider_failure
+        self.record_event = record_event
+
+    def _record_event(
+        self,
+        *,
+        event_type: str,
+        summary: str,
+        iteration: int | None = None,
+        payload: dict[str, Any] | None = None,
+        related_tool_call_id: str | None = None,
+    ) -> None:
+        if self.record_event is None:
+            return
+        self.record_event(
+            event_type=event_type,
+            summary=summary,
+            iteration=iteration,
+            payload=payload,
+            related_tool_call_id=related_tool_call_id,
+        )
 
     def run(
         self,
@@ -106,9 +160,19 @@ class InvestigationController:
     ) -> AgentTurnResult:
         state = InvestigationState.create_template(objective=user_input)
         if options.require_initial_plan:
+            self._record_event(
+                event_type="initial_plan_started",
+                summary="Initial investigation plan synthesis started",
+                payload={"mode": options.mode},
+            )
             try:
                 state = self._synthesize_initial_plan(user_input=user_input, state=state, options=options)
             except LLMProviderError as exc:
+                self._record_event(
+                    event_type="llm_provider_failure",
+                    summary="Initial plan provider failure handled",
+                    payload={"kind": exc.kind},
+                )
                 failure_result = self.handle_provider_failure(error=exc, user_input=user_input, turn_index=turn_index)
                 return self._attach_metadata(
                     failure_result,
@@ -118,12 +182,17 @@ class InvestigationController:
                     stop_reason="provider_failure",
                     state=state,
                 )
+            self._record_event(
+                event_type="initial_plan_created",
+                summary="Initial investigation plan created",
+                payload={"investigation_state": state.compact_summary()},
+            )
 
         return self._run_loop(
             user_input=user_input,
             session_id=session_id,
             context=context,
-            messages=self._with_investigation_guidance(messages, options=options),
+            messages=with_investigation_guidance(messages, options=options),
             turn_index=turn_index,
             options=options,
             state=state,
@@ -195,12 +264,28 @@ class InvestigationController:
     ) -> AgentTurnResult:
         while iterations_used < options.max_iterations:
             iterations_used += 1
+            self._record_event(
+                event_type="investigation_iteration_started",
+                summary="Investigation iteration started",
+                iteration=iterations_used,
+                payload={
+                    "tool_calls_used": tool_calls_used,
+                    "max_iterations": options.max_iterations,
+                    "max_tool_calls": options.max_tool_calls,
+                },
+            )
             try:
                 llm_response = self.call_model_once(
                     messages=messages,
                     options=self._call_options(options=options, target="assistant_step"),
                 )
             except LLMProviderError as exc:
+                self._record_event(
+                    event_type="llm_provider_failure",
+                    summary="Assistant step provider failure handled",
+                    iteration=iterations_used,
+                    payload={"kind": exc.kind},
+                )
                 failure_result = self.handle_provider_failure(error=exc, user_input=user_input, turn_index=turn_index)
                 return self._attach_metadata(
                     failure_result,
@@ -217,8 +302,27 @@ class InvestigationController:
                 tool_calls=list(llm_response.tool_calls),
             )
             messages.append(assistant_message)
+            self._record_event(
+                event_type="assistant_step_completed",
+                summary="Assistant investigation step completed",
+                iteration=iterations_used,
+                payload={
+                    "content_length": len(llm_response.content),
+                    "tool_call_count": len(llm_response.tool_calls),
+                    "tool_calls": [
+                        {"id": tool_call.id, "name": tool_call.name}
+                        for tool_call in llm_response.tool_calls
+                    ],
+                },
+            )
 
             if not llm_response.tool_calls:
+                self._record_event(
+                    event_type="final_draft_received",
+                    summary="Assistant produced a final draft",
+                    iteration=iterations_used,
+                    payload={"content_length": len(llm_response.content)},
+                )
                 return self._handle_final_draft(
                     user_input=user_input,
                     session_id=session_id,
@@ -266,6 +370,18 @@ class InvestigationController:
             messages = tool_step.messages
             exchange_index = tool_step.exchange_index
             tool_calls_used = tool_step.tool_calls_used
+            self._record_event(
+                event_type="tool_step_completed",
+                summary="Investigation tool step completed",
+                iteration=iterations_used,
+                payload={
+                    "tool_names": list(tool_step.tool_names),
+                    "tool_statuses": list(tool_step.tool_statuses),
+                    "tool_calls_used": tool_calls_used,
+                    "budget_exhausted": tool_step.budget_exhausted,
+                    "pending": tool_step.pending_result is not None,
+                },
+            )
 
             if tool_step.pending_result is not None:
                 return self._attach_metadata(
@@ -330,6 +446,16 @@ class InvestigationController:
             no_progress_iterations += 1
         else:
             no_progress_iterations = 0
+        self._record_event(
+            event_type="reflection_completed",
+            summary="Investigation reflection completed",
+            iteration=iterations_used,
+            payload={
+                "reflection": reflection.to_dict(),
+                "no_progress_iterations": no_progress_iterations,
+                "investigation_state": state.compact_summary(),
+            },
+        )
 
         decision = self._synthesize_decision(
             state=state,
@@ -337,6 +463,12 @@ class InvestigationController:
             options=options,
             iterations_used=iterations_used,
             tool_calls_used=tool_step.tool_calls_used,
+        )
+        self._record_event(
+            event_type="decision_completed",
+            summary="Investigation decision completed",
+            iteration=iterations_used,
+            payload={"decision": decision.to_dict()},
         )
 
         if decision.kind == "ask_user":
@@ -445,7 +577,19 @@ class InvestigationController:
                 stop_reason="final",
             )
 
+        self._record_event(
+            event_type="final_critique_started",
+            summary="Final critique synthesis started",
+            iteration=iterations_used,
+            payload={"draft_length": len(final_draft)},
+        )
         critique = self._synthesize_final_critique(state=state, final_draft=final_draft, options=options)
+        self._record_event(
+            event_type="final_critique_completed",
+            summary="Final critique completed",
+            iteration=iterations_used,
+            payload={"critique": critique.to_dict()},
+        )
         if critique.approved:
             return self._complete_turn(
                 user_input=user_input,
@@ -501,6 +645,16 @@ class InvestigationController:
         stop_reason: str,
     ) -> AgentTurnResult:
         state.stop_reason = stop_reason
+        self._record_event(
+            event_type="investigation_completed",
+            summary="Investigation completed",
+            payload={
+                "stop_reason": stop_reason,
+                "iterations_used": iterations_used,
+                "tool_calls_used": tool_calls_used,
+                "investigation_state": state.compact_summary(),
+            },
+        )
         self.persist_conversation_turn_once(
             turn_index=turn_index,
             user_input=user_input,
@@ -668,17 +822,7 @@ class InvestigationController:
         return "\n".join(lines)
 
     def _with_investigation_guidance(self, messages: list[LLMMessage], *, options: RunOptions) -> list[LLMMessage]:
-        guidance = LLMMessage(
-            role="system",
-            content=(
-                f"Run mode: {options.mode}. Work within the bounded investigation loop. "
-                "Use tools only when useful and in scope. Do not expose chain-of-thought; "
-                "final responses should summarize auditable findings and uncertainty."
-            ),
-        )
-        if messages and messages[-1].role == "user":
-            return [*messages[:-1], guidance, messages[-1]]
-        return [*messages, guidance]
+        return with_investigation_guidance(messages, options=options)
 
     def _call_options(self, *, options: RunOptions, target: str) -> LLMCallOptions:
         return LLMCallOptions(

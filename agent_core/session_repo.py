@@ -8,6 +8,7 @@ from agent_core.logging_utils import get_logger
 from agent_core.memory.context_block import ContextBlock
 from agent_core.memory.session_summary import SessionSummary
 from agent_core.memory.task_state import TaskState
+from agent_core.run_trace import RunTrace
 from agent_core.types import SessionState, build_empty_session_state
 
 logger = get_logger(__name__)
@@ -19,12 +20,14 @@ class SessionRepository:
         self.default_session_file.parent.mkdir(parents=True, exist_ok=True)
         self.session_directory = self.default_session_file.parent
         self.session_directory.mkdir(parents=True, exist_ok=True)
+        self.trace_directory = self.session_directory / "traces"
         self.storage_backend = "json"
         logger.debug(
             "Session repository ready",
             extra={
                 "default_session_file": str(self.default_session_file),
                 "session_directory": str(self.session_directory),
+                "trace_directory": str(self.trace_directory),
             },
         )
 
@@ -73,6 +76,61 @@ class SessionRepository:
         with temp_file.open("w", encoding="utf-8") as fh:
             json.dump(state, fh, indent=2, ensure_ascii=False)
         temp_file.replace(session_file)
+
+    def save_run_trace(self, session_id: str, trace_payload: dict[str, object]) -> None:
+        run_id = trace_payload.get("run_id")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise ValueError("Run trace payload must include a non-empty run_id")
+
+        trace_file = self._resolve_trace_file(session_id=session_id, run_id=run_id)
+        trace_file.parent.mkdir(parents=True, exist_ok=True)
+        temp_file = trace_file.with_suffix(f"{trace_file.suffix}.tmp")
+        logger.trace(
+            "Saving run trace",
+            extra={"trace_file": str(trace_file), "session_id": session_id, "run_id": run_id},
+        )
+        with temp_file.open("w", encoding="utf-8") as fh:
+            json.dump(trace_payload, fh, indent=2, ensure_ascii=False)
+        temp_file.replace(trace_file)
+
+    def load_run_trace(self, session_id: str, run_id: str) -> dict[str, object] | None:
+        trace_file = self._resolve_trace_file(session_id=session_id, run_id=run_id)
+        if not trace_file.exists():
+            return None
+        try:
+            with trace_file.open("r", encoding="utf-8") as fh:
+                payload = json.load(fh)
+        except json.JSONDecodeError:
+            backup_path = self._quarantine_corrupt_file(trace_file)
+            logger.error(
+                "Run trace file is corrupt; quarantined",
+                extra={"trace_file": str(trace_file), "backup_path": str(backup_path)},
+            )
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def list_run_traces(self, session_id: str) -> list[dict[str, object]]:
+        trace_dir = self._resolve_trace_directory(session_id)
+        if not trace_dir.exists():
+            return []
+
+        summaries: list[dict[str, object]] = []
+        for trace_file in trace_dir.glob("*.json"):
+            try:
+                with trace_file.open("r", encoding="utf-8") as fh:
+                    payload = json.load(fh)
+            except json.JSONDecodeError:
+                logger.warning("Skipping corrupt run trace in list operation", extra={"trace_file": str(trace_file)})
+                continue
+            trace = RunTrace.from_any(payload)
+            if trace is not None:
+                summaries.append(trace.to_summary_dict())
+
+        return sorted(
+            summaries,
+            key=lambda item: str(item.get("started_at") or ""),
+            reverse=True,
+        )
 
     def _normalize_state(self, state: object) -> SessionState:
         normalized = build_empty_session_state(storage_backend=self.storage_backend)
@@ -136,6 +194,12 @@ class SessionRepository:
         if session_id == "default":
             return self.default_session_file
         return self.session_directory / f"{self._sanitize_session_id(session_id)}.json"
+
+    def _resolve_trace_directory(self, session_id: str) -> Path:
+        return self.trace_directory / self._sanitize_session_id(session_id)
+
+    def _resolve_trace_file(self, *, session_id: str, run_id: str) -> Path:
+        return self._resolve_trace_directory(session_id) / f"{self._sanitize_session_id(run_id)}.json"
 
     def _sanitize_session_id(self, session_id: str) -> str:
         sanitized = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in session_id).strip("._")

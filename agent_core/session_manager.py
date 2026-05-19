@@ -7,6 +7,7 @@ from agent_core.memory.context_block import ContextBlock
 from agent_core.memory.history_compactor import CompactionPolicy, HistoryCompactor
 from agent_core.memory.session_summary import SessionSummary
 from agent_core.memory.task_state import TaskState
+from agent_core.run_trace import RunTrace
 from agent_core.session_repo import SessionRepository
 from agent_core.memory.thread_state import ThreadState
 from agent_core.types import SESSION_SCHEMA_VERSION, SessionState, build_empty_session_state, utc_now_iso
@@ -156,6 +157,18 @@ class SessionManager:
             storage_backend=self.repo.storage_backend,
         )
         self._save()
+
+    def save_run_trace(self, trace: RunTrace | dict[str, object]) -> None:
+        payload = trace.to_dict() if isinstance(trace, RunTrace) else dict(trace)
+        session_id = payload.get("session_id")
+        target_session_id = session_id if isinstance(session_id, str) and session_id else self.session_id
+        self.repo.save_run_trace(target_session_id, payload)
+
+    def load_run_trace(self, run_id: str) -> dict[str, object] | None:
+        return self.repo.load_run_trace(self.session_id, run_id)
+
+    def list_run_traces(self) -> list[dict[str, object]]:
+        return self.repo.list_run_traces(self.session_id)
 
     def _save(self) -> None:
         # Session metadata is maintained centrally here so callers do not need

@@ -6,6 +6,7 @@ from agent_core.investigation_models import FinalCritique, InvestigationDecision
 from agent_core.investigation_state import EvidenceItem, Hypothesis, InvestigationState
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.policy_engine import PolicyEngine
+from agent_core.run_trace import ContextBudget, PromptBlock, PromptSnapshot, RunTrace, TraceEvent
 from agent_core.run_options import AgentRunMode, RunOptions
 from agent_core.session_manager import SessionManager
 from agent_core.session_repo import SessionRepository
@@ -29,10 +30,15 @@ __all__ = [
     "InvestigationDecision",
     "InvestigationState",
     "PolicyEngine",
+    "ContextBudget",
+    "PromptBlock",
+    "PromptSnapshot",
+    "RunTrace",
     "RunOptions",
     "SessionManager",
     "SessionRepository",
     "StepReflection",
+    "TraceEvent",
     "ToolRegistry",
     "AgentTurnResult",
     "ToolResult",
