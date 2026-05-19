@@ -14,8 +14,9 @@ from openai import (
 )
 
 from agent_core.logging_utils import get_logger
-from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
+from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
+from agent_core.llm.openai_compat import create_chat_completion_with_reasoning_fallback
 
 logger = get_logger(__name__)
 
@@ -34,6 +35,7 @@ class OpenAIProvider:
         messages: list[LLMMessage],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> str:
         # This method is meant for internal, non-agentic completions such as prompt summarization,
         # working-memory synthesis, or report condensation. It does not expose any tools.
@@ -42,6 +44,7 @@ class OpenAIProvider:
             model=model,
             temperature=temperature,
             tools=None,
+            options=options,
         )
         message = response.choices[0].message
         logger.debug(
@@ -57,6 +60,7 @@ class OpenAIProvider:
         tools: list[LLMToolDefinition],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
         # This method is the main assistant path. It allows the model to request tools and is used
         # by the interactive runtime loop in the orchestrator.
@@ -65,6 +69,7 @@ class OpenAIProvider:
             model=model,
             temperature=temperature,
             tools=tools,
+            options=options,
         )
         message = response.choices[0].message
         tool_calls: list[LLMToolCall] = []
@@ -92,6 +97,7 @@ class OpenAIProvider:
         model: str,
         temperature: float,
         tools: list[LLMToolDefinition] | None,
+        options: LLMCallOptions | None = None,
     ):
         if not self.api_key_configured:
             raise LLMProviderError(
@@ -115,7 +121,19 @@ class OpenAIProvider:
                 request["tools"] = [self._to_openai_tool(tool) for tool in tools]
                 request["tool_choice"] = "auto"
                 request["parallel_tool_calls"] = False
-            response = client.chat.completions.create(**request)
+            if options is not None:
+                if options.response_format:
+                    request["response_format"] = options.response_format
+                if options.max_output_tokens is not None:
+                    request["max_tokens"] = options.max_output_tokens
+                if options.reasoning_effort:
+                    request["reasoning_effort"] = options.reasoning_effort
+            response = create_chat_completion_with_reasoning_fallback(
+                completions=client.chat.completions,
+                request=request,
+                provider_name="OpenAI",
+                logger=logger,
+            )
         except AuthenticationError as exc:
             logger.exception("OpenAI authentication failed")
             raise LLMProviderError(

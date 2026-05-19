@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+from inspect import Parameter, signature
 from typing import Any
 
 from agent_core.domain_hooks import DomainHooks
 from agent_core.execution_context import ExecutionContext
+from agent_core.investigation_controller import InvestigationController
+from agent_core.investigation_state import InvestigationState
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.memory.context_block import ContextBlock, estimate_token_count
 from agent_core.memory.session_summary import SessionSummary
@@ -17,12 +20,14 @@ from agent_core.memory.thread_state import (
 )
 from agent_core.policy_engine import PolicyEngine
 from agent_core.prompt_builder import PromptBuilder
+from agent_core.run_options import RunOptions
 from agent_core.session_manager import SessionManager
 from agent_core.settings import CoreSettings
 from agent_core.structured_synthesizer import StructuredSynthesisRequest, StructuredSynthesizer
 from agent_core.tool_registry import ToolRegistry
+from agent_core.turn_steps import PendingResumeState, ToolExecutionStepResult
 from agent_core.types import AgentTurnResult, ToolExecutionStatus
-from agent_core.llm.base import BaseLLMProvider, LLMMessage
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage
 from agent_core.llm.errors import LLMProviderError
 
 logger = get_logger("core.orchestrator")
@@ -292,7 +297,7 @@ class AgentOrchestrator:
             return []
         return overflow_blocks[marker_index + 1 :]
 
-    def _persist_conversation_turn(self, *, turn_index: int, user_input: str, assistant_content: str) -> None:
+    def _persist_conversation_turn_once(self, *, turn_index: int, user_input: str, assistant_content: str) -> None:
         # The provider still receives flat messages, but persisted history now
         # stores one whole user/assistant turn as a single atomic block.
         conversation_block = create_conversation_turn_block(
@@ -302,7 +307,7 @@ class AgentOrchestrator:
         )
         self.session_manager.append_context_block(conversation_block)
 
-    def _persist_tool_exchange(
+    def _persist_tool_exchange_once(
         self,
         *,
         turn_index: int,
@@ -317,6 +322,28 @@ class AgentOrchestrator:
             tool_messages=[message.to_history_dict() for message in tool_messages],
         )
         self.session_manager.append_context_block(tool_exchange_block)
+
+    def _persist_conversation_turn(self, *, turn_index: int, user_input: str, assistant_content: str) -> None:
+        self._persist_conversation_turn_once(
+            turn_index=turn_index,
+            user_input=user_input,
+            assistant_content=assistant_content,
+        )
+
+    def _persist_tool_exchange(
+        self,
+        *,
+        turn_index: int,
+        exchange_index: int,
+        assistant_message: LLMMessage,
+        tool_messages: list[LLMMessage],
+    ) -> None:
+        self._persist_tool_exchange_once(
+            turn_index=turn_index,
+            exchange_index=exchange_index,
+            assistant_message=assistant_message,
+            tool_messages=tool_messages,
+        )
 
     def _handle_provider_failure(self, *, error: LLMProviderError, user_input: str, turn_index: int) -> AgentTurnResult:
         logger.error(
@@ -355,32 +382,41 @@ class AgentOrchestrator:
         tool_name: str,
         arguments: dict[str, Any],
         result_metadata: dict[str, Any],
+        tool_messages: list[LLMMessage] | None = None,
+        pending_metadata_extra: dict[str, Any] | None = None,
     ) -> None:
-        self.session_manager.set_meta_value(
-            self.PENDING_TURN_META_KEY,
-            {
-                "pending_id": pending_id,
-                "user_input": user_input,
-                "messages": [message.to_history_dict() for message in messages],
-                "turn_index": turn_index,
-                "exchange_index": exchange_index,
-                "tool_calls_used": tool_calls_used,
-                "assistant_message": assistant_message.to_history_dict(),
-                "tool_call_id": tool_call_id,
-                "tool_name": tool_name,
-                "arguments": arguments,
-                "metadata": result_metadata,
-            },
-        )
+        payload = {
+            "pending_id": pending_id,
+            "user_input": user_input,
+            "messages": [message.to_history_dict() for message in messages],
+            "turn_index": turn_index,
+            "exchange_index": exchange_index,
+            "tool_calls_used": tool_calls_used,
+            "assistant_message": assistant_message.to_history_dict(),
+            "tool_messages": [message.to_history_dict() for message in tool_messages or []],
+            "tool_call_id": tool_call_id,
+            "tool_name": tool_name,
+            "arguments": arguments,
+            "metadata": result_metadata,
+        }
+        if pending_metadata_extra:
+            payload.update(pending_metadata_extra)
+        self.session_manager.set_meta_value(self.PENDING_TURN_META_KEY, payload)
 
     def run_turn(self, user_input: str, session_id: str = "default") -> str:
         return self.run_turn_result(user_input=user_input, session_id=session_id).content
 
-    def run_turn_result(self, user_input: str, session_id: str = "default") -> AgentTurnResult:
+    def run_turn_result(
+        self,
+        user_input: str,
+        session_id: str = "default",
+        options: RunOptions | None = None,
+    ) -> AgentTurnResult:
+        run_options = options or RunOptions.direct()
         self.session_manager.activate_session(session_id)
         logger.info(
             "Starting run_turn",
-            extra={"session_id": session_id, "user_input_length": len(user_input)},
+            extra={"session_id": session_id, "user_input_length": len(user_input), "mode": run_options.mode},
         )
         state = self.session_manager.get_state()
         context = ExecutionContext(
@@ -391,7 +427,18 @@ class AgentOrchestrator:
 
         messages = self._build_messages(user_input)
         turn_index = self.session_manager.get_next_turn_index()
-        return self._continue_turn(
+        if run_options.mode in {"investigate", "deep_investigate"}:
+            return self._build_investigation_controller().run(
+                user_input=user_input,
+                session_id=session_id,
+                context=context,
+                messages=messages,
+                turn_index=turn_index,
+                options=run_options,
+            )
+
+        tool_history_start_count = len(state.get("tool_history", [])) if isinstance(state.get("tool_history"), list) else 0
+        result = self._continue_turn(
             user_input=user_input,
             session_id=session_id,
             context=context,
@@ -400,6 +447,15 @@ class AgentOrchestrator:
             tool_calls_used=0,
             exchange_index=0,
         )
+        if options is not None:
+            result.metadata = {
+                **result.metadata,
+                "mode": run_options.mode,
+                "iterations_used": 1,
+                "tool_calls_used": self._tool_history_delta(start_count=tool_history_start_count),
+                "stop_reason": result.status,
+            }
+        return result
 
     def resume_turn(
         self,
@@ -418,6 +474,235 @@ class AgentOrchestrator:
                 content=f"No pending agent turn found for pending_id={pending_id}",
             )
 
+        resumed = self._handle_pending_tool_result_once(pending=pending, tool_content=tool_content, ok=ok)
+        if isinstance(resumed, AgentTurnResult):
+            return resumed
+
+        context = ExecutionContext(
+            session_id=session_id,
+            settings=self.settings,
+            session_state=state,
+        )
+        mode = resumed.pending_payload.get("mode")
+        if mode in {"investigate", "deep_investigate"}:
+            run_options = self._run_options_from_pending(resumed.pending_payload)
+            investigation_state = InvestigationState.from_any(resumed.pending_payload.get("investigation_state"))
+            if investigation_state is None:
+                investigation_state = InvestigationState.create_template(objective=resumed.user_input)
+            iterations_used = resumed.pending_payload.get("iterations_used")
+            no_progress_iterations = resumed.pending_payload.get("no_progress_iterations")
+            return self._build_investigation_controller().resume_after_pending(
+                pending=resumed,
+                session_id=session_id,
+                context=context,
+                options=run_options,
+                state=investigation_state,
+                iterations_used=iterations_used if isinstance(iterations_used, int) else 1,
+                no_progress_iterations=no_progress_iterations if isinstance(no_progress_iterations, int) else 0,
+            )
+
+        return self._continue_turn(
+            user_input=resumed.user_input,
+            session_id=session_id,
+            context=context,
+            messages=resumed.messages,
+            turn_index=resumed.turn_index,
+            tool_calls_used=resumed.tool_calls_used,
+            exchange_index=resumed.exchange_index,
+        )
+
+    def _build_investigation_controller(self) -> InvestigationController:
+        return InvestigationController(
+            settings=self.settings,
+            structured_synthesizer=self.structured_synthesizer,
+            call_model_once=self._call_model_once,
+            execute_tool_calls_once=self._execute_tool_calls_once,
+            persist_conversation_turn_once=self._persist_conversation_turn_once,
+            refresh_memory_after_turn=self._refresh_memory_after_turn,
+            handle_provider_failure=self._handle_provider_failure,
+        )
+
+    def _call_model_once(
+        self,
+        *,
+        messages: list[LLMMessage],
+        options: LLMCallOptions | None = None,
+    ) -> LLMCompletionResult:
+        if options is not None and self._provider_accepts_options("complete_with_tools"):
+            return self.provider.complete_with_tools(
+                messages=messages,
+                tools=self.registry.get_tool_specs(),
+                model=self.settings.model,
+                temperature=self.settings.temperature,
+                options=options,
+            )
+        return self.provider.complete_with_tools(
+            messages=messages,
+            tools=self.registry.get_tool_specs(),
+            model=self.settings.model,
+            temperature=self.settings.temperature,
+        )
+
+    def _execute_tool_calls_once(
+        self,
+        *,
+        user_input: str,
+        session_id: str,
+        context: ExecutionContext,
+        messages: list[LLMMessage],
+        turn_index: int,
+        exchange_index: int,
+        tool_calls_used: int,
+        assistant_message: LLMMessage,
+        max_tool_calls: int,
+        pending_metadata_extra: dict[str, Any] | None = None,
+    ) -> ToolExecutionStepResult:
+        tool_messages: list[LLMMessage] = []
+        tool_statuses: list[ToolExecutionStatus] = []
+        tool_names: list[str] = []
+        tool_budget_exhausted = False
+        current_exchange_index = exchange_index + 1
+
+        for tc in assistant_message.tool_calls:
+            # The live provider transcript keeps growing inside the loop, but
+            # persisted storage records each tool phase as an atomic
+            # tool-exchange block once execution completes.
+            if tool_calls_used >= max_tool_calls:
+                logger.error("Tool-call budget exhausted before executing remaining tool calls")
+                tool_budget_exhausted = True
+                break
+
+            tool_calls_used += 1
+            tool_names.append(tc.name)
+            logger.info(
+                "Executing tool call",
+                extra={"tool_name": tc.name, "tool_call_index": tool_calls_used},
+            )
+
+            try:
+                arguments = json.loads(tc.arguments_json or "{}")
+            except json.JSONDecodeError:
+                logger.exception("Failed to parse tool arguments JSON", extra={"tool_name": tc.name})
+                arguments = {}
+                tool_content = f"Invalid JSON arguments for tool {tc.name}"
+                tool_status: ToolExecutionStatus = "invalid_arguments"
+            else:
+                authz = self.policy_engine.authorize(tc.name, arguments, context)
+                if not authz.allowed:
+                    tool_content = f"Tool denied by policy: {authz.reason}"
+                    tool_status = "policy_denied"
+                    logger.info(
+                        "Tool denied by policy",
+                        extra={"tool_name": tc.name, "reason": authz.reason},
+                    )
+                else:
+                    try:
+                        logger.debug(
+                            "Dispatching tool execution",
+                            extra={"tool_name": tc.name, "argument_keys": sorted(arguments.keys())},
+                        )
+                        result = self.registry.execute(tc.name, arguments, context)
+                        tool_content = result.content
+                        if result.pending:
+                            pending_id = result.pending_id or self._build_pending_id(
+                                session_id=session_id,
+                                turn_index=turn_index,
+                                exchange_index=current_exchange_index,
+                                tool_call_id=tc.id,
+                            )
+                            self.session_manager.append_tool_history(
+                                self._build_tool_history_item(
+                                    tool_name=tc.name,
+                                    arguments=arguments,
+                                    tool_content=tool_content,
+                                    status="pending",
+                                )
+                            )
+                            self._persist_pending_turn(
+                                pending_id=pending_id,
+                                user_input=user_input,
+                                messages=messages,
+                                turn_index=turn_index,
+                                exchange_index=current_exchange_index,
+                                tool_calls_used=tool_calls_used,
+                                assistant_message=assistant_message,
+                                tool_call_id=tc.id,
+                                tool_name=tc.name,
+                                arguments=arguments,
+                                result_metadata=result.metadata,
+                                tool_messages=tool_messages,
+                                pending_metadata_extra=pending_metadata_extra,
+                            )
+                            logger.info(
+                                "Tool execution is pending external result",
+                                extra={"tool_name": tc.name, "pending_id": pending_id},
+                            )
+                            return ToolExecutionStepResult(
+                                messages=messages,
+                                tool_messages=tool_messages,
+                                exchange_index=current_exchange_index,
+                                tool_calls_used=tool_calls_used,
+                                pending_result=AgentTurnResult(
+                                    status="pending_tool_result",
+                                    content=tool_content,
+                                    pending_id=pending_id,
+                                    tool_name=tc.name,
+                                    tool_arguments=arguments,
+                                    metadata=result.metadata,
+                                ),
+                                tool_statuses=tool_statuses + ["pending"],
+                                tool_names=tool_names,
+                            )
+                        tool_status = "ok" if result.ok else "tool_error"
+                        logger.debug(
+                            "Tool execution completed",
+                            extra={
+                                "tool_name": tc.name,
+                                "ok": result.ok,
+                                "content_preview": safe_preview(tool_content, limit=200),
+                            },
+                        )
+                    except Exception as exc:
+                        tool_content = f"Tool execution failed: {exc}"
+                        tool_status = "execution_failed"
+                        logger.exception("Tool execution crashed", extra={"tool_name": tc.name})
+
+            tool_message = LLMMessage(role="tool", tool_call_id=tc.id, content=tool_content)
+            messages.append(tool_message)
+            tool_messages.append(tool_message)
+            tool_statuses.append(tool_status)
+            self.session_manager.append_tool_history(
+                self._build_tool_history_item(
+                    tool_name=tc.name,
+                    arguments=arguments,
+                    tool_content=tool_content,
+                    status=tool_status,
+                )
+            )
+
+        self._persist_tool_exchange_once(
+            turn_index=turn_index,
+            exchange_index=current_exchange_index,
+            assistant_message=assistant_message,
+            tool_messages=tool_messages,
+        )
+        return ToolExecutionStepResult(
+            messages=messages,
+            tool_messages=tool_messages,
+            exchange_index=current_exchange_index,
+            tool_calls_used=tool_calls_used,
+            budget_exhausted=tool_budget_exhausted,
+            tool_statuses=tool_statuses,
+            tool_names=tool_names,
+        )
+
+    def _handle_pending_tool_result_once(
+        self,
+        *,
+        pending: dict[str, Any],
+        tool_content: str,
+        ok: bool,
+    ) -> PendingResumeState | AgentTurnResult:
         raw_messages = pending.get("messages")
         if not isinstance(raw_messages, list):
             return AgentTurnResult(status="completed", content="Pending agent turn is corrupt: missing messages.")
@@ -446,36 +731,68 @@ class AgentOrchestrator:
             if isinstance(assistant_payload, dict)
             else LLMMessage(role="assistant", content="")
         )
-        self._persist_tool_exchange(
+        raw_tool_messages = pending.get("tool_messages")
+        previous_tool_messages = [
+            LLMMessage.from_history_dict(item)
+            for item in raw_tool_messages
+            if isinstance(item, dict)
+        ] if isinstance(raw_tool_messages, list) else []
+        persisted_tool_messages = [*previous_tool_messages, tool_message]
+        self._persist_tool_exchange_once(
             turn_index=turn_index,
             exchange_index=exchange_index,
             assistant_message=assistant_message,
-            tool_messages=[tool_message],
+            tool_messages=persisted_tool_messages,
         )
+        pending_arguments = pending.get("arguments")
         self.session_manager.append_tool_history(
             self._build_tool_history_item(
                 tool_name=str(pending.get("tool_name") or "unknown"),
-                arguments=pending.get("arguments") if isinstance(pending.get("arguments"), dict) else {},
+                arguments=dict(pending_arguments) if isinstance(pending_arguments, dict) else {},
                 tool_content=tool_content,
                 status="ok" if ok else "tool_error",
             )
         )
         self.session_manager.set_meta_value(self.PENDING_TURN_META_KEY, None)
-
-        context = ExecutionContext(
-            session_id=session_id,
-            settings=self.settings,
-            session_state=state,
-        )
-        return self._continue_turn(
+        return PendingResumeState(
             user_input=str(pending.get("user_input") or ""),
-            session_id=session_id,
-            context=context,
             messages=messages,
             turn_index=turn_index,
-            tool_calls_used=tool_calls_used,
             exchange_index=exchange_index,
+            tool_calls_used=tool_calls_used,
+            tool_messages=persisted_tool_messages,
+            tool_status="ok" if ok else "tool_error",
+            pending_payload=dict(pending),
         )
+
+    def _run_options_from_pending(self, pending: dict[str, Any]) -> RunOptions:
+        raw_options = pending.get("run_options")
+        if isinstance(raw_options, dict):
+            allowed_keys = set(RunOptions.__dataclass_fields__.keys())
+            try:
+                return RunOptions(**{key: value for key, value in raw_options.items() if key in allowed_keys})
+            except (TypeError, ValueError):
+                logger.warning("Pending investigation run options were invalid; falling back to mode defaults")
+
+        mode = pending.get("mode")
+        if mode == "deep_investigate":
+            return RunOptions.deep_investigate()
+        return RunOptions.investigate(require_initial_plan=False)
+
+    def _provider_accepts_options(self, method_name: str) -> bool:
+        method = getattr(self.provider, method_name)
+        try:
+            parameters = signature(method).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(
+            parameter.kind == Parameter.VAR_KEYWORD or parameter.name == "options"
+            for parameter in parameters
+        )
+
+    def _tool_history_delta(self, *, start_count: int) -> int:
+        history = self.session_manager.get_state().get("tool_history", [])
+        return max(0, len(history) - start_count) if isinstance(history, list) else 0
 
     def _continue_turn(
         self,
@@ -523,12 +840,7 @@ class AgentOrchestrator:
                 )
                 prompt_reserve_warning_emitted = True
             try:
-                llm_response = self.provider.complete_with_tools(
-                    messages=messages,
-                    tools=self.registry.get_tool_specs(),
-                    model=self.settings.model,
-                    temperature=self.settings.temperature,
-                )
+                llm_response = self._call_model_once(messages=messages)
             except LLMProviderError as exc:
                 return self._handle_provider_failure(
                     error=exc,
@@ -563,7 +875,7 @@ class AgentOrchestrator:
 
             if tool_calls_used >= self.settings.max_tool_calls_per_turn:
                 exchange_index += 1
-                self._persist_tool_exchange(
+                self._persist_tool_exchange_once(
                     turn_index=turn_index,
                     exchange_index=exchange_index,
                     assistant_message=assistant_message,
@@ -579,123 +891,25 @@ class AgentOrchestrator:
                 self._refresh_memory_after_turn(turn_index=turn_index)
                 return AgentTurnResult(status="completed", content=msg)
 
-            tool_messages: list[LLMMessage] = []
-            tool_budget_exhausted = False
-            current_exchange_index = exchange_index + 1
-            for tc in llm_response.tool_calls:
-                # The live provider transcript keeps growing inside the loop,
-                # but persisted storage records each tool phase as an atomic
-                # tool-exchange block once execution completes.
-                if tool_calls_used >= self.settings.max_tool_calls_per_turn:
-                    logger.error("Tool-call budget exhausted before executing remaining tool calls")
-                    tool_budget_exhausted = True
-                    break
-
-                tool_calls_used += 1
-                logger.info(
-                    "Executing tool call",
-                    extra={"tool_name": tc.name, "tool_call_index": tool_calls_used},
-                )
-
-                try:
-                    arguments = json.loads(tc.arguments_json or "{}")
-                except json.JSONDecodeError:
-                    logger.exception("Failed to parse tool arguments JSON", extra={"tool_name": tc.name})
-                    arguments = {}
-                    tool_content = f"Invalid JSON arguments for tool {tc.name}"
-                    tool_status = "invalid_arguments"
-                else:
-                    authz = self.policy_engine.authorize(tc.name, arguments, context)
-                    if not authz.allowed:
-                        tool_content = f"Tool denied by policy: {authz.reason}"
-                        tool_status = "policy_denied"
-                        logger.info(
-                            "Tool denied by policy",
-                            extra={"tool_name": tc.name, "reason": authz.reason},
-                        )
-                    else:
-                        try:
-                            logger.debug(
-                                "Dispatching tool execution",
-                                extra={"tool_name": tc.name, "argument_keys": sorted(arguments.keys())},
-                            )
-                            result = self.registry.execute(tc.name, arguments, context)
-                            tool_content = result.content
-                            if result.pending:
-                                pending_id = result.pending_id or self._build_pending_id(
-                                    session_id=session_id,
-                                    turn_index=turn_index,
-                                    exchange_index=current_exchange_index,
-                                    tool_call_id=tc.id,
-                                )
-                                self.session_manager.append_tool_history(
-                                    self._build_tool_history_item(
-                                        tool_name=tc.name,
-                                        arguments=arguments,
-                                        tool_content=tool_content,
-                                        status="pending",
-                                    )
-                                )
-                                self._persist_pending_turn(
-                                    pending_id=pending_id,
-                                    user_input=user_input,
-                                    messages=messages,
-                                    turn_index=turn_index,
-                                    exchange_index=current_exchange_index,
-                                    tool_calls_used=tool_calls_used,
-                                    assistant_message=assistant_message,
-                                    tool_call_id=tc.id,
-                                    tool_name=tc.name,
-                                    arguments=arguments,
-                                    result_metadata=result.metadata,
-                                )
-                                logger.info(
-                                    "Tool execution is pending external result",
-                                    extra={"tool_name": tc.name, "pending_id": pending_id},
-                                )
-                                return AgentTurnResult(
-                                    status="pending_tool_result",
-                                    content=tool_content,
-                                    pending_id=pending_id,
-                                    tool_name=tc.name,
-                                    tool_arguments=arguments,
-                                    metadata=result.metadata,
-                                )
-                            tool_status = "ok" if result.ok else "tool_error"
-                            logger.debug(
-                                "Tool execution completed",
-                                extra={
-                                    "tool_name": tc.name,
-                                    "ok": result.ok,
-                                    "content_preview": safe_preview(tool_content, limit=200),
-                                },
-                            )
-                        except Exception as exc:
-                            tool_content = f"Tool execution failed: {exc}"
-                            tool_status = "execution_failed"
-                            logger.exception("Tool execution crashed", extra={"tool_name": tc.name})
-
-                tool_message = LLMMessage(role="tool", tool_call_id=tc.id, content=tool_content)
-                messages.append(tool_message)
-                tool_messages.append(tool_message)
-                self.session_manager.append_tool_history(
-                    self._build_tool_history_item(
-                        tool_name=tc.name,
-                        arguments=arguments,
-                        tool_content=tool_content,
-                        status=tool_status,
-                    )
-                )
-
-            exchange_index = current_exchange_index
-            self._persist_tool_exchange(
+            tool_step = self._execute_tool_calls_once(
+                user_input=user_input,
+                session_id=session_id,
+                context=context,
+                messages=messages,
                 turn_index=turn_index,
                 exchange_index=exchange_index,
+                tool_calls_used=tool_calls_used,
                 assistant_message=assistant_message,
-                tool_messages=tool_messages,
+                max_tool_calls=self.settings.max_tool_calls_per_turn,
             )
+            messages = tool_step.messages
+            exchange_index = tool_step.exchange_index
+            tool_calls_used = tool_step.tool_calls_used
 
-            if tool_budget_exhausted:
+            if tool_step.pending_result is not None:
+                return tool_step.pending_result
+
+            if tool_step.budget_exhausted:
                 msg = "Maximum number of tool calls reached for this turn."
                 logger.error(msg)
                 self._persist_conversation_turn(

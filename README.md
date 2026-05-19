@@ -64,6 +64,13 @@ Or run a small REPL:
 See [examples/README.md](examples/README.md) for the pending tool result /
 resume example.
 
+## Investigation Modes
+
+Bounded investigation modes are documented in
+[docs/investigation_modes.md](docs/investigation_modes.md). They provide
+domain-agnostic planning/reflection/decision loops without storing or exposing
+raw chain-of-thought.
+
 ## Public API
 
 ```python

@@ -8,7 +8,7 @@ from requests import Response, Session
 from requests.exceptions import RequestException, Timeout
 
 from agent_core.logging_utils import get_logger
-from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
+from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
 
 logger = get_logger(__name__)
@@ -58,12 +58,14 @@ class AzureAnthropicProvider:
         messages: list[LLMMessage],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> str:
         response_payload = self._post_messages(
             messages=messages,
             tools=None,
             model=model,
             temperature=temperature,
+            options=options,
         )
         content, tool_calls = self._parse_response(response_payload)
         if tool_calls:
@@ -80,12 +82,14 @@ class AzureAnthropicProvider:
         tools: list[LLMToolDefinition],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
         response_payload = self._post_messages(
             messages=messages,
             tools=tools,
             model=model,
             temperature=temperature,
+            options=options,
         )
         content, tool_calls = self._parse_response(response_payload)
         return LLMCompletionResult(content=content, tool_calls=tool_calls)
@@ -97,6 +101,7 @@ class AzureAnthropicProvider:
         tools: list[LLMToolDefinition] | None,
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> dict[str, Any]:
         if not self.endpoint_configured:
             raise LLMProviderError(
@@ -119,6 +124,8 @@ class AzureAnthropicProvider:
             "temperature": temperature,
             "stream": False,
         }
+        if options is not None and options.max_output_tokens is not None:
+            request_payload["max_tokens"] = options.max_output_tokens
         if system_prompt:
             request_payload["system"] = system_prompt
         if tools:
