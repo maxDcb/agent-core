@@ -67,6 +67,7 @@ class TaskState:
         if not isinstance(objective, str) or not isinstance(run_id, str):
             return None
         domain_ext = payload.get("domain_extensions")
+        status = payload.get("status")
         return cls(
             run_id=run_id,
             objective=objective,
@@ -77,7 +78,7 @@ class TaskState:
             stop_conditions=_normalize_str_list(payload.get("stop_conditions")),
             constraints=_normalize_str_list(payload.get("constraints")),
             relevant_artifacts=_normalize_str_list(payload.get("relevant_artifacts")),
-            status=payload.get("status") if isinstance(payload.get("status"), str) else "active",
+            status=status if isinstance(status, str) else "active",
             domain_extensions=dict(domain_ext) if isinstance(domain_ext, dict) else {},
         )
 

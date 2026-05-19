@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, cast
 
 
 LLMMessageRole = Literal["system", "user", "assistant", "tool"]
@@ -62,8 +62,9 @@ class LLMMessage:
         tool_call_id = payload.get("tool_call_id")
         if not isinstance(tool_call_id, str):
             tool_call_id = None
+        normalized_role = cast(LLMMessageRole, role if role in {"system", "user", "assistant", "tool"} else "user")
         return cls(
-            role=role if role in {"system", "user", "assistant", "tool"} else "user",
+            role=normalized_role,
             content=content,
             tool_call_id=tool_call_id,
             tool_calls=tool_calls,
@@ -91,6 +92,15 @@ class LLMCompletionResult:
     tool_calls: list[LLMToolCall] = field(default_factory=list)
 
 
+@dataclass(slots=True)
+class LLMCallOptions:
+    reasoning_effort: str | None = None
+    reasoning_summary: str | None = None
+    response_format: dict[str, Any] | None = None
+    max_output_tokens: int | None = None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
 class BaseLLMProvider(Protocol):
     def complete_text(
         self,
@@ -98,6 +108,7 @@ class BaseLLMProvider(Protocol):
         messages: list[LLMMessage],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> str:
         ...
 
@@ -108,5 +119,6 @@ class BaseLLMProvider(Protocol):
         tools: list[LLMToolDefinition],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
         ...

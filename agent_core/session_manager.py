@@ -105,7 +105,7 @@ class SessionManager:
 
         blocks = self.get_context_blocks()
         blocks.append(normalized)
-        self.set_context_blocks(blocks)
+        self.set_context_blocks(list(blocks))
         return normalized
 
     def get_next_turn_index(self) -> int:

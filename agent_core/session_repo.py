@@ -118,7 +118,7 @@ class SessionRepository:
 
         normalized["context_blocks"] = normalized_blocks
 
-        last_block_id = normalized_blocks[-1]["block_id"] if normalized_blocks else ""
+        last_block_id = str(normalized_blocks[-1]["block_id"]) if normalized_blocks else ""
         summary = SessionSummary.from_any(
             state.get("summary"),
             thread_id=str(normalized["meta"].get("session_id", "")),

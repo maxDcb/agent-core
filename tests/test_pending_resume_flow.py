@@ -29,10 +29,10 @@ class FakeProvider:
             LLMCompletionResult(content="final after tool output"),
         ]
 
-    def complete_with_tools(self, *, messages, tools, model, temperature):
+    def complete_with_tools(self, *, messages, tools, model, temperature, options=None):
         return self.responses.pop(0)
 
-    def complete_text(self, *, messages, model, temperature):
+    def complete_text(self, *, messages, model, temperature, options=None):
         return json.dumps(
             {
                 "run_id": "run-0000",

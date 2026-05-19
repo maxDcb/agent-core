@@ -14,7 +14,7 @@ from openai import (
 )
 
 from agent_core.logging_utils import get_logger
-from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
+from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
 
 logger = get_logger(__name__)
@@ -59,6 +59,7 @@ class AzureOpenAIProvider:
         messages: list[LLMMessage],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> str:
         # This method is for internal summarization-style completions. It intentionally avoids tool
         # exposure so components like a working-memory synthesizer cannot trigger tool calls.
@@ -67,6 +68,7 @@ class AzureOpenAIProvider:
             model=model,
             temperature=temperature,
             tools=None,
+            options=options,
         )
         message = response.choices[0].message
         logger.debug(
@@ -82,6 +84,7 @@ class AzureOpenAIProvider:
         tools: list[LLMToolDefinition],
         model: str,
         temperature: float,
+        options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
         # This is the primary agent loop method. It keeps tool-calling enabled for the assistant's
         # main investigation turn and should not be used for internal synthesis tasks.
@@ -90,6 +93,7 @@ class AzureOpenAIProvider:
             model=model,
             temperature=temperature,
             tools=tools,
+            options=options,
         )
         message = response.choices[0].message
         tool_calls: list[LLMToolCall] = []
@@ -124,6 +128,7 @@ class AzureOpenAIProvider:
         model: str,
         temperature: float,
         tools: list[LLMToolDefinition] | None,
+        options: LLMCallOptions | None = None,
     ):
         if not self.azure_endpoint_configured:
             raise LLMProviderError(
@@ -160,6 +165,13 @@ class AzureOpenAIProvider:
                 request["tools"] = [self._to_openai_tool(tool) for tool in tools]
                 request["tool_choice"] = "auto"
                 request["parallel_tool_calls"] = True
+            if options is not None:
+                if options.response_format:
+                    request["response_format"] = options.response_format
+                if options.max_output_tokens is not None:
+                    request["max_tokens"] = options.max_output_tokens
+                if options.reasoning_effort:
+                    request["reasoning_effort"] = options.reasoning_effort
             response = client.chat.completions.create(**request)
         except AuthenticationError as exc:
             logger.exception("Azure OpenAI authentication failed")
@@ -215,6 +227,8 @@ class AzureOpenAIProvider:
 
     def _get_client(self) -> AzureOpenAI:
         if self.client is None:
+            assert self.azure_endpoint is not None
+            assert self.api_key is not None
             self.client = AzureOpenAI(
                 azure_endpoint=self.azure_endpoint,
                 api_key=self.api_key,

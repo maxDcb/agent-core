@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from inspect import Parameter, signature
 from typing import Any, Callable, Generic, TypeVar
 
 from agent_core.logging_utils import get_logger
-from agent_core.llm.base import BaseLLMProvider, LLMMessage
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage
 from agent_core.settings import CoreSettings
 
 logger = get_logger(__name__)
@@ -22,6 +23,7 @@ class StructuredSynthesisRequest(Generic[T]):
     output_format: dict[str, Any]
     payload: dict[str, Any]
     parser: Callable[[object], T | None]
+    options: LLMCallOptions | None = None
 
 
 class StructuredSynthesizer:
@@ -68,11 +70,7 @@ class StructuredSynthesizer:
                 ),
             )
 
-        raw_content = self.provider.complete_text(
-            messages=messages,
-            model=self.settings.memory_model,
-            temperature=self.settings.memory_temperature,
-        )
+        raw_content = self._complete_text(messages=messages, options=request.options)
 
         if self.settings.log_synthesis_payloads:
             logger.info(
@@ -93,6 +91,31 @@ class StructuredSynthesizer:
         if parsed is None:
             raise ValueError(f"{request.target_name} synthesis returned an invalid structured payload")
         return parsed
+
+    def _complete_text(self, *, messages: list[LLMMessage], options: LLMCallOptions | None) -> str:
+        if options is not None and self._provider_accepts_options("complete_text"):
+            return self.provider.complete_text(
+                messages=messages,
+                model=self.settings.memory_model,
+                temperature=self.settings.memory_temperature,
+                options=options,
+            )
+        return self.provider.complete_text(
+            messages=messages,
+            model=self.settings.memory_model,
+            temperature=self.settings.memory_temperature,
+        )
+
+    def _provider_accepts_options(self, method_name: str) -> bool:
+        method = getattr(self.provider, method_name)
+        try:
+            parameters = signature(method).parameters.values()
+        except (TypeError, ValueError):
+            return True
+        return any(
+            parameter.kind == Parameter.VAR_KEYWORD or parameter.name == "options"
+            for parameter in parameters
+        )
 
     def _build_system_prompt(self, *, instructions: str, output_format: dict[str, Any]) -> str:
         return "\n\n".join(
