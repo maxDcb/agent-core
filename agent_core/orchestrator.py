@@ -439,6 +439,45 @@ class AgentOrchestrator:
             tool_messages=tool_messages,
         )
 
+    def _append_budget_exhausted_tool_messages(
+        self,
+        *,
+        messages: list[LLMMessage],
+        tool_calls: list[Any],
+        tool_messages: list[LLMMessage],
+        tool_names: list[str],
+        tool_statuses: list[ToolExecutionStatus],
+        trace: RunTrace | None = None,
+        iteration: int | None = None,
+    ) -> None:
+        for tool_call in tool_calls:
+            tool_content = f"Tool call skipped: maximum tool-call budget reached before executing {tool_call.name}."
+            tool_message = LLMMessage(role="tool", tool_call_id=tool_call.id, content=tool_content)
+            messages.append(tool_message)
+            tool_messages.append(tool_message)
+            tool_names.append(tool_call.name)
+            tool_statuses.append("budget_exhausted")
+            try:
+                arguments = json.loads(tool_call.arguments_json or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            self.session_manager.append_tool_history(
+                self._build_tool_history_item(
+                    tool_name=tool_call.name,
+                    arguments=arguments,
+                    tool_content=tool_content,
+                    status="budget_exhausted",
+                )
+            )
+            self._record_trace_event(
+                trace,
+                event_type="tool_call_skipped_budget_exhausted",
+                summary=f"Tool call skipped due to budget: {tool_call.name}",
+                iteration=iteration,
+                payload={"tool_name": tool_call.name, "content_length": len(tool_content)},
+                related_tool_call_id=tool_call.id,
+            )
+
     def _handle_provider_failure(self, *, error: LLMProviderError, user_input: str, turn_index: int) -> AgentTurnResult:
         logger.error(
             "LLM provider failure",
@@ -717,7 +756,7 @@ class AgentOrchestrator:
         if trace is not None:
             effective_pending_metadata_extra["run_trace_id"] = trace.run_id
 
-        for tc in assistant_message.tool_calls:
+        for tool_call_offset, tc in enumerate(assistant_message.tool_calls):
             # The live provider transcript keeps growing inside the loop, but
             # persisted storage records each tool phase as an atomic
             # tool-exchange block once execution completes.
@@ -729,6 +768,14 @@ class AgentOrchestrator:
                     event_type="tool_budget_exhausted",
                     summary="Tool-call budget exhausted before executing remaining tool calls",
                     payload={"tool_calls_used": tool_calls_used, "max_tool_calls": max_tool_calls},
+                )
+                self._append_budget_exhausted_tool_messages(
+                    messages=messages,
+                    tool_calls=assistant_message.tool_calls[tool_call_offset:],
+                    tool_messages=tool_messages,
+                    tool_names=tool_names,
+                    tool_statuses=tool_statuses,
+                    trace=trace,
                 )
                 break
 
@@ -1128,11 +1175,23 @@ class AgentOrchestrator:
 
             if tool_calls_used >= self.settings.max_tool_calls_per_turn:
                 exchange_index += 1
+                tool_messages: list[LLMMessage] = []
+                tool_statuses: list[ToolExecutionStatus] = []
+                tool_names: list[str] = []
+                self._append_budget_exhausted_tool_messages(
+                    messages=messages,
+                    tool_calls=assistant_message.tool_calls,
+                    tool_messages=tool_messages,
+                    tool_names=tool_names,
+                    tool_statuses=tool_statuses,
+                    trace=trace,
+                    iteration=model_call_index,
+                )
                 self._persist_tool_exchange_once(
                     turn_index=turn_index,
                     exchange_index=exchange_index,
                     assistant_message=assistant_message,
-                    tool_messages=[],
+                    tool_messages=tool_messages,
                 )
                 msg = "Maximum number of tool calls reached for this turn."
                 logger.error(msg)

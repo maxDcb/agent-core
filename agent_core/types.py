@@ -11,6 +11,7 @@ ToolExecutionStatus: TypeAlias = Literal[
     "policy_denied",
     "invalid_arguments",
     "execution_failed",
+    "budget_exhausted",
 ]
 
 AgentTurnStatus: TypeAlias = Literal["completed", "pending_tool_result"]
