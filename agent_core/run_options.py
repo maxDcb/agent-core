@@ -10,7 +10,7 @@ AgentRunMode: TypeAlias = Literal["direct", "investigate", "deep_investigate"]
 class RunOptions:
     mode: AgentRunMode = "direct"
     max_iterations: int = 1
-    max_tool_calls: int = 5
+    max_tool_calls: int = 10
     max_no_progress_iterations: int = 2
     require_initial_plan: bool = False
     require_final_critique: bool = False
@@ -41,7 +41,7 @@ class RunOptions:
         defaults: dict[str, Any] = {
             "mode": "investigate",
             "max_iterations": 10,
-            "max_tool_calls": 8,
+            "max_tool_calls": 50,
             "max_no_progress_iterations": 2,
             "require_initial_plan": True,
             "require_final_critique": False,
@@ -54,7 +54,7 @@ class RunOptions:
         defaults: dict[str, Any] = {
             "mode": "deep_investigate",
             "max_iterations": 20,
-            "max_tool_calls": 20,
+            "max_tool_calls": 100,
             "max_no_progress_iterations": 3,
             "require_initial_plan": True,
             "require_final_critique": True,
