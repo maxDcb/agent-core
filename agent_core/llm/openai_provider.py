@@ -16,16 +16,24 @@ from openai import (
 from agent_core.logging_utils import get_logger
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
-from agent_core.llm.openai_compat import create_chat_completion_with_reasoning_fallback
+from agent_core.llm.openai_compat import create_chat_completion_with_adaptive_retry
+from agent_core.llm.openai_request_policy import OpenAIChatRequestNormalizer, OpenAIModelCapabilityResolver
 
 logger = get_logger(__name__)
 
 
 class OpenAIProvider:
-    def __init__(self, api_key: str | None = None) -> None:
+    def __init__(
+        self,
+        api_key: str | None = None,
+        *,
+        capability_resolver: OpenAIModelCapabilityResolver | None = None,
+    ) -> None:
         self.api_key_configured = bool(api_key)
         self.api_key = api_key
         self.client: OpenAI | None = None
+        self.capability_resolver = capability_resolver or OpenAIModelCapabilityResolver()
+        self.request_normalizer = OpenAIChatRequestNormalizer(self.capability_resolver)
         # Delay client creation so local REPL commands still work when the API key is missing.
         logger.debug("OpenAI provider initialized", extra={"api_key_configured": self.api_key_configured})
 
@@ -128,11 +136,17 @@ class OpenAIProvider:
                     request["max_tokens"] = options.max_output_tokens
                 if options.reasoning_effort:
                     request["reasoning_effort"] = options.reasoning_effort
-            response = create_chat_completion_with_reasoning_fallback(
+            normalization = self.request_normalizer.normalize(request)
+            request = normalization.request
+            for change in normalization.changes:
+                logger.debug("Adjusted OpenAI chat completion request", extra={"model": model, "change": change})
+
+            response = create_chat_completion_with_adaptive_retry(
                 completions=client.chat.completions,
                 request=request,
                 provider_name="OpenAI",
                 logger=logger,
+                capability_resolver=self.capability_resolver,
             )
         except AuthenticationError as exc:
             logger.exception("OpenAI authentication failed")

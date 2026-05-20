@@ -4,13 +4,16 @@ from typing import Any
 
 from openai import BadRequestError
 
+from agent_core.llm.openai_request_policy import OpenAIModelCapabilityResolver, select_bad_request_retry_action
 
-def create_chat_completion_with_reasoning_fallback(
+
+def create_chat_completion_with_adaptive_retry(
     *,
     completions: Any,
     request: dict[str, Any],
     provider_name: str,
     logger: Any,
+    capability_resolver: OpenAIModelCapabilityResolver | None = None,
 ) -> Any:
     fallback_request = dict(request)
     retried_without: set[str] = set()
@@ -19,50 +22,39 @@ def create_chat_completion_with_reasoning_fallback(
         try:
             return completions.create(**fallback_request)
         except BadRequestError as exc:
-            unsupported_parameter = _unsupported_fallback_parameter(exc, fallback_request)
-            if unsupported_parameter is None or unsupported_parameter in retried_without:
+            retry_action = select_bad_request_retry_action(exc, fallback_request)
+            if retry_action is None or retry_action.parameter in retried_without:
                 raise
 
+            if capability_resolver is not None:
+                capability_resolver.record_unsupported_parameter(
+                    model=str(fallback_request.get("model", "")),
+                    parameter=retry_action.parameter,
+                )
+
+            if retry_action.replacement_parameter is not None and retry_action.replacement_parameter not in fallback_request:
+                fallback_request[retry_action.replacement_parameter] = fallback_request[retry_action.parameter]
+
             logger.warning(
-                "%s rejected %s; retrying without it",
+                "%s rejected %s; retrying with adjusted request",
                 provider_name,
-                unsupported_parameter,
+                retry_action.parameter,
                 extra={"model": fallback_request.get("model")},
             )
-            fallback_request.pop(unsupported_parameter, None)
-            retried_without.add(unsupported_parameter)
+            fallback_request.pop(retry_action.parameter, None)
+            retried_without.add(retry_action.parameter)
 
 
-def _unsupported_fallback_parameter(exc: BadRequestError, request: dict[str, Any]) -> str | None:
-    if "reasoning_effort" in request and _is_unsupported_reasoning_effort_error(exc):
-        return "reasoning_effort"
-    if "temperature" in request and _is_unsupported_temperature_error(exc):
-        return "temperature"
-    return None
-
-
-def _is_unsupported_reasoning_effort_error(exc: BadRequestError) -> bool:
-    message = str(exc).lower()
-    return "reasoning_effort" in message and any(
-        fragment in message
-        for fragment in (
-            "unrecognized",
-            "unsupported",
-            "unknown",
-            "not supported",
-            "invalid request argument",
-        )
-    )
-
-
-def _is_unsupported_temperature_error(exc: BadRequestError) -> bool:
-    message = str(exc).lower()
-    return "temperature" in message and any(
-        fragment in message
-        for fragment in (
-            "unsupported",
-            "does not support",
-            "only the default",
-            "unsupported_value",
-        )
+def create_chat_completion_with_reasoning_fallback(
+    *,
+    completions: Any,
+    request: dict[str, Any],
+    provider_name: str,
+    logger: Any,
+) -> Any:
+    return create_chat_completion_with_adaptive_retry(
+        completions=completions,
+        request=request,
+        provider_name=provider_name,
+        logger=logger,
     )
