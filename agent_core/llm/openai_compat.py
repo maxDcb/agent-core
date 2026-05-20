@@ -12,20 +12,33 @@ def create_chat_completion_with_reasoning_fallback(
     provider_name: str,
     logger: Any,
 ) -> Any:
-    try:
-        return completions.create(**request)
-    except BadRequestError as exc:
-        if "reasoning_effort" not in request or not _is_unsupported_reasoning_effort_error(exc):
-            raise
+    fallback_request = dict(request)
+    retried_without: set[str] = set()
 
-        logger.warning(
-            "%s rejected reasoning_effort; retrying without it",
-            provider_name,
-            extra={"model": request.get("model")},
-        )
-        fallback_request = dict(request)
-        fallback_request.pop("reasoning_effort", None)
-        return completions.create(**fallback_request)
+    while True:
+        try:
+            return completions.create(**fallback_request)
+        except BadRequestError as exc:
+            unsupported_parameter = _unsupported_fallback_parameter(exc, fallback_request)
+            if unsupported_parameter is None or unsupported_parameter in retried_without:
+                raise
+
+            logger.warning(
+                "%s rejected %s; retrying without it",
+                provider_name,
+                unsupported_parameter,
+                extra={"model": fallback_request.get("model")},
+            )
+            fallback_request.pop(unsupported_parameter, None)
+            retried_without.add(unsupported_parameter)
+
+
+def _unsupported_fallback_parameter(exc: BadRequestError, request: dict[str, Any]) -> str | None:
+    if "reasoning_effort" in request and _is_unsupported_reasoning_effort_error(exc):
+        return "reasoning_effort"
+    if "temperature" in request and _is_unsupported_temperature_error(exc):
+        return "temperature"
+    return None
 
 
 def _is_unsupported_reasoning_effort_error(exc: BadRequestError) -> bool:
@@ -38,5 +51,18 @@ def _is_unsupported_reasoning_effort_error(exc: BadRequestError) -> bool:
             "unknown",
             "not supported",
             "invalid request argument",
+        )
+    )
+
+
+def _is_unsupported_temperature_error(exc: BadRequestError) -> bool:
+    message = str(exc).lower()
+    return "temperature" in message and any(
+        fragment in message
+        for fragment in (
+            "unsupported",
+            "does not support",
+            "only the default",
+            "unsupported_value",
         )
     )
