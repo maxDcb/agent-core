@@ -120,7 +120,25 @@ class PromptBuilder:
 
     def _sanitize_messages(self, messages: list[LLMMessage]) -> list[LLMMessage]:
         sanitized: list[LLMMessage] = []
+        pending_assistant: LLMMessage | None = None
+        pending_tool_messages: list[LLMMessage] = []
         pending_tool_calls: set[str] = set()
+
+        def flush_pending_tool_exchange() -> None:
+            nonlocal pending_assistant, pending_tool_messages, pending_tool_calls
+            if pending_assistant is None:
+                return
+            if pending_tool_calls:
+                logger.warning(
+                    "Dropping assistant tool-call message with missing tool responses",
+                    extra={"missing_tool_call_ids": sorted(pending_tool_calls)},
+                )
+            else:
+                sanitized.append(pending_assistant)
+                sanitized.extend(pending_tool_messages)
+            pending_assistant = None
+            pending_tool_messages = []
+            pending_tool_calls = set()
 
         for msg in messages:
             role = msg.role
@@ -129,12 +147,16 @@ class PromptBuilder:
                 # Once an assistant message with tool calls is emitted, only
                 # matching tool responses should survive. This prevents stale or
                 # orphan tool messages from breaking the chat transcript shape.
-                sanitized.append(msg)
-                pending_tool_calls = {tool_call.id for tool_call in msg.tool_calls}
+                flush_pending_tool_exchange()
+                if msg.tool_calls:
+                    pending_assistant = msg
+                    pending_tool_calls = {tool_call.id for tool_call in msg.tool_calls}
+                else:
+                    sanitized.append(msg)
             elif role == "tool":
                 tool_call_id = msg.tool_call_id
-                if tool_call_id and tool_call_id in pending_tool_calls:
-                    sanitized.append(msg)
+                if pending_assistant is not None and tool_call_id and tool_call_id in pending_tool_calls:
+                    pending_tool_messages.append(msg)
                     pending_tool_calls.remove(tool_call_id)
                 else:
                     logger.debug(
@@ -142,7 +164,9 @@ class PromptBuilder:
                         extra={"tool_call_id": tool_call_id, "content_preview": safe_preview(msg.content)},
                     )
             else:
+                flush_pending_tool_exchange()
                 sanitized.append(msg)
-                pending_tool_calls = set()
+
+        flush_pending_tool_exchange()
 
         return sanitized

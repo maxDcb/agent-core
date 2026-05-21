@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import agent_core
-from agent_core import AgentOrchestrator, CoreSettings, InvestigationState, RunOptions, ToolRegistry
+from agent_core import AgentOrchestrator, CoreSettings, InvestigationState, RunOptions, RunTrace, ToolRegistry
 
 
 def test_public_api_exports_runtime_entrypoints() -> None:
@@ -10,4 +10,5 @@ def test_public_api_exports_runtime_entrypoints() -> None:
     assert CoreSettings is not None
     assert InvestigationState is not None
     assert RunOptions is not None
+    assert RunTrace is not None
     assert ToolRegistry is not None

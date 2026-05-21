@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from agent_core.llm.base import LLMCompletionResult, LLMToolCall
+from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall
+from agent_core.memory.thread_state import render_context_blocks_to_messages
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_options import RunOptions
@@ -201,6 +202,64 @@ def test_direct_mode_without_options_preserves_tool_loop_shape(tmp_path) -> None
     blocks = orchestrator.session_manager.get_context_blocks()
     assert [block.kind for block in blocks] == ["tool_exchange", "conversation_turn"]
     assert len(blocks[0].content["tool_messages"]) == 1
+
+
+def test_direct_mode_budget_exhaustion_persists_tool_responses_for_skipped_calls(tmp_path) -> None:
+    provider = ScriptedProvider(
+        chat=[
+            LLMCompletionResult(
+                content="",
+                tool_calls=[
+                    LLMToolCall(id="call-1", name="echo", arguments_json=json.dumps({"value": "first"})),
+                    LLMToolCall(id="call-2", name="echo", arguments_json=json.dumps({"value": "second"})),
+                ],
+            )
+        ]
+    )
+    orchestrator = build_orchestrator(tmp_path, provider)
+    orchestrator.settings.max_tool_calls_per_turn = 1
+
+    result = orchestrator.run_turn_result("echo twice")
+    blocks = orchestrator.session_manager.get_context_blocks()
+    tool_messages = blocks[0].content["tool_messages"]
+    history = orchestrator.session_manager.get_state()["tool_history"]
+
+    assert result.content == "Maximum number of tool calls reached for this turn."
+    assert [item["status"] for item in history] == ["ok", "budget_exhausted"]
+    assert [message["tool_call_id"] for message in tool_messages] == ["call-1", "call-2"]
+
+    pending_tool_calls: set[str] = set()
+    for message in render_context_blocks_to_messages(blocks):
+        if message.role == "assistant" and message.tool_calls:
+            assert not pending_tool_calls
+            pending_tool_calls = {tool_call.id for tool_call in message.tool_calls}
+        elif message.role == "tool":
+            pending_tool_calls.discard(message.tool_call_id or "")
+        else:
+            assert not pending_tool_calls
+    assert not pending_tool_calls
+
+
+def test_prompt_sanitizer_drops_legacy_unanswered_tool_call_messages(tmp_path) -> None:
+    provider = ScriptedProvider(chat=[])
+    orchestrator = build_orchestrator(tmp_path, provider)
+
+    sanitized = orchestrator.prompt_builder._sanitize_messages(
+        [
+            LLMMessage(role="user", content="old turn"),
+            LLMMessage(
+                role="assistant",
+                content="",
+                tool_calls=[LLMToolCall(id="call-orphan", name="echo", arguments_json='{"value":"x"}')],
+            ),
+            LLMMessage(role="assistant", content="final answer"),
+        ]
+    )
+
+    assert [(message.role, message.content) for message in sanitized] == [
+        ("user", "old turn"),
+        ("assistant", "final answer"),
+    ]
 
 
 def test_investigation_no_tool_no_critique_returns_final(tmp_path) -> None:

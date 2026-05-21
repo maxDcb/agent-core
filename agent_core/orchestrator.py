@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 import json
 from inspect import Parameter, signature
 from typing import Any
+from uuid import uuid4
 
 from agent_core.domain_hooks import DomainHooks
 from agent_core.execution_context import ExecutionContext
-from agent_core.investigation_controller import InvestigationController
+from agent_core.investigation_controller import InvestigationController, with_investigation_guidance
 from agent_core.investigation_state import InvestigationState
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.memory.context_block import ContextBlock, estimate_token_count
@@ -20,6 +22,7 @@ from agent_core.memory.thread_state import (
 )
 from agent_core.policy_engine import PolicyEngine
 from agent_core.prompt_builder import PromptBuilder
+from agent_core.run_trace import PromptSnapshot, RunTrace
 from agent_core.run_options import RunOptions
 from agent_core.session_manager import SessionManager
 from agent_core.settings import CoreSettings
@@ -98,6 +101,97 @@ class AgentOrchestrator:
 
     def _estimate_prompt_tokens(self, *, messages: list[LLMMessage]) -> int:
         return estimate_token_count([message.to_history_dict() for message in messages])
+
+    def _start_run_trace(
+        self,
+        *,
+        session_id: str,
+        run_options: RunOptions,
+        messages: list[LLMMessage],
+        turn_index: int,
+    ) -> RunTrace:
+        return RunTrace.start(
+            run_id=f"run-{turn_index:04d}-{uuid4().hex[:8]}",
+            session_id=session_id,
+            mode=run_options.mode,
+            turn_index=turn_index,
+            options={
+                "run_options": asdict(run_options),
+                "model": self.settings.model,
+                "max_active_context_tokens": self.settings.max_active_context_tokens,
+                "max_tool_calls_per_turn": self.settings.max_tool_calls_per_turn,
+            },
+            prompt_snapshot=PromptSnapshot.from_messages(
+                messages=messages,
+                context_window_tokens=self.settings.max_active_context_tokens,
+            ),
+        )
+
+    def _record_trace_event(
+        self,
+        trace: RunTrace | None,
+        *,
+        event_type: str,
+        summary: str,
+        iteration: int | None = None,
+        payload: dict[str, Any] | None = None,
+        related_tool_call_id: str | None = None,
+    ) -> None:
+        if trace is None:
+            return
+        trace.add_event(
+            event_type=event_type,
+            summary=summary,
+            iteration=iteration,
+            payload=payload,
+            related_tool_call_id=related_tool_call_id,
+        )
+
+    def _save_run_trace_safely(self, trace: RunTrace) -> None:
+        try:
+            self.session_manager.save_run_trace(trace)
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist run trace",
+                extra={"run_id": trace.run_id, "error_preview": safe_preview(str(exc), limit=200)},
+            )
+
+    def _finalize_run_trace_result(
+        self,
+        *,
+        trace: RunTrace,
+        result: AgentTurnResult,
+        expose_trace_id: bool,
+    ) -> AgentTurnResult:
+        if expose_trace_id:
+            result.metadata = {**result.metadata, "run_trace_id": trace.run_id}
+        event_type = "run_completed" if result.status == "completed" else "run_pending"
+        self._record_trace_event(
+            trace,
+            event_type=event_type,
+            summary="Run completed" if result.status == "completed" else "Run is pending tool result",
+            payload={
+                "status": result.status,
+                "content_length": len(result.content),
+                "metadata_keys": sorted(result.metadata.keys()),
+            },
+        )
+        trace.complete(status=result.status, final_metadata=result.metadata)
+        self._save_run_trace_safely(trace)
+        return result
+
+    def _fail_run_trace(self, trace: RunTrace, exc: Exception) -> None:
+        self._record_trace_event(
+            trace,
+            event_type="run_failed",
+            summary="Run failed with an unhandled exception",
+            payload={"exception_type": type(exc).__name__, "error_preview": safe_preview(str(exc), limit=300)},
+        )
+        trace.complete(
+            status="failed",
+            final_metadata={"exception_type": type(exc).__name__, "error_preview": safe_preview(str(exc), limit=300)},
+        )
+        self._save_run_trace_safely(trace)
 
     def _refresh_memory_after_turn(self, *, turn_index: int) -> None:
         # Memory synthesis belongs after the assistant has finished the turn, not
@@ -345,6 +439,45 @@ class AgentOrchestrator:
             tool_messages=tool_messages,
         )
 
+    def _append_budget_exhausted_tool_messages(
+        self,
+        *,
+        messages: list[LLMMessage],
+        tool_calls: list[Any],
+        tool_messages: list[LLMMessage],
+        tool_names: list[str],
+        tool_statuses: list[ToolExecutionStatus],
+        trace: RunTrace | None = None,
+        iteration: int | None = None,
+    ) -> None:
+        for tool_call in tool_calls:
+            tool_content = f"Tool call skipped: maximum tool-call budget reached before executing {tool_call.name}."
+            tool_message = LLMMessage(role="tool", tool_call_id=tool_call.id, content=tool_content)
+            messages.append(tool_message)
+            tool_messages.append(tool_message)
+            tool_names.append(tool_call.name)
+            tool_statuses.append("budget_exhausted")
+            try:
+                arguments = json.loads(tool_call.arguments_json or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            self.session_manager.append_tool_history(
+                self._build_tool_history_item(
+                    tool_name=tool_call.name,
+                    arguments=arguments,
+                    tool_content=tool_content,
+                    status="budget_exhausted",
+                )
+            )
+            self._record_trace_event(
+                trace,
+                event_type="tool_call_skipped_budget_exhausted",
+                summary=f"Tool call skipped due to budget: {tool_call.name}",
+                iteration=iteration,
+                payload={"tool_name": tool_call.name, "content_length": len(tool_content)},
+                related_tool_call_id=tool_call.id,
+            )
+
     def _handle_provider_failure(self, *, error: LLMProviderError, user_input: str, turn_index: int) -> AgentTurnResult:
         logger.error(
             "LLM provider failure",
@@ -428,34 +561,57 @@ class AgentOrchestrator:
         messages = self._build_messages(user_input)
         turn_index = self.session_manager.get_next_turn_index()
         if run_options.mode in {"investigate", "deep_investigate"}:
-            return self._build_investigation_controller().run(
+            messages = with_investigation_guidance(messages, options=run_options)
+        trace = self._start_run_trace(
+            session_id=session_id,
+            run_options=run_options,
+            messages=messages,
+            turn_index=turn_index,
+        )
+        expose_trace_id = options is not None or run_options.mode in {"investigate", "deep_investigate"}
+        try:
+            if run_options.mode in {"investigate", "deep_investigate"}:
+                result = self._build_investigation_controller(trace=trace).run(
+                    user_input=user_input,
+                    session_id=session_id,
+                    context=context,
+                    messages=messages,
+                    turn_index=turn_index,
+                    options=run_options,
+                )
+                return self._finalize_run_trace_result(
+                    trace=trace,
+                    result=result,
+                    expose_trace_id=expose_trace_id,
+                )
+
+            tool_history_start_count = len(state.get("tool_history", [])) if isinstance(state.get("tool_history"), list) else 0
+            result = self._continue_turn(
                 user_input=user_input,
                 session_id=session_id,
                 context=context,
                 messages=messages,
                 turn_index=turn_index,
-                options=run_options,
+                tool_calls_used=0,
+                exchange_index=0,
+                trace=trace,
             )
-
-        tool_history_start_count = len(state.get("tool_history", [])) if isinstance(state.get("tool_history"), list) else 0
-        result = self._continue_turn(
-            user_input=user_input,
-            session_id=session_id,
-            context=context,
-            messages=messages,
-            turn_index=turn_index,
-            tool_calls_used=0,
-            exchange_index=0,
-        )
-        if options is not None:
-            result.metadata = {
-                **result.metadata,
-                "mode": run_options.mode,
-                "iterations_used": 1,
-                "tool_calls_used": self._tool_history_delta(start_count=tool_history_start_count),
-                "stop_reason": result.status,
-            }
-        return result
+            if options is not None:
+                result.metadata = {
+                    **result.metadata,
+                    "mode": run_options.mode,
+                    "iterations_used": 1,
+                    "tool_calls_used": self._tool_history_delta(start_count=tool_history_start_count),
+                    "stop_reason": result.status,
+                }
+            return self._finalize_run_trace_result(
+                trace=trace,
+                result=result,
+                expose_trace_id=expose_trace_id,
+            )
+        except Exception as exc:
+            self._fail_run_trace(trace, exc)
+            raise
 
     def resume_turn(
         self,
@@ -474,9 +630,20 @@ class AgentOrchestrator:
                 content=f"No pending agent turn found for pending_id={pending_id}",
             )
 
-        resumed = self._handle_pending_tool_result_once(pending=pending, tool_content=tool_content, ok=ok)
+        trace = self._load_run_trace_from_pending(pending)
+        self._record_trace_event(
+            trace,
+            event_type="pending_tool_result_received",
+            summary="External pending tool result received",
+            payload={"ok": ok, "content_length": len(tool_content)},
+        )
+        resumed = self._handle_pending_tool_result_once(pending=pending, tool_content=tool_content, ok=ok, trace=trace)
         if isinstance(resumed, AgentTurnResult):
-            return resumed
+            return (
+                self._finalize_run_trace_result(trace=trace, result=resumed, expose_trace_id=bool(resumed.metadata))
+                if trace is not None
+                else resumed
+            )
 
         context = ExecutionContext(
             session_id=session_id,
@@ -491,7 +658,7 @@ class AgentOrchestrator:
                 investigation_state = InvestigationState.create_template(objective=resumed.user_input)
             iterations_used = resumed.pending_payload.get("iterations_used")
             no_progress_iterations = resumed.pending_payload.get("no_progress_iterations")
-            return self._build_investigation_controller().resume_after_pending(
+            result = self._build_investigation_controller(trace=trace).resume_after_pending(
                 pending=resumed,
                 session_id=session_id,
                 context=context,
@@ -500,8 +667,13 @@ class AgentOrchestrator:
                 iterations_used=iterations_used if isinstance(iterations_used, int) else 1,
                 no_progress_iterations=no_progress_iterations if isinstance(no_progress_iterations, int) else 0,
             )
+            return (
+                self._finalize_run_trace_result(trace=trace, result=result, expose_trace_id=True)
+                if trace is not None
+                else result
+            )
 
-        return self._continue_turn(
+        result = self._continue_turn(
             user_input=resumed.user_input,
             session_id=session_id,
             context=context,
@@ -509,18 +681,35 @@ class AgentOrchestrator:
             turn_index=resumed.turn_index,
             tool_calls_used=resumed.tool_calls_used,
             exchange_index=resumed.exchange_index,
+            trace=trace,
+        )
+        return (
+            self._finalize_run_trace_result(trace=trace, result=result, expose_trace_id=bool(result.metadata))
+            if trace is not None
+            else result
         )
 
-    def _build_investigation_controller(self) -> InvestigationController:
+    def _build_investigation_controller(self, *, trace: RunTrace | None = None) -> InvestigationController:
         return InvestigationController(
             settings=self.settings,
             structured_synthesizer=self.structured_synthesizer,
             call_model_once=self._call_model_once,
-            execute_tool_calls_once=self._execute_tool_calls_once,
+            execute_tool_calls_once=lambda **kwargs: self._execute_tool_calls_once(**kwargs, trace=trace),
             persist_conversation_turn_once=self._persist_conversation_turn_once,
             refresh_memory_after_turn=self._refresh_memory_after_turn,
             handle_provider_failure=self._handle_provider_failure,
+            record_event=lambda **kwargs: self._record_trace_event(trace, **kwargs),
         )
+
+    def _load_run_trace_from_pending(self, pending: dict[str, Any]) -> RunTrace | None:
+        run_trace_id = pending.get("run_trace_id")
+        if not isinstance(run_trace_id, str) or not run_trace_id:
+            return None
+        payload = self.session_manager.load_run_trace(run_trace_id)
+        trace = RunTrace.from_any(payload)
+        if trace is None:
+            logger.warning("Pending run trace could not be loaded", extra={"run_trace_id": run_trace_id})
+        return trace
 
     def _call_model_once(
         self,
@@ -556,20 +745,38 @@ class AgentOrchestrator:
         assistant_message: LLMMessage,
         max_tool_calls: int,
         pending_metadata_extra: dict[str, Any] | None = None,
+        trace: RunTrace | None = None,
     ) -> ToolExecutionStepResult:
         tool_messages: list[LLMMessage] = []
         tool_statuses: list[ToolExecutionStatus] = []
         tool_names: list[str] = []
         tool_budget_exhausted = False
         current_exchange_index = exchange_index + 1
+        effective_pending_metadata_extra = dict(pending_metadata_extra or {})
+        if trace is not None:
+            effective_pending_metadata_extra["run_trace_id"] = trace.run_id
 
-        for tc in assistant_message.tool_calls:
+        for tool_call_offset, tc in enumerate(assistant_message.tool_calls):
             # The live provider transcript keeps growing inside the loop, but
             # persisted storage records each tool phase as an atomic
             # tool-exchange block once execution completes.
             if tool_calls_used >= max_tool_calls:
                 logger.error("Tool-call budget exhausted before executing remaining tool calls")
                 tool_budget_exhausted = True
+                self._record_trace_event(
+                    trace,
+                    event_type="tool_budget_exhausted",
+                    summary="Tool-call budget exhausted before executing remaining tool calls",
+                    payload={"tool_calls_used": tool_calls_used, "max_tool_calls": max_tool_calls},
+                )
+                self._append_budget_exhausted_tool_messages(
+                    messages=messages,
+                    tool_calls=assistant_message.tool_calls[tool_call_offset:],
+                    tool_messages=tool_messages,
+                    tool_names=tool_names,
+                    tool_statuses=tool_statuses,
+                    trace=trace,
+                )
                 break
 
             tool_calls_used += 1
@@ -577,6 +784,17 @@ class AgentOrchestrator:
             logger.info(
                 "Executing tool call",
                 extra={"tool_name": tc.name, "tool_call_index": tool_calls_used},
+            )
+            self._record_trace_event(
+                trace,
+                event_type="tool_call_started",
+                summary=f"Tool call started: {tc.name}",
+                payload={
+                    "tool_name": tc.name,
+                    "tool_call_index": tool_calls_used,
+                    "arguments_length": len(tc.arguments_json or ""),
+                },
+                related_tool_call_id=tc.id,
             )
 
             try:
@@ -631,11 +849,23 @@ class AgentOrchestrator:
                                 arguments=arguments,
                                 result_metadata=result.metadata,
                                 tool_messages=tool_messages,
-                                pending_metadata_extra=pending_metadata_extra,
+                                pending_metadata_extra=effective_pending_metadata_extra or None,
                             )
                             logger.info(
                                 "Tool execution is pending external result",
                                 extra={"tool_name": tc.name, "pending_id": pending_id},
+                            )
+                            self._record_trace_event(
+                                trace,
+                                event_type="tool_call_pending",
+                                summary=f"Tool call pending: {tc.name}",
+                                payload={
+                                    "tool_name": tc.name,
+                                    "pending_id": pending_id,
+                                    "content_length": len(tool_content),
+                                    "metadata": result.metadata,
+                                },
+                                related_tool_call_id=tc.id,
                             )
                             return ToolExecutionStepResult(
                                 messages=messages,
@@ -679,12 +909,34 @@ class AgentOrchestrator:
                     status=tool_status,
                 )
             )
+            self._record_trace_event(
+                trace,
+                event_type="tool_call_completed",
+                summary=f"Tool call completed: {tc.name}",
+                payload={
+                    "tool_name": tc.name,
+                    "status": tool_status,
+                    "content_length": len(tool_content),
+                },
+                related_tool_call_id=tc.id,
+            )
 
         self._persist_tool_exchange_once(
             turn_index=turn_index,
             exchange_index=current_exchange_index,
             assistant_message=assistant_message,
             tool_messages=tool_messages,
+        )
+        self._record_trace_event(
+            trace,
+            event_type="tool_exchange_completed",
+            summary="Tool exchange persisted",
+            payload={
+                "exchange_index": current_exchange_index,
+                "tool_names": list(tool_names),
+                "tool_statuses": list(tool_statuses),
+                "budget_exhausted": tool_budget_exhausted,
+            },
         )
         return ToolExecutionStepResult(
             messages=messages,
@@ -702,6 +954,7 @@ class AgentOrchestrator:
         pending: dict[str, Any],
         tool_content: str,
         ok: bool,
+        trace: RunTrace | None = None,
     ) -> PendingResumeState | AgentTurnResult:
         raw_messages = pending.get("messages")
         if not isinstance(raw_messages, list):
@@ -752,6 +1005,17 @@ class AgentOrchestrator:
                 tool_content=tool_content,
                 status="ok" if ok else "tool_error",
             )
+        )
+        self._record_trace_event(
+            trace,
+            event_type="pending_tool_result_persisted",
+            summary="Pending tool result persisted",
+            payload={
+                "tool_name": str(pending.get("tool_name") or "unknown"),
+                "status": "ok" if ok else "tool_error",
+                "content_length": len(tool_content),
+            },
+            related_tool_call_id=tool_call_id,
         )
         self.session_manager.set_meta_value(self.PENDING_TURN_META_KEY, None)
         return PendingResumeState(
@@ -804,12 +1068,15 @@ class AgentOrchestrator:
         turn_index: int,
         tool_calls_used: int,
         exchange_index: int,
+        trace: RunTrace | None = None,
     ) -> AgentTurnResult:
         start_prompt_tokens = self._estimate_prompt_tokens(messages=messages)
         tool_loop_reserve_tokens = max(1, self.settings.max_active_context_tokens)
         prompt_reserve_warning_emitted = False
+        model_call_index = 0
 
         while True:
+            model_call_index += 1
             prompt_tokens = self._estimate_prompt_tokens(messages=messages)
             prompt_growth_tokens = max(0, prompt_tokens - start_prompt_tokens)
             logger.debug(
@@ -839,9 +1106,28 @@ class AgentOrchestrator:
                     },
                 )
                 prompt_reserve_warning_emitted = True
+            self._record_trace_event(
+                trace,
+                event_type="llm_call_started",
+                summary="LLM call started",
+                iteration=model_call_index,
+                payload={
+                    "message_count": len(messages),
+                    "estimated_prompt_tokens": prompt_tokens,
+                    "tool_calls_used": tool_calls_used,
+                    "exchange_index": exchange_index,
+                },
+            )
             try:
                 llm_response = self._call_model_once(messages=messages)
             except LLMProviderError as exc:
+                self._record_trace_event(
+                    trace,
+                    event_type="llm_provider_failure",
+                    summary="LLM provider failure handled",
+                    iteration=model_call_index,
+                    payload={"kind": exc.kind, "detail_preview": safe_preview(exc.detail or exc.user_message, limit=200)},
+                )
                 return self._handle_provider_failure(
                     error=exc,
                     user_input=user_input,
@@ -862,6 +1148,20 @@ class AgentOrchestrator:
                 tool_calls=list(llm_response.tool_calls),
             )
             messages.append(assistant_message)
+            self._record_trace_event(
+                trace,
+                event_type="assistant_response_received",
+                summary="Assistant response received",
+                iteration=model_call_index,
+                payload={
+                    "content_length": len(llm_response.content),
+                    "tool_call_count": len(llm_response.tool_calls),
+                    "tool_calls": [
+                        {"id": tool_call.id, "name": tool_call.name}
+                        for tool_call in llm_response.tool_calls
+                    ],
+                },
+            )
 
             if not llm_response.tool_calls:
                 self._persist_conversation_turn(
@@ -875,14 +1175,33 @@ class AgentOrchestrator:
 
             if tool_calls_used >= self.settings.max_tool_calls_per_turn:
                 exchange_index += 1
+                tool_messages: list[LLMMessage] = []
+                tool_statuses: list[ToolExecutionStatus] = []
+                tool_names: list[str] = []
+                self._append_budget_exhausted_tool_messages(
+                    messages=messages,
+                    tool_calls=assistant_message.tool_calls,
+                    tool_messages=tool_messages,
+                    tool_names=tool_names,
+                    tool_statuses=tool_statuses,
+                    trace=trace,
+                    iteration=model_call_index,
+                )
                 self._persist_tool_exchange_once(
                     turn_index=turn_index,
                     exchange_index=exchange_index,
                     assistant_message=assistant_message,
-                    tool_messages=[],
+                    tool_messages=tool_messages,
                 )
                 msg = "Maximum number of tool calls reached for this turn."
                 logger.error(msg)
+                self._record_trace_event(
+                    trace,
+                    event_type="tool_budget_exhausted",
+                    summary=msg,
+                    iteration=model_call_index,
+                    payload={"tool_calls_used": tool_calls_used},
+                )
                 self._persist_conversation_turn(
                     turn_index=turn_index,
                     user_input=user_input,
@@ -901,6 +1220,7 @@ class AgentOrchestrator:
                 tool_calls_used=tool_calls_used,
                 assistant_message=assistant_message,
                 max_tool_calls=self.settings.max_tool_calls_per_turn,
+                trace=trace,
             )
             messages = tool_step.messages
             exchange_index = tool_step.exchange_index
@@ -912,6 +1232,13 @@ class AgentOrchestrator:
             if tool_step.budget_exhausted:
                 msg = "Maximum number of tool calls reached for this turn."
                 logger.error(msg)
+                self._record_trace_event(
+                    trace,
+                    event_type="tool_budget_exhausted",
+                    summary=msg,
+                    iteration=model_call_index,
+                    payload={"tool_calls_used": tool_calls_used},
+                )
                 self._persist_conversation_turn(
                     turn_index=turn_index,
                     user_input=user_input,

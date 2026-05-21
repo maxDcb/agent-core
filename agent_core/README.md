@@ -49,6 +49,23 @@ The runtime depends on:
 - `openai`
 - `requests`
 
+### OpenAI Chat Completions compatibility
+
+`OpenAIProvider` and `AzureOpenAIProvider` use Chat Completions.
+Before dispatch, they normalize model-sensitive parameters through a shared
+request policy:
+
+- known non-reasoning chat models omit unsupported `reasoning_effort`
+- known reasoning model families omit custom `temperature`
+- reasoning model families use `max_completion_tokens` instead of deprecated
+  `max_tokens`
+- opaque model names, common with Azure deployment names, keep the requested
+  payload first and learn unsupported parameters from controlled `BadRequest`
+  retries
+
+The adaptive retry path is a safety net for unknown deployments and provider
+drift. It should not be the normal path for known OpenAI model families.
+
 ## Packaging Notes
 
 - Typed package marker: `py.typed`

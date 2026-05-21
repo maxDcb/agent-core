@@ -16,7 +16,8 @@ from openai import (
 from agent_core.logging_utils import get_logger
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
-from agent_core.llm.openai_compat import create_chat_completion_with_reasoning_fallback
+from agent_core.llm.openai_compat import create_chat_completion_with_adaptive_retry
+from agent_core.llm.openai_request_policy import OpenAIChatRequestNormalizer, OpenAIModelCapabilityResolver
 
 logger = get_logger(__name__)
 
@@ -37,6 +38,7 @@ class AzureOpenAIProvider:
         azure_endpoint: str | None = None,
         api_key: str | None = None,
         api_version: str | None = None,
+        capability_resolver: OpenAIModelCapabilityResolver | None = None,
     ) -> None:
         self.azure_endpoint_configured = bool(azure_endpoint)
         self.api_key_configured = bool(api_key)
@@ -44,6 +46,8 @@ class AzureOpenAIProvider:
         self.azure_endpoint = azure_endpoint
         self.api_key = api_key
         self.client: AzureOpenAI | None = None
+        self.capability_resolver = capability_resolver or OpenAIModelCapabilityResolver()
+        self.request_normalizer = OpenAIChatRequestNormalizer(self.capability_resolver)
 
         logger.debug(
             "Azure OpenAI provider initialized",
@@ -173,11 +177,17 @@ class AzureOpenAIProvider:
                     request["max_tokens"] = options.max_output_tokens
                 if options.reasoning_effort:
                     request["reasoning_effort"] = options.reasoning_effort
-            response = create_chat_completion_with_reasoning_fallback(
+            normalization = self.request_normalizer.normalize(request)
+            request = normalization.request
+            for change in normalization.changes:
+                logger.debug("Adjusted Azure OpenAI chat completion request", extra={"model": model, "change": change})
+
+            response = create_chat_completion_with_adaptive_retry(
                 completions=client.chat.completions,
                 request=request,
                 provider_name="Azure OpenAI",
                 logger=logger,
+                capability_resolver=self.capability_resolver,
             )
         except AuthenticationError as exc:
             logger.exception("Azure OpenAI authentication failed")
