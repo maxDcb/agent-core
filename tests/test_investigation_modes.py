@@ -303,6 +303,31 @@ def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_pa
     assert result.metadata["investigation_state"]["facts"] == ["echo returned fact"]
 
 
+def test_investigation_does_not_finalize_when_reflection_requires_continuation(tmp_path) -> None:
+    provider = ScriptedProvider(
+        chat=[tool_call(value="partial")],
+        reflections=[
+            reflection_payload(
+                new_facts=["partial evidence saved"],
+                remaining_gaps=["validated finding missing"],
+                recommended_next_actions=["save validated finding"],
+                should_continue=True,
+            )
+        ],
+        decisions=[decision_payload("final", reason_summary="inconsistent final")],
+    )
+    orchestrator = build_orchestrator(tmp_path, provider)
+
+    result = orchestrator.run_turn_result(
+        "investigate",
+        options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
+    )
+
+    assert result.metadata["stop_reason"] == "max_iterations"
+    assert "partial evidence saved" in result.content
+    assert "validated finding missing" in result.content
+
+
 def test_investigation_stops_at_max_iterations_with_budget_answer(tmp_path) -> None:
     provider = ScriptedProvider(
         chat=[tool_call()],

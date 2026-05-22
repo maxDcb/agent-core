@@ -502,7 +502,17 @@ class InvestigationController:
                 no_progress_iterations,
             )
 
-        if decision.kind == "final" or (
+        if decision.kind == "final" and reflection.should_continue:
+            self._record_event(
+                event_type="decision_overridden",
+                summary="Final decision overridden because reflection still requires continuation",
+                iteration=iterations_used,
+                payload={
+                    "decision": decision.to_dict(),
+                    "reflection": reflection.to_dict(),
+                },
+            )
+        elif decision.kind == "final" or (
             not reflection.should_continue and state.confidence >= options.min_confidence_to_answer
         ):
             return (
