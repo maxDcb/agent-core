@@ -20,14 +20,12 @@ class SessionRepository:
         self.default_session_file.parent.mkdir(parents=True, exist_ok=True)
         self.session_directory = self.default_session_file.parent
         self.session_directory.mkdir(parents=True, exist_ok=True)
-        self.trace_directory = self.session_directory / "traces"
         self.storage_backend = "json"
         logger.debug(
             "Session repository ready",
             extra={
                 "default_session_file": str(self.default_session_file),
                 "session_directory": str(self.session_directory),
-                "trace_directory": str(self.trace_directory),
             },
         )
 
@@ -70,6 +68,7 @@ class SessionRepository:
 
     def save(self, session_id: str, state: SessionState) -> None:
         session_file = self._resolve_session_file(session_id)
+        session_file.parent.mkdir(parents=True, exist_ok=True)
         temp_file = session_file.with_suffix(f"{session_file.suffix}.tmp")
         # Replace-on-write avoids leaving a partially written session file behind on normal save paths.
         logger.trace("Saving session state", extra={"session_file": str(session_file), "session_id": session_id})
@@ -190,13 +189,14 @@ class SessionRepository:
         return normalized
 
     def _resolve_session_file(self, session_id: str) -> Path:
-        # The default session keeps the configured file name, while named sessions live alongside it.
-        if session_id == "default":
-            return self.default_session_file
-        return self.session_directory / f"{self._sanitize_session_id(session_id)}.json"
+        sanitized_session_id = self._sanitize_session_id(session_id)
+        return self._resolve_session_directory(session_id) / f"{sanitized_session_id}.json"
+
+    def _resolve_session_directory(self, session_id: str) -> Path:
+        return self.session_directory / self._sanitize_session_id(session_id)
 
     def _resolve_trace_directory(self, session_id: str) -> Path:
-        return self.trace_directory / self._sanitize_session_id(session_id)
+        return self._resolve_session_directory(session_id) / "traces"
 
     def _resolve_trace_file(self, *, session_id: str, run_id: str) -> Path:
         return self._resolve_trace_directory(session_id) / f"{self._sanitize_session_id(run_id)}.json"
