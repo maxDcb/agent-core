@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from threading import Lock, RLock
 from typing import Any
 
 from agent_core.logging_utils import get_logger
@@ -26,25 +30,102 @@ class SessionManager:
 
     def __init__(self, repo: SessionRepository, *, default_session_id: str = "default") -> None:
         self.repo = repo
-        self.session_id = ""
-        self.state: SessionState = build_empty_session_state(
-            session_id=default_session_id,
-            storage_backend=self.repo.storage_backend,
-        )
+        self._session_id_var: ContextVar[str] = ContextVar("session_id", default=default_session_id)
+        self._state_var: ContextVar[SessionState | None] = ContextVar("session_state", default=None)
+        self._scope_depth_var: ContextVar[int] = ContextVar("session_scope_depth", default=0)
+        self._locks_guard = Lock()
+        self._session_locks: dict[str, RLock] = {}
+        self._active_session_id = default_session_id
         self.activate_session(default_session_id)
 
+    @property
+    def session_id(self) -> str:
+        if self._scope_depth_var.get() > 0:
+            return self._session_id_var.get()
+        return self._active_session_id
+
+    @property
+    def state(self) -> SessionState:
+        session_id = self.session_id
+        state = self._state_var.get()
+        if state is None or self._session_id_var.get() != session_id:
+            self._session_id_var.set(session_id)
+            state = self.repo.load(session_id)
+            self._state_var.set(state)
+        return state
+
+    @state.setter
+    def state(self, value: SessionState) -> None:
+        self._state_var.set(value)
+
     def activate_session(self, session_id: str) -> None:
-        if session_id == self.session_id and self.state:
+        with self._locks_guard:
+            self._active_session_id = session_id
+
+        if session_id == self._session_id_var.get() and self._state_var.get() is not None:
             logger.trace("Session already active", extra={"session_id": session_id})
             return
 
         # Session switching is explicit so the storage layer can later move from JSON files to SQLite cleanly.
-        self.session_id = session_id
+        self._session_id_var.set(session_id)
         self.state = self.repo.load(session_id)
         logger.info(
             "Activated session",
             extra={"session_id": session_id, "context_block_count": len(self.state.get("context_blocks", []))},
         )
+
+    @contextmanager
+    def session_scope(self, session_id: str) -> Iterator[None]:
+        """Bind the active session to the current execution context.
+
+        A shared SessionManager can be used by concurrent requests. Each
+        request receives its own context-local state, while same-session turns
+        are serialized by a per-session lock. Nested scopes for the same
+        session reuse the already-loaded state so API handlers can wrap a full
+        request and the orchestrator can still protect direct callers.
+        """
+
+        depth = self._scope_depth_var.get()
+        if depth > 0 and self.session_id == session_id:
+            depth_token = self._scope_depth_var.set(depth + 1)
+            try:
+                yield
+            finally:
+                self._scope_depth_var.reset(depth_token)
+            return
+
+        previous_context_session_id = self._session_id_var.get()
+        previous_context_state = self._state_var.get()
+        lock = self._lock_for_session(session_id)
+        lock.acquire()
+        session_token = self._session_id_var.set(session_id)
+        state_token = self._state_var.set(self.repo.load(session_id))
+        depth_token = self._scope_depth_var.set(1)
+        try:
+            logger.trace("Entered session scope", extra={"session_id": session_id})
+            yield
+        finally:
+            scoped_state = self._state_var.get()
+            self._scope_depth_var.reset(depth_token)
+            self._state_var.reset(state_token)
+            self._session_id_var.reset(session_token)
+            if previous_context_session_id == session_id and previous_context_state is not None and scoped_state is not None:
+                self._session_id_var.set(session_id)
+                self._state_var.set(scoped_state)
+            lock.release()
+            logger.trace("Exited session scope", extra={"session_id": session_id})
+
+    def reset_session(self, session_id: str) -> None:
+        with self.session_scope(session_id):
+            self.reset()
+
+    def load_run_trace_for_session(self, session_id: str, run_id: str) -> dict[str, object] | None:
+        with self.session_scope(session_id):
+            return self.load_run_trace(run_id)
+
+    def list_run_traces_for_session(self, session_id: str) -> list[dict[str, object]]:
+        with self.session_scope(session_id):
+            return self.list_run_traces()
 
     def get_state(self) -> SessionState:
         logger.trace("Returning current session state")
@@ -190,3 +271,11 @@ class SessionManager:
 
     def _store_context_blocks(self, blocks: list[ContextBlock]) -> None:
         self.state["context_blocks"] = [block.to_dict() for block in blocks]
+
+    def _lock_for_session(self, session_id: str) -> RLock:
+        with self._locks_guard:
+            lock = self._session_locks.get(session_id)
+            if lock is None:
+                lock = RLock()
+                self._session_locks[session_id] = lock
+            return lock

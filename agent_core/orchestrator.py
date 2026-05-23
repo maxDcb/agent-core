@@ -545,8 +545,16 @@ class AgentOrchestrator:
         session_id: str = "default",
         options: RunOptions | None = None,
     ) -> AgentTurnResult:
+        with self.session_manager.session_scope(session_id):
+            return self._run_turn_result_active(user_input=user_input, session_id=session_id, options=options)
+
+    def _run_turn_result_active(
+        self,
+        user_input: str,
+        session_id: str,
+        options: RunOptions | None,
+    ) -> AgentTurnResult:
         run_options = options or RunOptions.direct()
-        self.session_manager.activate_session(session_id)
         logger.info(
             "Starting run_turn",
             extra={"session_id": session_id, "user_input_length": len(user_input), "mode": run_options.mode},
@@ -621,7 +629,22 @@ class AgentOrchestrator:
         ok: bool = True,
         session_id: str = "default",
     ) -> AgentTurnResult:
-        self.session_manager.activate_session(session_id)
+        with self.session_manager.session_scope(session_id):
+            return self._resume_turn_active(
+                pending_id=pending_id,
+                tool_content=tool_content,
+                ok=ok,
+                session_id=session_id,
+            )
+
+    def _resume_turn_active(
+        self,
+        *,
+        pending_id: str,
+        tool_content: str,
+        ok: bool,
+        session_id: str,
+    ) -> AgentTurnResult:
         state = self.session_manager.get_state()
         pending = state.get("meta", {}).get(self.PENDING_TURN_META_KEY)
         if not isinstance(pending, dict) or pending.get("pending_id") != pending_id:

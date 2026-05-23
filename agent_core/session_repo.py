@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import NamedTemporaryFile
+from typing import Protocol
 
 from agent_core.logging_utils import get_logger
 from agent_core.memory.context_block import ContextBlock
@@ -14,7 +17,78 @@ from agent_core.types import SessionState, build_empty_session_state
 logger = get_logger(__name__)
 
 
+class SessionStore(Protocol):
+    storage_backend: str
+
+    def load(self, session_id: str) -> SessionState:
+        ...
+
+    def save(self, session_id: str, state: SessionState) -> None:
+        ...
+
+    def save_run_trace(self, session_id: str, trace_payload: dict[str, object]) -> None:
+        ...
+
+    def load_run_trace(self, session_id: str, run_id: str) -> dict[str, object] | None:
+        ...
+
+    def list_run_traces(self, session_id: str) -> list[dict[str, object]]:
+        ...
+
+    def list_session_ids(self) -> list[str]:
+        ...
+
+    def describe(self) -> dict[str, object]:
+        ...
+
+
 class SessionRepository:
+    """Facade around the configured session storage implementation."""
+
+    def __init__(self, session_file: Path | None = None, *, store: SessionStore | None = None) -> None:
+        if store is None:
+            if session_file is None:
+                raise ValueError("SessionRepository requires either a session_file or a store")
+            store = JsonFileSessionStore(session_file)
+        elif session_file is not None:
+            raise ValueError("Provide either session_file or store, not both")
+
+        self.store = store
+
+    @property
+    def storage_backend(self) -> str:
+        return self.store.storage_backend
+
+    @property
+    def session_directory(self) -> Path:
+        session_directory = getattr(self.store, "session_directory", None)
+        if isinstance(session_directory, Path):
+            return session_directory
+        raise AttributeError("The configured session store does not expose a filesystem session_directory")
+
+    def load(self, session_id: str) -> SessionState:
+        return self.store.load(session_id)
+
+    def save(self, session_id: str, state: SessionState) -> None:
+        self.store.save(session_id, state)
+
+    def save_run_trace(self, session_id: str, trace_payload: dict[str, object]) -> None:
+        self.store.save_run_trace(session_id, trace_payload)
+
+    def load_run_trace(self, session_id: str, run_id: str) -> dict[str, object] | None:
+        return self.store.load_run_trace(session_id, run_id)
+
+    def list_run_traces(self, session_id: str) -> list[dict[str, object]]:
+        return self.store.list_run_traces(session_id)
+
+    def list_session_ids(self) -> list[str]:
+        return self.store.list_session_ids()
+
+    def describe(self) -> dict[str, object]:
+        return self.store.describe()
+
+
+class JsonFileSessionStore:
     def __init__(self, session_file: Path) -> None:
         self.default_session_file = session_file
         self.default_session_file.parent.mkdir(parents=True, exist_ok=True)
@@ -67,14 +141,10 @@ class SessionRepository:
         return normalized
 
     def save(self, session_id: str, state: SessionState) -> None:
-        session_file = self._resolve_session_file(session_id)
-        session_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = session_file.with_suffix(f"{session_file.suffix}.tmp")
         # Replace-on-write avoids leaving a partially written session file behind on normal save paths.
+        session_file = self._resolve_session_file(session_id)
         logger.trace("Saving session state", extra={"session_file": str(session_file), "session_id": session_id})
-        with temp_file.open("w", encoding="utf-8") as fh:
-            json.dump(state, fh, indent=2, ensure_ascii=False)
-        temp_file.replace(session_file)
+        self._atomic_write_json(session_file, state)
 
     def save_run_trace(self, session_id: str, trace_payload: dict[str, object]) -> None:
         run_id = trace_payload.get("run_id")
@@ -82,15 +152,11 @@ class SessionRepository:
             raise ValueError("Run trace payload must include a non-empty run_id")
 
         trace_file = self._resolve_trace_file(session_id=session_id, run_id=run_id)
-        trace_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_file = trace_file.with_suffix(f"{trace_file.suffix}.tmp")
         logger.trace(
             "Saving run trace",
             extra={"trace_file": str(trace_file), "session_id": session_id, "run_id": run_id},
         )
-        with temp_file.open("w", encoding="utf-8") as fh:
-            json.dump(trace_payload, fh, indent=2, ensure_ascii=False)
-        temp_file.replace(trace_file)
+        self._atomic_write_json(trace_file, trace_payload)
 
     def load_run_trace(self, session_id: str, run_id: str) -> dict[str, object] | None:
         trace_file = self._resolve_trace_file(session_id=session_id, run_id=run_id)
@@ -130,6 +196,25 @@ class SessionRepository:
             key=lambda item: str(item.get("started_at") or ""),
             reverse=True,
         )
+
+    def list_session_ids(self) -> list[str]:
+        session_ids: set[str] = set()
+        if not self.session_directory.exists():
+            return []
+        for session_dir in self.session_directory.iterdir():
+            if not session_dir.is_dir():
+                continue
+            session_file = session_dir / f"{session_dir.name}.json"
+            if session_file.exists():
+                session_ids.add(session_dir.name)
+        return sorted(session_ids)
+
+    def describe(self) -> dict[str, object]:
+        return {
+            "backend": self.storage_backend,
+            "session_directory": str(self.session_directory),
+            "default_session_file": str(self.default_session_file),
+        }
 
     def _normalize_state(self, state: object) -> SessionState:
         normalized = build_empty_session_state(storage_backend=self.storage_backend)
@@ -210,3 +295,26 @@ class SessionRepository:
         backup_path = session_file.with_suffix(f"{session_file.suffix}.corrupt.{suffix}")
         session_file.replace(backup_path)
         return backup_path
+
+    def _atomic_write_json(self, path: Path, payload: object) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            temporary_path = Path(handle.name)
+        temporary_path.replace(path)
+        self._fsync_directory(path.parent)
+
+    def _fsync_directory(self, directory: Path) -> None:
+        try:
+            directory_fd = os.open(directory, os.O_RDONLY)
+        except OSError:
+            return
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+        finally:
+            os.close(directory_fd)
