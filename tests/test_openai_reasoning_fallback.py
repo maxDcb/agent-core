@@ -3,7 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import httpx
-from openai import BadRequestError, RateLimitError
+from openai import APIStatusError, BadRequestError, RateLimitError
 
 from agent_core.llm.azure_openai_provider import AzureOpenAIProvider
 from agent_core.llm.base import LLMCallOptions, LLMMessage
@@ -87,6 +87,19 @@ def _rate_limit_error(*, retry_after: str | None = None) -> RateLimitError:
             request=httpx.Request("POST", "https://api.openai.test/v1/chat/completions"),
         ),
         body={"error": {"message": "Rate limit reached"}},
+    )
+
+
+def _api_status_error(status_code: int, *, retry_after: str | None = None) -> APIStatusError:
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return APIStatusError(
+        f"HTTP {status_code}",
+        response=httpx.Response(
+            status_code,
+            headers=headers,
+            request=httpx.Request("POST", "https://api.openai.test/v1/chat/completions"),
+        ),
+        body={"error": {"message": f"HTTP {status_code}"}},
     )
 
 
@@ -246,6 +259,46 @@ def test_openai_compat_retries_rate_limit_with_retry_after() -> None:
     assert response.choices[0].message.content == "ok"
     assert sleeps == [3.0]
     assert len(completions.requests) == 2
+
+
+def test_openai_compat_retries_transient_provider_status_errors() -> None:
+    completions = ScriptedCompletions(_api_status_error(502, retry_after="4"), _text_response("ok"))
+    sleeps: list[float] = []
+
+    response = create_chat_completion_with_adaptive_retry(
+        completions=completions,
+        request={"model": "deployment-name", "messages": []},
+        provider_name="Azure OpenAI",
+        logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
+        rate_limit_policy=OpenAIRateLimitRetryPolicy(max_attempts=2, jitter_ratio=0.0),
+        sleeper=sleeps.append,
+        random_fn=lambda: 0.5,
+    )
+
+    assert response.choices[0].message.content == "ok"
+    assert sleeps == [4.0]
+    assert len(completions.requests) == 2
+
+
+def test_openai_compat_does_not_retry_non_transient_provider_status_errors() -> None:
+    completions = ScriptedCompletions(_api_status_error(401), _text_response("should-not-run"))
+
+    try:
+        create_chat_completion_with_adaptive_retry(
+            completions=completions,
+            request={"model": "deployment-name", "messages": []},
+            provider_name="Azure OpenAI",
+            logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
+            rate_limit_policy=OpenAIRateLimitRetryPolicy(max_attempts=2, initial_delay_seconds=0.0, jitter_ratio=0.0),
+            sleeper=lambda seconds: None,
+            random_fn=lambda: 0.5,
+        )
+    except APIStatusError:
+        pass
+    else:
+        raise AssertionError("Expected APIStatusError")
+
+    assert len(completions.requests) == 1
 
 
 def test_openai_compat_preserves_bad_request_fallback_across_rate_limit_retry() -> None:

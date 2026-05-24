@@ -7,7 +7,7 @@ import random
 import time
 from typing import Any
 
-from openai import BadRequestError, RateLimitError
+from openai import APIConnectionError, APIStatusError, APITimeoutError, BadRequestError, RateLimitError
 
 from agent_core.llm.openai_request_policy import OpenAIModelCapabilityResolver, select_bad_request_retry_action
 
@@ -30,7 +30,7 @@ class OpenAIRateLimitRetryPolicy:
             jitter_ratio=_env_float(f"{prefix}JITTER_RATIO", cls.jitter_ratio),
         )
 
-    def retry_delay_seconds(self, *, exc: RateLimitError, attempt_index: int, random_value: float) -> float:
+    def retry_delay_seconds(self, *, exc: BaseException, attempt_index: int, random_value: float) -> float:
         retry_after = _retry_after_seconds(exc)
         if retry_after is not None:
             return min(self.max_delay_seconds, max(0.0, retry_after))
@@ -65,26 +65,17 @@ def create_chat_completion_with_adaptive_retry(
         try:
             return completions.create(**fallback_request)
         except RateLimitError as exc:
-            if attempt >= policy.max_attempts:
-                raise
-
-            delay_seconds = policy.retry_delay_seconds(
+            attempt = _retry_after_transient_error(
                 exc=exc,
-                attempt_index=attempt,
-                random_value=float(random_fn()),
+                attempt=attempt,
+                policy=policy,
+                provider_name=provider_name,
+                logger=logger,
+                fallback_request=fallback_request,
+                sleeper=sleeper,
+                random_fn=random_fn,
+                log_message="%s rate limited chat completion request; retrying",
             )
-            logger.warning(
-                "%s rate limited chat completion request; retrying",
-                provider_name,
-                extra={
-                    "model": fallback_request.get("model"),
-                    "attempt": attempt,
-                    "max_attempts": policy.max_attempts,
-                    "delay_seconds": round(delay_seconds, 3),
-                },
-            )
-            sleeper(delay_seconds)
-            attempt += 1
         except BadRequestError as exc:
             retry_action = select_bad_request_retry_action(exc, fallback_request)
             if retry_action is None or retry_action.parameter in retried_without:
@@ -107,6 +98,20 @@ def create_chat_completion_with_adaptive_retry(
             )
             fallback_request.pop(retry_action.parameter, None)
             retried_without.add(retry_action.parameter)
+        except (APIConnectionError, APITimeoutError, APIStatusError) as exc:
+            if not _is_retryable_transient_error(exc):
+                raise
+            attempt = _retry_after_transient_error(
+                exc=exc,
+                attempt=attempt,
+                policy=policy,
+                provider_name=provider_name,
+                logger=logger,
+                fallback_request=fallback_request,
+                sleeper=sleeper,
+                random_fn=random_fn,
+                log_message="%s transient chat completion error; retrying",
+            )
 
 
 def create_chat_completion_with_reasoning_fallback(
@@ -124,7 +129,52 @@ def create_chat_completion_with_reasoning_fallback(
     )
 
 
-def _retry_after_seconds(exc: RateLimitError) -> float | None:
+def _retry_after_transient_error(
+    *,
+    exc: BaseException,
+    attempt: int,
+    policy: OpenAIRateLimitRetryPolicy,
+    provider_name: str,
+    logger: Any,
+    fallback_request: dict[str, Any],
+    sleeper: Any,
+    random_fn: Any,
+    log_message: str,
+) -> int:
+    if attempt >= policy.max_attempts:
+        raise exc
+
+    delay_seconds = policy.retry_delay_seconds(
+        exc=exc,
+        attempt_index=attempt,
+        random_value=float(random_fn()),
+    )
+    logger.warning(
+        log_message,
+        provider_name,
+        extra={
+            "model": fallback_request.get("model"),
+            "attempt": attempt,
+            "max_attempts": policy.max_attempts,
+            "delay_seconds": round(delay_seconds, 3),
+            "error_type": type(exc).__name__,
+            "status_code": getattr(exc, "status_code", None),
+        },
+    )
+    sleeper(delay_seconds)
+    return attempt + 1
+
+
+def _is_retryable_transient_error(exc: BaseException) -> bool:
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        status_code = getattr(exc, "status_code", None)
+        return status_code in {408, 409, 425, 429} or (isinstance(status_code, int) and status_code >= 500)
+    return False
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
     response = getattr(exc, "response", None)
     headers = getattr(response, "headers", None)
     if not headers:
