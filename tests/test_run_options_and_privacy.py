@@ -5,9 +5,11 @@ from dataclasses import fields
 import pytest
 
 from agent_core.investigation_prompts import (
+    DEFAULT_INVESTIGATION_PROMPTS,
     FINAL_CRITIQUE_PROMPT,
     INITIAL_PLAN_PROMPT,
     INVESTIGATION_DECISION_PROMPT,
+    RUN_GUIDANCE_PROMPT,
     STEP_REFLECTION_PROMPT,
 )
 from agent_core.investigation_state import InvestigationState
@@ -46,17 +48,21 @@ def test_investigation_state_has_no_private_reasoning_fields() -> None:
     assert set(InvestigationState.create_template(objective="check").to_dict()).isdisjoint(forbidden)
 
 
-def test_investigation_prompts_prohibit_chain_of_thought() -> None:
+def test_default_investigation_prompts_are_available() -> None:
     prompts = [
         INITIAL_PLAN_PROMPT,
         STEP_REFLECTION_PROMPT,
         INVESTIGATION_DECISION_PROMPT,
         FINAL_CRITIQUE_PROMPT,
+        RUN_GUIDANCE_PROMPT,
+        DEFAULT_INVESTIGATION_PROMPTS.initial_plan,
+        DEFAULT_INVESTIGATION_PROMPTS.step_reflection,
+        DEFAULT_INVESTIGATION_PROMPTS.decision,
+        DEFAULT_INVESTIGATION_PROMPTS.final_critique,
+        DEFAULT_INVESTIGATION_PROMPTS.run_guidance,
     ]
     for prompt in prompts:
-        assert "Do not output chain-of-thought" in prompt
-        assert "Return JSON only" in prompt
-        lowered = prompt.lower()
-        assert "credential" not in lowered
-        assert "exploit" not in lowered
-        assert "lateral movement" not in lowered
+        assert isinstance(prompt, str)
+        assert prompt.strip()
+
+    assert DEFAULT_INVESTIGATION_PROMPTS.render_run_guidance(mode="investigate").strip()

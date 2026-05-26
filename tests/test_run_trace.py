@@ -67,10 +67,10 @@ class ScriptedProvider:
         return self.chat.pop(0)
 
     def complete_text(self, *, messages, model, temperature, options=None):
-        system_prompt = messages[0].content
-        if "updating a generic investigation state" in system_prompt:
+        target = (options.metadata or {}).get("target") if options is not None else None
+        if target == "investigation_step_reflection":
             return json.dumps(reflection_payload())
-        if "choosing the next generic investigation action" in system_prompt:
+        if target == "investigation_decision":
             return json.dumps(decision_payload())
         return json.dumps(task_state_payload())
 

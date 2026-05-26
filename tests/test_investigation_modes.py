@@ -114,13 +114,14 @@ class ScriptedProvider:
         self.text_options.append(options)
         system_prompt = messages[0].content
         self.text_prompts.append(system_prompt)
-        if "preparing a generic bounded investigation plan" in system_prompt:
+        target = (options.metadata or {}).get("target") if options is not None else None
+        if target == "investigation_initial_plan":
             return json.dumps(self.plans.pop(0))
-        if "updating a generic investigation state" in system_prompt:
+        if target == "investigation_step_reflection":
             return json.dumps(self.reflections.pop(0))
-        if "choosing the next generic investigation action" in system_prompt:
+        if target == "investigation_decision":
             return json.dumps(self.decisions.pop(0))
-        if "critiquing a final draft" in system_prompt:
+        if target == "investigation_final_critique":
             return json.dumps(self.critiques.pop(0))
         return json.dumps(task_state_payload())
 
