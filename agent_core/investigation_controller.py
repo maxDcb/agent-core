@@ -6,10 +6,8 @@ from typing import Any, Protocol
 from agent_core.execution_context import ExecutionContext
 from agent_core.investigation_models import FinalCritique, InvestigationDecision, StepReflection
 from agent_core.investigation_prompts import (
-    FINAL_CRITIQUE_PROMPT,
-    INITIAL_PLAN_PROMPT,
-    INVESTIGATION_DECISION_PROMPT,
-    STEP_REFLECTION_PROMPT,
+    DEFAULT_INVESTIGATION_PROMPTS,
+    InvestigationPromptSet,
 )
 from agent_core.investigation_state import InvestigationState
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage
@@ -80,20 +78,22 @@ class TraceRecorder(Protocol):
         ...
 
 
-def with_investigation_guidance(messages: list[LLMMessage], *, options: RunOptions) -> list[LLMMessage]:
+def with_investigation_guidance(
+    messages: list[LLMMessage],
+    *,
+    options: RunOptions,
+    prompt_set: InvestigationPromptSet | None = None,
+) -> list[LLMMessage]:
     if any(
         message.role == "system" and message.content.startswith(f"Run mode: {options.mode}.")
         for message in messages
     ):
         return list(messages)
 
+    prompts = prompt_set or DEFAULT_INVESTIGATION_PROMPTS
     guidance = LLMMessage(
         role="system",
-        content=(
-            f"Run mode: {options.mode}. Work within the bounded investigation loop. "
-            "Use tools only when useful and in scope. Do not expose chain-of-thought; "
-            "final responses should summarize auditable findings and uncertainty."
-        ),
+        content=prompts.render_run_guidance(mode=options.mode),
     )
     if messages and messages[-1].role == "user":
         return [*messages[:-1], guidance, messages[-1]]
@@ -119,6 +119,7 @@ class InvestigationController:
         refresh_memory_after_turn: MemoryRefresher,
         handle_provider_failure: ProviderFailureHandler,
         record_event: TraceRecorder | None = None,
+        prompt_set: InvestigationPromptSet | None = None,
     ) -> None:
         self.settings = settings
         self.structured_synthesizer = structured_synthesizer
@@ -128,6 +129,7 @@ class InvestigationController:
         self.refresh_memory_after_turn = refresh_memory_after_turn
         self.handle_provider_failure = handle_provider_failure
         self.record_event = record_event
+        self.prompt_set = prompt_set or DEFAULT_INVESTIGATION_PROMPTS
 
     def _record_event(
         self,
@@ -192,7 +194,7 @@ class InvestigationController:
             user_input=user_input,
             session_id=session_id,
             context=context,
-            messages=with_investigation_guidance(messages, options=options),
+            messages=with_investigation_guidance(messages, options=options, prompt_set=self.prompt_set),
             turn_index=turn_index,
             options=options,
             state=state,
@@ -716,7 +718,7 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_initial_plan",
-                instructions=INITIAL_PLAN_PROMPT,
+                instructions=self.prompt_set.initial_plan,
                 output_format=InvestigationState.create_template(objective=user_input).to_dict(),
                 payload={"objective": user_input, "current_state": state.to_dict()},
                 parser=InvestigationState.from_any,
@@ -747,7 +749,7 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_step_reflection",
-                instructions=STEP_REFLECTION_PROMPT,
+                instructions=self.prompt_set.step_reflection,
                 output_format=StepReflection.create_template().to_dict(),
                 payload=payload,
                 parser=StepReflection.from_any,
@@ -778,7 +780,7 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_decision",
-                instructions=INVESTIGATION_DECISION_PROMPT,
+                instructions=self.prompt_set.decision,
                 output_format=InvestigationDecision.create_template().to_dict(),
                 payload=payload,
                 parser=InvestigationDecision.from_any,
@@ -796,7 +798,7 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_final_critique",
-                instructions=FINAL_CRITIQUE_PROMPT,
+                instructions=self.prompt_set.final_critique,
                 output_format=FinalCritique.create_template().to_dict(),
                 payload={"current_state": state.to_dict(), "final_draft": final_draft},
                 parser=FinalCritique.from_any,
@@ -832,7 +834,7 @@ class InvestigationController:
         return "\n".join(lines)
 
     def _with_investigation_guidance(self, messages: list[LLMMessage], *, options: RunOptions) -> list[LLMMessage]:
-        return with_investigation_guidance(messages, options=options)
+        return with_investigation_guidance(messages, options=options, prompt_set=self.prompt_set)
 
     def _call_options(self, *, options: RunOptions, target: str) -> LLMCallOptions:
         return LLMCallOptions(

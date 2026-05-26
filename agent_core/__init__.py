@@ -3,6 +3,7 @@
 from agent_core.domain_hooks import DomainHooks
 from agent_core.execution_context import ExecutionContext
 from agent_core.investigation_models import FinalCritique, InvestigationDecision, StepReflection
+from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.investigation_state import EvidenceItem, Hypothesis, InvestigationState
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.policy_engine import PolicyEngine
@@ -28,6 +29,7 @@ __all__ = [
     "FinalCritique",
     "Hypothesis",
     "InvestigationDecision",
+    "InvestigationPromptSet",
     "InvestigationState",
     "PolicyEngine",
     "ContextBudget",

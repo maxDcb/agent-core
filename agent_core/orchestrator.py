@@ -9,6 +9,7 @@ from uuid import uuid4
 from agent_core.domain_hooks import DomainHooks
 from agent_core.execution_context import ExecutionContext
 from agent_core.investigation_controller import InvestigationController, with_investigation_guidance
+from agent_core.investigation_prompts import DEFAULT_INVESTIGATION_PROMPTS, InvestigationPromptSet
 from agent_core.investigation_state import InvestigationState
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.memory.context_block import ContextBlock, estimate_token_count
@@ -568,8 +569,14 @@ class AgentOrchestrator:
 
         messages = self._build_messages(user_input)
         turn_index = self.session_manager.get_next_turn_index()
+        investigation_prompt_set: InvestigationPromptSet | None = None
         if run_options.mode in {"investigate", "deep_investigate"}:
-            messages = with_investigation_guidance(messages, options=run_options)
+            investigation_prompt_set = self._build_investigation_prompt_set(options=run_options)
+            messages = with_investigation_guidance(
+                messages,
+                options=run_options,
+                prompt_set=investigation_prompt_set,
+            )
         trace = self._start_run_trace(
             session_id=session_id,
             run_options=run_options,
@@ -579,7 +586,10 @@ class AgentOrchestrator:
         expose_trace_id = options is not None or run_options.mode in {"investigate", "deep_investigate"}
         try:
             if run_options.mode in {"investigate", "deep_investigate"}:
-                result = self._build_investigation_controller(trace=trace).run(
+                result = self._build_investigation_controller(
+                    trace=trace,
+                    prompt_set=investigation_prompt_set,
+                ).run(
                     user_input=user_input,
                     session_id=session_id,
                     context=context,
@@ -676,12 +686,16 @@ class AgentOrchestrator:
         mode = resumed.pending_payload.get("mode")
         if mode in {"investigate", "deep_investigate"}:
             run_options = self._run_options_from_pending(resumed.pending_payload)
+            investigation_prompt_set = self._build_investigation_prompt_set(options=run_options)
             investigation_state = InvestigationState.from_any(resumed.pending_payload.get("investigation_state"))
             if investigation_state is None:
                 investigation_state = InvestigationState.create_template(objective=resumed.user_input)
             iterations_used = resumed.pending_payload.get("iterations_used")
             no_progress_iterations = resumed.pending_payload.get("no_progress_iterations")
-            result = self._build_investigation_controller(trace=trace).resume_after_pending(
+            result = self._build_investigation_controller(
+                trace=trace,
+                prompt_set=investigation_prompt_set,
+            ).resume_after_pending(
                 pending=resumed,
                 session_id=session_id,
                 context=context,
@@ -712,7 +726,19 @@ class AgentOrchestrator:
             else result
         )
 
-    def _build_investigation_controller(self, *, trace: RunTrace | None = None) -> InvestigationController:
+    def _build_investigation_prompt_set(self, *, options: RunOptions) -> InvestigationPromptSet:
+        return self.domain_hooks.customize_investigation_prompts(
+            prompt_set=DEFAULT_INVESTIGATION_PROMPTS,
+            settings=self.settings,
+            options=options,
+        )
+
+    def _build_investigation_controller(
+        self,
+        *,
+        trace: RunTrace | None = None,
+        prompt_set: InvestigationPromptSet | None = None,
+    ) -> InvestigationController:
         return InvestigationController(
             settings=self.settings,
             structured_synthesizer=self.structured_synthesizer,
@@ -722,6 +748,7 @@ class AgentOrchestrator:
             refresh_memory_after_turn=self._refresh_memory_after_turn,
             handle_provider_failure=self._handle_provider_failure,
             record_event=lambda **kwargs: self._record_trace_event(trace, **kwargs),
+            prompt_set=prompt_set,
         )
 
     def _load_run_trace_from_pending(self, pending: dict[str, Any]) -> RunTrace | None:

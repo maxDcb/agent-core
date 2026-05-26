@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from agent_core.domain_hooks import DomainHooks
+from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.memory.thread_state import render_context_blocks_to_messages
 from agent_core.orchestrator import AgentOrchestrator
@@ -98,9 +100,12 @@ class ScriptedProvider:
         self.critiques = list(critiques or [])
         self.tool_options = []
         self.text_options = []
+        self.chat_messages = []
+        self.text_prompts = []
 
     def complete_with_tools(self, *, messages, tools, model, temperature, options=None):
         self.tool_options.append(options)
+        self.chat_messages.append(list(messages))
         if not self.chat:
             raise AssertionError("No scripted chat response left")
         return self.chat.pop(0)
@@ -108,6 +113,7 @@ class ScriptedProvider:
     def complete_text(self, *, messages, model, temperature, options=None):
         self.text_options.append(options)
         system_prompt = messages[0].content
+        self.text_prompts.append(system_prompt)
         if "preparing a generic bounded investigation plan" in system_prompt:
             return json.dumps(self.plans.pop(0))
         if "updating a generic investigation state" in system_prompt:
@@ -167,7 +173,25 @@ def tool_call(name: str = "echo", *, value: str = "hello", call_id: str = "call-
     )
 
 
-def build_orchestrator(tmp_path, provider, *, policy_engine: PolicyEngine | None = None, pending: bool = False):
+class CustomInvestigationHooks(DomainHooks):
+    def __init__(self) -> None:
+        self.modes: list[str] = []
+
+    def customize_investigation_prompts(self, *, prompt_set, settings, options) -> InvestigationPromptSet:
+        self.modes.append(options.mode)
+        return prompt_set.append_domain_guidance(
+            "Domain investigation guidance: preserve endpoint provenance and persistence gaps."
+        )
+
+
+def build_orchestrator(
+    tmp_path,
+    provider,
+    *,
+    policy_engine: PolicyEngine | None = None,
+    pending: bool = False,
+    domain_hooks: DomainHooks | None = None,
+):
     settings = CoreSettings(
         openai_api_key="test",
         model="fake",
@@ -187,6 +211,7 @@ def build_orchestrator(tmp_path, provider, *, policy_engine: PolicyEngine | None
         registry=registry,
         session_manager=SessionManager(SessionRepository(settings.session_file)),
         policy_engine=policy_engine or PolicyEngine(),
+        domain_hooks=domain_hooks,
     )
 
 
@@ -275,6 +300,42 @@ def test_investigation_no_tool_no_critique_returns_final(tmp_path) -> None:
     assert result.metadata["mode"] == "investigate"
     assert result.metadata["iterations_used"] == 1
     assert "reasoning" not in json.dumps(result.metadata)
+
+
+def test_domain_hooks_customize_investigation_prompts_and_guidance(tmp_path) -> None:
+    provider = ScriptedProvider(
+        chat=[LLMCompletionResult(content="domain-guided final")],
+        plans=[
+            {
+                "objective": "investigate with domain hooks",
+                "plan": ["use the domain guidance"],
+                "facts": [],
+                "hypotheses": [],
+                "evidence_gaps": [],
+                "completed_actions": [],
+                "next_actions": [],
+                "risk_notes": [],
+                "confidence": 0.2,
+                "stop_reason": None,
+                "metadata": {},
+            }
+        ],
+    )
+    hooks = CustomInvestigationHooks()
+    orchestrator = build_orchestrator(tmp_path, provider, domain_hooks=hooks)
+
+    result = orchestrator.run_turn_result(
+        "investigate with domain hooks",
+        options=RunOptions.investigate(max_iterations=1),
+    )
+
+    assert result.content == "domain-guided final"
+    assert hooks.modes == ["investigate"]
+    assert any("Domain investigation guidance" in prompt for prompt in provider.text_prompts)
+    first_chat_system_messages = [
+        message.content for message in provider.chat_messages[0] if message.role == "system"
+    ]
+    assert any("Domain investigation guidance" in content for content in first_chat_system_messages)
 
 
 def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_path) -> None:
