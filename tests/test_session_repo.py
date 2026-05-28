@@ -72,6 +72,23 @@ def test_json_file_session_repository_normalizes_malformed_state(tmp_path) -> No
     assert state["meta"]["session_id"] == "default"
 
 
+def test_json_file_session_repository_preserves_execution_scope(tmp_path) -> None:
+    repo = SessionRepository(tmp_path / "session.json")
+    state = repo.load("scoped")
+    state["execution_scope"] = {
+        "allowed_read_roots": ["/tmp/workspace"],
+        "allowed_http_hosts": ["127.0.0.1"],
+        "allowed_http_methods": ["GET"],
+        "runtime": {"base_url": "http://127.0.0.1:3000"},
+    }
+
+    repo.save("scoped", state)
+    loaded = repo.load("scoped")
+
+    assert loaded["execution_scope"]["allowed_http_hosts"] == ["127.0.0.1"]
+    assert loaded["execution_scope"]["runtime"]["base_url"] == "http://127.0.0.1:3000"
+
+
 def test_session_repository_can_delegate_to_custom_store() -> None:
     store = InMemorySessionStore()
     repo = SessionRepository(store=store)

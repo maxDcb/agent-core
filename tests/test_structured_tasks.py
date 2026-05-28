@@ -65,6 +65,21 @@ class EchoTool:
         return ToolResult(ok=True, content=f"echo:{arguments['value']}")
 
 
+class SessionIdTool:
+    name = "session_id_tool"
+    description = "Return the execution context session id."
+
+    def schema(self):
+        return build_tool_definition(
+            name=self.name,
+            description=self.description,
+            parameters={"type": "object", "properties": {}, "required": [], "additionalProperties": False},
+        )
+
+    def execute(self, arguments: dict, context) -> ToolResult:
+        return ToolResult(ok=True, content=context.session_id)
+
+
 def _settings(root: Path) -> CoreSettings:
     return CoreSettings(
         allowed_read_roots=[root],
@@ -157,6 +172,47 @@ def test_structured_task_runner_rejects_invalid_json_output() -> None:
 
         assert result.ok is False
         assert result.failure_reason == "Structured task returned invalid JSON output."
+
+
+def test_structured_task_runner_uses_parent_session_id_for_tool_context() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        registry = ToolRegistry()
+        registry.register(SessionIdTool())
+        provider = FakeProvider(
+            [
+                LLMCompletionResult(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-1",
+                            name="session_id_tool",
+                            arguments_json="{}",
+                        )
+                    ],
+                ),
+                LLMCompletionResult(content=json.dumps({"summary": "done"})),
+            ]
+        )
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=provider,
+            tool_registry=registry,
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="recon",
+                system_prompt="Return JSON after checking session id.",
+                objective="Check session id.",
+                allowed_tools=["session_id_tool"],
+            ),
+            session_id="engagement-session",
+        )
+
+        assert result.ok is True
+        assert result.tool_history[0]["content_preview"] == "engagement-session"
 
 
 def test_structured_task_runner_fails_fast_on_unknown_allowed_tool() -> None:

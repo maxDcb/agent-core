@@ -150,9 +150,8 @@ class StructuredTaskRunner:
                 failure_reason=str(exc),
             )
 
-        task_session_id = f"{session_id}:task:{spec.task_id}"
         context = ExecutionContext(
-            session_id=task_session_id,
+            session_id=session_id,
             settings=self.settings,
             session_state=session_state or build_empty_session_state(session_id=session_id),
         )

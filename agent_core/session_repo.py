@@ -252,6 +252,12 @@ class JsonFileSessionStore:
         else:
             logger.info("Loaded session domain_state field is not a dictionary; resetting domain_state")
 
+        execution_scope = state.get("execution_scope")
+        if isinstance(execution_scope, dict):
+            normalized["execution_scope"] = execution_scope
+        elif "execution_scope" in state:
+            logger.info("Loaded session execution_scope field is not a dictionary; resetting execution_scope")
+
         meta = state.get("meta", {})
         if isinstance(meta, dict):
             normalized["meta"].update(meta)
