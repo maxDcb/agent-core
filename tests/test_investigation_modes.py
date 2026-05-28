@@ -39,6 +39,7 @@ def reflection_payload(
     observation_summary: str = "Observed tool output",
     new_facts: list[str] | None = None,
     remaining_gaps: list[str] | None = None,
+    resolved_gaps: list[str] | None = None,
     recommended_next_actions: list[str] | None = None,
     confidence: float = 0.8,
     should_continue: bool = True,
@@ -50,6 +51,7 @@ def reflection_payload(
         "updated_hypotheses": [],
         "rejected_hypotheses": [],
         "remaining_gaps": remaining_gaps or [],
+        "resolved_gaps": resolved_gaps or [],
         "recommended_next_actions": recommended_next_actions or [],
         "risk_notes": [],
         "confidence": confidence,
@@ -363,6 +365,42 @@ def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_pa
     assert "need second source" in result.content
     assert result.metadata["stop_reason"] == "enough evidence"
     assert result.metadata["investigation_state"]["facts"] == ["echo returned fact"]
+
+
+def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) -> None:
+    provider = ScriptedProvider(
+        chat=[tool_call(value="first pass"), tool_call(value="snapshot artifact")],
+        reflections=[
+            reflection_payload(
+                new_facts=["navigation succeeded"],
+                remaining_gaps=["browser_snapshot not yet performed"],
+                recommended_next_actions=["run browser_snapshot"],
+                should_continue=True,
+            ),
+            reflection_payload(
+                new_facts=[{"summary": "browser_snapshot produced artifact browser-000005"}],
+                remaining_gaps=[],
+                resolved_gaps=["browser_snapshot not yet performed"],
+                recommended_next_actions=[],
+                should_continue=False,
+                confidence=0.95,
+            ),
+        ],
+        decisions=[
+            decision_payload("continue"),
+            decision_payload("final", reason_summary="snapshot evidence collected"),
+        ],
+    )
+    orchestrator = build_orchestrator(tmp_path, provider)
+
+    result = orchestrator.run_turn_result(
+        "investigate browser target",
+        options=RunOptions(mode="investigate", max_iterations=3, require_initial_plan=False),
+    )
+
+    assert "browser_snapshot produced artifact browser-000005" in result.content
+    assert "browser_snapshot not yet performed" not in result.content
+    assert result.metadata["investigation_state"]["evidence_gaps"] == []
 
 
 def test_investigation_does_not_finalize_when_reflection_requires_continuation(tmp_path) -> None:

@@ -11,7 +11,24 @@ from agent_core.investigation_models import FinalCritique, StepReflection
 def _normalize_str_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    normalized = []
+    for item in value:
+        if isinstance(item, str):
+            text = item.strip()
+        elif isinstance(item, dict):
+            text = ""
+            for key in ("summary", "fact", "statement", "gap", "action", "note", "reason", "value"):
+                candidate = item.get(key)
+                if isinstance(candidate, str) and candidate.strip():
+                    text = candidate.strip()
+                    break
+            if not text:
+                text = json.dumps(item, ensure_ascii=False, sort_keys=True)
+        else:
+            text = str(item).strip()
+        if text:
+            normalized.append(text)
+    return normalized
 
 
 def _normalize_optional_str(value: object) -> str | None:
@@ -33,6 +50,13 @@ def _merge_unique(existing: list[str], additions: list[str]) -> list[str]:
             merged.append(normalized)
             seen.add(normalized)
     return merged
+
+
+def _remove_resolved(existing: list[str], resolved: list[str]) -> list[str]:
+    resolved_set = {item.strip() for item in resolved if item.strip()}
+    if not resolved_set:
+        return existing
+    return [item for item in existing if item.strip() not in resolved_set]
 
 
 @dataclass(slots=True)
@@ -213,7 +237,10 @@ class InvestigationState:
 
         self._apply_supported_hypotheses(parsed.updated_hypotheses)
         self._apply_rejected_hypotheses(parsed.rejected_hypotheses)
-        self.evidence_gaps = _merge_unique(self.evidence_gaps, parsed.remaining_gaps)
+        self.evidence_gaps = _remove_resolved(
+            _merge_unique(self.evidence_gaps, parsed.remaining_gaps),
+            parsed.resolved_gaps,
+        )
         self.next_actions = _merge_unique([], parsed.recommended_next_actions)
         self.risk_notes = _merge_unique(self.risk_notes, parsed.risk_notes)
         self.confidence = parsed.confidence

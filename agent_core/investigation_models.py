@@ -1,13 +1,43 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
 from typing import Any, Literal
+
+
+def _coerce_text_item(value: object) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for key in (
+            "summary",
+            "fact",
+            "statement",
+            "gap",
+            "action",
+            "note",
+            "reason",
+            "value",
+        ):
+            candidate = value.get(key)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        try:
+            return json.dumps(value, ensure_ascii=False, sort_keys=True)
+        except TypeError:
+            return str(value).strip()
+    return str(value).strip()
 
 
 def _normalize_str_list(value: object) -> list[str]:
     if not isinstance(value, list):
         return []
-    return [str(item).strip() for item in value if str(item).strip()]
+    normalized = []
+    for item in value:
+        text = _coerce_text_item(item)
+        if text:
+            normalized.append(text)
+    return normalized
 
 
 def _normalize_optional_str(value: object) -> str | None:
@@ -27,6 +57,7 @@ class StepReflection:
     updated_hypotheses: list[str] = field(default_factory=list)
     rejected_hypotheses: list[str] = field(default_factory=list)
     remaining_gaps: list[str] = field(default_factory=list)
+    resolved_gaps: list[str] = field(default_factory=list)
     recommended_next_actions: list[str] = field(default_factory=list)
     risk_notes: list[str] = field(default_factory=list)
     confidence: float = 0.5
@@ -40,6 +71,7 @@ class StepReflection:
             "updated_hypotheses": self.updated_hypotheses,
             "rejected_hypotheses": self.rejected_hypotheses,
             "remaining_gaps": self.remaining_gaps,
+            "resolved_gaps": self.resolved_gaps,
             "recommended_next_actions": self.recommended_next_actions,
             "risk_notes": self.risk_notes,
             "confidence": self.confidence,
@@ -62,6 +94,7 @@ class StepReflection:
             updated_hypotheses=_normalize_str_list(payload.get("updated_hypotheses")),
             rejected_hypotheses=_normalize_str_list(payload.get("rejected_hypotheses")),
             remaining_gaps=_normalize_str_list(payload.get("remaining_gaps")),
+            resolved_gaps=_normalize_str_list(payload.get("resolved_gaps")),
             recommended_next_actions=_normalize_str_list(payload.get("recommended_next_actions")),
             risk_notes=_normalize_str_list(payload.get("risk_notes")),
             confidence=_clamp_confidence(payload.get("confidence")),
