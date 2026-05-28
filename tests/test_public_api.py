@@ -9,6 +9,8 @@ from agent_core import (
     RunOptions,
     RunTrace,
     SessionStore,
+    StructuredTaskRunner,
+    StructuredTaskSpec,
     ToolRegistry,
 )
 
@@ -22,4 +24,6 @@ def test_public_api_exports_runtime_entrypoints() -> None:
     assert RunOptions is not None
     assert RunTrace is not None
     assert SessionStore is not None
+    assert StructuredTaskRunner is not None
+    assert StructuredTaskSpec is not None
     assert ToolRegistry is not None

@@ -12,6 +12,7 @@ from agent_core.run_options import AgentRunMode, RunOptions
 from agent_core.session_manager import SessionManager
 from agent_core.session_repo import JsonFileSessionStore, SessionRepository, SessionStore
 from agent_core.settings import CoreSettings
+from agent_core.structured_tasks import StructuredTaskResult, StructuredTaskRunner, StructuredTaskSpec
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import BaseTool, build_tool_definition
 from agent_core.types import AgentTurnResult, ToolResult
@@ -40,6 +41,9 @@ __all__ = [
     "SessionManager",
     "SessionRepository",
     "SessionStore",
+    "StructuredTaskResult",
+    "StructuredTaskRunner",
+    "StructuredTaskSpec",
     "JsonFileSessionStore",
     "StepReflection",
     "TraceEvent",
