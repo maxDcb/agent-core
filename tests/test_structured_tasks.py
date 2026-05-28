@@ -182,3 +182,48 @@ def test_structured_task_runner_fails_fast_on_unknown_allowed_tool() -> None:
         assert result.ok is False
         assert "Unknown tool: missing_tool" in result.failure_reason
         assert provider.responses == []
+
+
+def test_structured_task_runner_forces_json_finalization_after_iteration_budget() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        provider = FakeProvider(
+            [
+                LLMCompletionResult(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-1",
+                            name="echo_tool",
+                            arguments_json=json.dumps({"value": "budget"}),
+                        )
+                    ],
+                ),
+                LLMCompletionResult(content=json.dumps({"summary": "finalized from observed evidence"})),
+            ]
+        )
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=provider,
+            tool_registry=registry,
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="budgeted",
+                system_prompt="Return JSON after using the echo tool.",
+                objective="Exercise forced finalization.",
+                allowed_tools=["echo_tool"],
+                max_iterations=1,
+                max_tool_calls=3,
+            )
+        )
+
+        assert result.ok is True
+        assert result.output == {"summary": "finalized from observed evidence"}
+        assert result.metadata["forced_finalization"] is True
+        assert result.metadata["budget_failure_reason"] == "Maximum number of structured task iterations reached."
+        assert provider.last_tools == []

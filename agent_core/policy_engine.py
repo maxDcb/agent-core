@@ -65,7 +65,8 @@ class PolicyEngine:
             return AuthorizationResult(False, "Missing HTTP method")
 
         method = raw_method.upper()
-        if method not in context.settings.allowed_http_methods:
+        allowed_methods = {allowed.strip().upper() for allowed in context.allowed_http_methods() if allowed.strip()}
+        if "*" not in allowed_methods and "ALL" not in allowed_methods and method not in allowed_methods:
             logger.info("Policy denied HTTP method", extra={"method": method})
             return AuthorizationResult(False, f"HTTP method not allowed: {method}")
 
@@ -84,7 +85,8 @@ class PolicyEngine:
             logger.info("Policy denied HTTP request with invalid URL", extra={"url": url})
             return AuthorizationResult(False, "Invalid URL")
 
-        if host not in context.settings.allowed_http_hosts:
+        allowed_hosts = {allowed.strip().lower() for allowed in context.allowed_http_hosts() if allowed.strip()}
+        if "*" not in allowed_hosts and host.lower() not in allowed_hosts:
             logger.info("Policy denied HTTP host", extra={"host": host})
             return AuthorizationResult(False, f"Host not allowed: {host}")
 
@@ -131,4 +133,3 @@ class PolicyEngine:
             return AuthorizationResult(False, f"Knowledge path not allowed: {candidate}")
 
         return AuthorizationResult(True, "allowed")
-

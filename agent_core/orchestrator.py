@@ -7,7 +7,12 @@ from typing import Any
 from uuid import uuid4
 
 from agent_core.domain_hooks import DomainHooks
-from agent_core.execution_context import ExecutionContext
+from agent_core.execution_context import (
+    ExecutionContext,
+    effective_allowed_http_hosts,
+    effective_allowed_http_methods,
+    effective_allowed_read_roots,
+)
 from agent_core.investigation_controller import InvestigationController, with_investigation_guidance
 from agent_core.investigation_prompts import DEFAULT_INVESTIGATION_PROMPTS, InvestigationPromptSet
 from agent_core.investigation_state import InvestigationState
@@ -249,12 +254,16 @@ class AgentOrchestrator:
         )
 
     def _application_context_payload(self) -> dict[str, Any]:
+        session_state = self.session_manager.get_state()
         return {
             "session_id": self.session_manager.session_id or "default",
-            "scope": list(self.settings.allowed_http_hosts),
-            "source_code_locations": [str(path.resolve()) for path in self.settings.allowed_read_roots],
+            "scope": effective_allowed_http_hosts(self.settings, session_state),
+            "source_code_locations": [
+                str(path.resolve())
+                for path in effective_allowed_read_roots(self.settings, session_state)
+            ],
             "knowledge_base_dir": str(self.settings.knowledge_base_dir.resolve()),
-            "allowed_http_methods": list(self.settings.allowed_http_methods),
+            "allowed_http_methods": effective_allowed_http_methods(self.settings, session_state),
         }
 
     def _synthesize_task_state(self, *, thread_state: ThreadState, turn_index: int) -> TaskState:

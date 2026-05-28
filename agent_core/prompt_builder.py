@@ -2,6 +2,11 @@
 
 from agent_core.context_assembler import ContextAssembler
 from agent_core.domain_hooks import DomainHooks
+from agent_core.execution_context import (
+    effective_allowed_http_hosts,
+    effective_allowed_http_methods,
+    effective_allowed_read_roots,
+)
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.session_manager import SessionManager
 from agent_core.settings import CoreSettings
@@ -72,10 +77,11 @@ class PromptBuilder:
         return messages
 
     def _build_scope_prompt_block(self) -> str:
-        allowed_roots = [str(path.resolve()) for path in self.settings.allowed_read_roots]
+        session_state = self.session_manager.get_state()
+        allowed_roots = [str(path.resolve()) for path in effective_allowed_read_roots(self.settings, session_state)]
         knowledge_root = str(self.settings.knowledge_base_dir.resolve())
-        allowed_hosts = self.settings.allowed_http_hosts or []
-        allowed_methods = self.settings.allowed_http_methods or []
+        allowed_hosts = effective_allowed_http_hosts(self.settings, session_state)
+        allowed_methods = effective_allowed_http_methods(self.settings, session_state)
         session_id = self.session_manager.session_id or "default"
 
         lines = [
