@@ -87,6 +87,36 @@ def _safe_tool_argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def _load_json_output(raw_content: str) -> tuple[object, dict[str, Any]]:
+    """Load a structured-task JSON response, recovering from duplicated final JSON.
+
+    Chat JSON mode prevents most malformed prose, but models can still emit a
+    complete JSON object and then append a second complete object. That is
+    invalid JSON as a whole, yet the first object is the controller contract we
+    asked for. Keep that first complete object and record metadata instead of
+    failing the whole phase.
+    """
+
+    try:
+        return json.loads(raw_content), {}
+    except json.JSONDecodeError as original_exc:
+        stripped = raw_content.lstrip()
+        if not stripped.startswith("{"):
+            raise original_exc
+        try:
+            payload, end_index = json.JSONDecoder().raw_decode(stripped)
+        except json.JSONDecodeError:
+            raise original_exc
+        trailing = stripped[end_index:].strip()
+        if not trailing:
+            return payload, {}
+        return payload, {
+            "json_recovery_applied": True,
+            "json_recovery_reason": "ignored_trailing_content_after_first_json_object",
+            "json_recovery_trailing_preview": safe_preview(trailing, limit=500),
+        }
+
+
 def _clean_positive_int(value: object, *, default: int, minimum: int = 0) -> int:
     try:
         normalized = int(value)  # type: ignore[arg-type]
@@ -343,7 +373,8 @@ class StructuredTaskRunner:
                 content=(
                     f"{failure_reason} No more tools are available. "
                     "Return the best possible final JSON object now, using only the evidence already present "
-                    "in the transcript. Do not request tools. Do not wrap the JSON in markdown fences."
+                    "in the transcript. Do not request tools. Return one JSON object only, with no prose, "
+                    "no markdown fences, and no second JSON object after it."
                 ),
             ),
         ]
@@ -383,7 +414,8 @@ class StructuredTaskRunner:
             "- Drive the task to a bounded conclusion within this one run.",
             "- Base conclusions only on observed evidence and tool results.",
             "- Return exactly one JSON object when you are done.",
-            "- Do not wrap the final JSON in markdown fences.",
+            "- The final assistant message must contain only that one JSON object: no prose before it, no markdown fences, no comments, and no second JSON object after it.",
+            "- If you need to correct or revise the final output, produce one complete replacement JSON object instead of appending another object.",
             "",
             "Output schema or caller hint:",
             json.dumps(output_schema, ensure_ascii=False, indent=2),
@@ -503,7 +535,7 @@ class StructuredTaskRunner:
         metadata: dict[str, Any],
     ) -> StructuredTaskResult:
         try:
-            payload = json.loads(raw_content)
+            payload, recovery_metadata = _load_json_output(raw_content)
         except json.JSONDecodeError:
             return StructuredTaskResult(
                 ok=False,
@@ -536,7 +568,7 @@ class StructuredTaskRunner:
             tool_history=tool_history,
             iterations=iterations,
             tool_calls_used=tool_calls_used,
-            metadata=metadata,
+            metadata={**metadata, **recovery_metadata},
         )
 
     def _finalize_after_budget(

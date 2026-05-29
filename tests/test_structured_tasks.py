@@ -191,6 +191,58 @@ def test_structured_task_runner_rejects_invalid_json_output() -> None:
         assert result.failure_reason == "Structured task returned invalid JSON output."
 
 
+def test_structured_task_runner_recovers_first_json_object_when_output_is_duplicated() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        first = {"summary": "keep this", "items": [1]}
+        second = {"summary": "duplicate object should be ignored"}
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=FakeProvider([LLMCompletionResult(content=json.dumps(first) + "\n" + json.dumps(second))]),
+            tool_registry=ToolRegistry(),
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="recon_auth",
+                system_prompt="Return JSON.",
+                objective="Validate duplicated JSON recovery.",
+            )
+        )
+
+        assert result.ok is True
+        assert result.output == first
+        assert result.metadata["json_recovery_applied"] is True
+        assert result.metadata["json_recovery_reason"] == "ignored_trailing_content_after_first_json_object"
+        assert "duplicate object should be ignored" in result.metadata["json_recovery_trailing_preview"]
+
+
+def test_structured_task_prompt_forbids_appended_second_json_object() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        provider = FakeProvider([LLMCompletionResult(content=json.dumps({"summary": "done"}))])
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=provider,
+            tool_registry=ToolRegistry(),
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="recon",
+                system_prompt="Return JSON.",
+                objective="Validate prompt guard.",
+            )
+        )
+
+        assert result.ok is True
+        task_prompt = provider.last_messages[1].content
+        assert "no second JSON object after it" in task_prompt
+        assert "replacement JSON object instead of appending another object" in task_prompt
+
+
 def test_structured_task_runner_uses_parent_session_id_for_tool_context() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
