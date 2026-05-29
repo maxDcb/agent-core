@@ -14,13 +14,17 @@ def build_provider(settings: CoreSettings):
     provider_name = normalize_provider_name(settings.llm_provider)
 
     if provider_name == "openai":
-        return OpenAIProvider(api_key=settings.openai_api_key)
+        return OpenAIProvider(
+            api_key=settings.openai_api_key,
+            timeout_seconds=settings.llm_timeout_seconds,
+        )
 
     if provider_name == "azure_openai":
         return AzureOpenAIProvider(
             azure_endpoint=settings.azure_openai_endpoint,
             api_key=settings.azure_openai_api_key,
             api_version=settings.azure_openai_api_version,
+            timeout_seconds=settings.llm_timeout_seconds,
         )
 
     if provider_name == "azure_anthropic":
@@ -28,6 +32,7 @@ def build_provider(settings: CoreSettings):
             endpoint=settings.azure_anthropic_endpoint,
             api_key=settings.azure_anthropic_api_key,
             api_version=settings.azure_anthropic_api_version,
+            timeout_seconds=settings.llm_timeout_seconds,
         )
 
     raise ValueError(

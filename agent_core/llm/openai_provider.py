@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from openai import (
@@ -28,14 +29,19 @@ class OpenAIProvider:
         api_key: str | None = None,
         *,
         capability_resolver: OpenAIModelCapabilityResolver | None = None,
+        timeout_seconds: float = 120.0,
     ) -> None:
         self.api_key_configured = bool(api_key)
         self.api_key = api_key
+        self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.client: OpenAI | None = None
         self.capability_resolver = capability_resolver or OpenAIModelCapabilityResolver()
         self.request_normalizer = OpenAIChatRequestNormalizer(self.capability_resolver)
         # Delay client creation so local REPL commands still work when the API key is missing.
-        logger.debug("OpenAI provider initialized", extra={"api_key_configured": self.api_key_configured})
+        logger.debug(
+            "OpenAI provider initialized",
+            extra={"api_key_configured": self.api_key_configured, "timeout_seconds": self.timeout_seconds},
+        )
 
     def complete_text(
         self,
@@ -114,9 +120,14 @@ class OpenAIProvider:
                 detail="Missing OPENAI_API_KEY for OpenAIProvider",
             )
 
-        logger.debug(
+        logger.info(
             "Sending chat completion request",
-            extra={"model": model, "message_count": len(messages), "tool_count": len(tools or [])},
+            extra={
+                "model": model,
+                "message_count": len(messages),
+                "tool_count": len(tools or []),
+                "timeout_seconds": self.timeout_seconds,
+            },
         )
         try:
             client = self._get_client()
@@ -141,12 +152,17 @@ class OpenAIProvider:
             for change in normalization.changes:
                 logger.debug("Adjusted OpenAI chat completion request", extra={"model": model, "change": change})
 
+            started_at = time.monotonic()
             response = create_chat_completion_with_adaptive_retry(
                 completions=client.chat.completions,
                 request=request,
                 provider_name="OpenAI",
                 logger=logger,
                 capability_resolver=self.capability_resolver,
+            )
+            logger.info(
+                "Received chat completion response",
+                extra={"model": model, "elapsed_seconds": round(time.monotonic() - started_at, 3)},
             )
         except AuthenticationError as exc:
             logger.exception("OpenAI authentication failed")
@@ -202,7 +218,7 @@ class OpenAIProvider:
 
     def _get_client(self) -> OpenAI:
         if self.client is None:
-            self.client = OpenAI(api_key=self.api_key)
+            self.client = OpenAI(api_key=self.api_key, timeout=self.timeout_seconds)
         return self.client
 
     def _to_openai_message(self, message: LLMMessage) -> dict[str, Any]:

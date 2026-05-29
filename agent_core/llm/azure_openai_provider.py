@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from openai import (
@@ -39,12 +40,14 @@ class AzureOpenAIProvider:
         api_key: str | None = None,
         api_version: str | None = None,
         capability_resolver: OpenAIModelCapabilityResolver | None = None,
+        timeout_seconds: float = 120.0,
     ) -> None:
         self.azure_endpoint_configured = bool(azure_endpoint)
         self.api_key_configured = bool(api_key)
         self.api_version = api_version or "v1"
         self.azure_endpoint = azure_endpoint
         self.api_key = api_key
+        self.timeout_seconds = max(1.0, float(timeout_seconds))
         self.client: AzureOpenAI | None = None
         self.capability_resolver = capability_resolver or OpenAIModelCapabilityResolver()
         self.request_normalizer = OpenAIChatRequestNormalizer(self.capability_resolver)
@@ -55,6 +58,7 @@ class AzureOpenAIProvider:
                 "azure_endpoint_configured": self.azure_endpoint_configured,
                 "api_key_configured": self.api_key_configured,
                 "api_version": self.api_version,
+                "timeout_seconds": self.timeout_seconds,
             },
         )
 
@@ -149,13 +153,14 @@ class AzureOpenAIProvider:
                 detail="Missing AZURE_OPENAI_API_KEY for AzureOpenAIProvider",
             )
 
-        logger.debug(
+        logger.info(
             "Sending Azure OpenAI chat completion request",
             extra={
                 "model": model,
                 "message_count": len(messages),
                 "tool_count": len(tools or []),
                 "api_version": self.api_version,
+                "timeout_seconds": self.timeout_seconds,
             },
         )
 
@@ -182,12 +187,17 @@ class AzureOpenAIProvider:
             for change in normalization.changes:
                 logger.debug("Adjusted Azure OpenAI chat completion request", extra={"model": model, "change": change})
 
+            started_at = time.monotonic()
             response = create_chat_completion_with_adaptive_retry(
                 completions=client.chat.completions,
                 request=request,
                 provider_name="Azure OpenAI",
                 logger=logger,
                 capability_resolver=self.capability_resolver,
+            )
+            logger.info(
+                "Received Azure OpenAI chat completion response",
+                extra={"model": model, "elapsed_seconds": round(time.monotonic() - started_at, 3)},
             )
         except AuthenticationError as exc:
             logger.exception("Azure OpenAI authentication failed")
@@ -249,6 +259,7 @@ class AzureOpenAIProvider:
                 azure_endpoint=self.azure_endpoint,
                 api_key=self.api_key,
                 api_version=self.api_version,
+                timeout=self.timeout_seconds,
             )
         return self.client
 

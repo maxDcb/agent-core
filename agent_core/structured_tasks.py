@@ -39,6 +39,54 @@ def _clean_string_list(values: object) -> list[str]:
     return cleaned
 
 
+SAFE_TOOL_ARGUMENT_KEYS = {
+    "around_line",
+    "case_sensitive",
+    "context_after",
+    "context_before",
+    "end_line",
+    "glob",
+    "identity_id",
+    "include_files",
+    "max_depth",
+    "max_entries",
+    "max_results",
+    "method",
+    "path",
+    "query",
+    "regex",
+    "selector",
+    "start_line",
+    "timeout_ms",
+    "url",
+}
+
+SENSITIVE_ARGUMENT_FRAGMENTS = ("answer", "authorization", "body", "cookie", "credential", "email", "field", "pass", "secret", "token", "value")
+
+
+def _safe_tool_argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {}
+    for key in sorted(SAFE_TOOL_ARGUMENT_KEYS.intersection(arguments)):
+        value = arguments.get(key)
+        if value is None:
+            continue
+        if isinstance(value, (bool, int, float)):
+            summary[key] = value
+        elif isinstance(value, str):
+            summary[key] = safe_preview(value, limit=180)
+        else:
+            summary[key] = type(value).__name__
+
+    redacted_keys = [
+        key
+        for key in sorted(arguments)
+        if key not in summary and any(fragment in key.lower() for fragment in SENSITIVE_ARGUMENT_FRAGMENTS)
+    ]
+    if redacted_keys:
+        summary["redacted_argument_keys"] = redacted_keys
+    return summary
+
+
 def _clean_positive_int(value: object, *, default: int, minimum: int = 0) -> int:
     try:
         normalized = int(value)  # type: ignore[arg-type]
@@ -354,6 +402,7 @@ class StructuredTaskRunner:
         ]
         if allowed_roots:
             lines.extend(f"  - {root}" for root in allowed_roots)
+            lines.append("- For local code tools, use absolute paths inside these roots or paths relative to one of these roots.")
         else:
             lines.append("  - none")
 
@@ -394,15 +443,41 @@ class StructuredTaskRunner:
             tool_content = f"Invalid JSON arguments for tool {tool_name}"
             tool_status: ToolExecutionStatus = "invalid_arguments"
         else:
+            logger.info(
+                "Structured task tool call started",
+                extra={
+                    "session_id": context.session_id,
+                    "tool_name": tool_name,
+                    "argument_keys": sorted(arguments.keys()),
+                    "arguments_summary": _safe_tool_argument_summary(arguments),
+                },
+            )
             authz = self.policy_engine.authorize(tool_name, arguments, context)
             if not authz.allowed:
                 tool_content = f"Tool denied by policy: {authz.reason}"
                 tool_status = "policy_denied"
+                logger.info(
+                    "Structured task tool call denied",
+                    extra={
+                        "session_id": context.session_id,
+                        "tool_name": tool_name,
+                        "reason": authz.reason,
+                    },
+                )
             else:
                 try:
                     result = registry.execute(tool_name, arguments, context)
                     tool_content = result.content
                     tool_status = "ok" if result.ok else "tool_error"
+                    logger.info(
+                        "Structured task tool call completed",
+                        extra={
+                            "session_id": context.session_id,
+                            "tool_name": tool_name,
+                            "status": tool_status,
+                            "content_length": len(tool_content),
+                        },
+                    )
                 except Exception as exc:
                     logger.exception("Structured task tool execution crashed", extra={"tool_name": tool_name})
                     tool_content = f"Tool execution failed: {exc}"

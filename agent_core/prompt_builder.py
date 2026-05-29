@@ -91,6 +91,7 @@ class PromptBuilder:
         ]
         if allowed_roots:
             lines.extend(f"  - {root}" for root in allowed_roots)
+            lines.append("- For local code tools, use absolute paths inside these roots or paths relative to one of these roots.")
         else:
             lines.append("  - none")
 

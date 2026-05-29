@@ -51,12 +51,31 @@ class PolicyEngine:
             logger.info("Policy denied filesystem access because path is missing", extra={"path": raw_path})
             return AuthorizationResult(False, "Missing path")
 
-        candidate = Path(raw_path).resolve()
-        if not context.is_path_allowed(candidate):
-            logger.info("Policy denied filesystem access", extra={"path": str(candidate)})
-            return AuthorizationResult(False, f"Path not allowed: {candidate}")
+        candidate = self._resolve_filesystem_candidate(raw_path, context)
+        if candidate is None:
+            denied_candidate = Path(raw_path).resolve()
+            logger.info("Policy denied filesystem access", extra={"path": str(denied_candidate)})
+            return AuthorizationResult(False, f"Path not allowed: {denied_candidate}")
 
+        arguments["path"] = str(candidate)
         return AuthorizationResult(True, "allowed")
+
+    def _resolve_filesystem_candidate(self, raw_path: str, context: ExecutionContext) -> Path | None:
+        raw = Path(raw_path.strip())
+        if raw.is_absolute():
+            candidate = raw.resolve()
+            return candidate if context.is_path_allowed(candidate) else None
+
+        candidates = [raw.resolve()]
+        candidates.extend((root / raw).resolve() for root in context.allowed_read_roots())
+
+        for candidate in candidates:
+            if context.is_path_allowed(candidate) and candidate.exists():
+                return candidate
+        for candidate in candidates:
+            if context.is_path_allowed(candidate):
+                return candidate
+        return None
 
     def _validate_http_tool(self, arguments: dict, context: ExecutionContext) -> AuthorizationResult:
         raw_method = arguments.get("method")

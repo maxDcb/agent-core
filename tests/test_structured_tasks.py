@@ -7,7 +7,7 @@ from pathlib import Path
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.policy_engine import PolicyEngine
 from agent_core.settings import CoreSettings
-from agent_core.structured_tasks import StructuredTaskRunner, StructuredTaskSpec
+from agent_core.structured_tasks import StructuredTaskRunner, StructuredTaskSpec, _safe_tool_argument_summary
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
@@ -86,6 +86,23 @@ def _settings(root: Path) -> CoreSettings:
         knowledge_base_dir=root / "knowledge",
         base_system_prompt="Base system prompt.",
     )
+
+
+def test_safe_tool_argument_summary_keeps_useful_context_without_sensitive_values() -> None:
+    summary = _safe_tool_argument_summary(
+        {
+            "path": "workspace/server.ts",
+            "query": "router.get",
+            "password": "secret",
+            "fields": {"email": "user@example.test", "password": "secret"},
+        }
+    )
+
+    assert summary["path"] == "workspace/server.ts"
+    assert summary["query"] == "router.get"
+    assert "password" not in summary
+    assert "fields" not in summary
+    assert summary["redacted_argument_keys"] == ["fields", "password"]
 
 
 def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> None:
