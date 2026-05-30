@@ -99,6 +99,7 @@ class PromptBuilder:
             [
                 "- Allowed knowledge base root:",
                 f"  - {knowledge_root}",
+                "- For knowledge tools, use this absolute root for broad searches or paths relative to it; pass exact returned paths to read_knowledge_chunk.",
                 "- Allowed web hosts:",
             ]
         )

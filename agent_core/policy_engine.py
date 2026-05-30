@@ -140,15 +140,35 @@ class PolicyEngine:
             logger.info("Policy denied knowledge access because path is missing", extra={"path": raw_path})
             return AuthorizationResult(False, "Missing path")
 
-        candidate = Path(raw_path).resolve()
-        knowledge_root = context.settings.knowledge_base_dir.resolve()
-        try:
-            candidate.relative_to(knowledge_root)
-        except ValueError:
+        candidate = self._resolve_knowledge_candidate(raw_path, context)
+        if candidate is None:
+            denied_candidate = Path(raw_path).resolve()
             logger.info(
                 "Policy denied knowledge access outside knowledge base",
-                extra={"path": str(candidate), "knowledge_root": str(knowledge_root)},
+                extra={"path": str(denied_candidate), "knowledge_root": str(context.settings.knowledge_base_dir.resolve())},
             )
-            return AuthorizationResult(False, f"Knowledge path not allowed: {candidate}")
+            return AuthorizationResult(False, f"Knowledge path not allowed: {denied_candidate}")
 
+        arguments["path"] = str(candidate)
         return AuthorizationResult(True, "allowed")
+
+    def _resolve_knowledge_candidate(self, raw_path: str, context: ExecutionContext) -> Path | None:
+        knowledge_root = context.settings.knowledge_base_dir.resolve()
+        raw = Path(raw_path.strip())
+        candidates = [raw.resolve()] if raw.is_absolute() else [(knowledge_root / raw).resolve(), raw.resolve()]
+
+        for candidate in candidates:
+            if candidate.exists() and _is_relative_to(candidate, knowledge_root):
+                return candidate
+        for candidate in candidates:
+            if _is_relative_to(candidate, knowledge_root):
+                return candidate
+        return None
+
+
+def _is_relative_to(candidate: Path, root: Path) -> bool:
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return False
+    return True
