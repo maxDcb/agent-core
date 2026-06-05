@@ -153,6 +153,22 @@ def select_bad_request_retry_action(
     ):
         return OpenAIRequestRetryAction(parameter="parallel_tool_calls")
 
+    if "response_format" in request and _is_parameter_rejected(
+        parameter="response_format",
+        explicit_param=explicit_param,
+        message=message,
+        fragments=(
+            "unrecognized",
+            "unsupported",
+            "unknown",
+            "not supported",
+            "invalid request argument",
+            "json_schema",
+            "schema",
+        ),
+    ):
+        return OpenAIRequestRetryAction(parameter="response_format")
+
     return None
 
 

@@ -7,7 +7,12 @@ from pathlib import Path
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.policy_engine import PolicyEngine
 from agent_core.settings import CoreSettings
-from agent_core.structured_tasks import StructuredTaskRunner, StructuredTaskSpec, _safe_tool_argument_summary
+from agent_core.structured_tasks import (
+    StructuredOutputContract,
+    StructuredTaskRunner,
+    StructuredTaskSpec,
+    _safe_tool_argument_summary,
+)
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
@@ -19,6 +24,8 @@ class FakeProvider:
         self.last_messages: list[LLMMessage] = []
         self.last_tools: list[object] = []
         self.last_options: LLMCallOptions | None = None
+        self.options_history: list[LLMCallOptions | None] = []
+        self.tools_history: list[list[object]] = []
 
     def complete_text(
         self,
@@ -42,6 +49,8 @@ class FakeProvider:
         self.last_messages = list(messages)
         self.last_tools = list(tools)
         self.last_options = options
+        self.options_history.append(options)
+        self.tools_history.append(list(tools))
         return self.responses.pop(0)
 
 
@@ -167,6 +176,151 @@ def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> N
         assert provider.last_options.response_format == {"type": "json_object"}
         assert provider.last_options.metadata["structured_task_id"] == "pre_inventory"
         assert provider.last_tools[0].name == "echo_tool"
+
+
+def test_structured_task_runner_uses_structured_output_contract_when_requested() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        contract_schema = {
+            "type": "object",
+            "required": ["observations", "confidence"],
+            "additionalProperties": False,
+            "properties": {
+                "observations": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number"},
+            },
+        }
+        provider = FakeProvider(
+            [
+                LLMCompletionResult(
+                    content=json.dumps(
+                        {
+                            "observations": ["ok"],
+                            "confidence": 0.9,
+                        }
+                    )
+                )
+            ]
+        )
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=provider,
+            tool_registry=ToolRegistry(),
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="analysis",
+                system_prompt="Analyze the input.",
+                objective="Return structured analysis.",
+                output_contract=StructuredOutputContract(
+                    name="Analysis Contract!",
+                    schema=contract_schema,
+                    strict=True,
+                    instructions=["Use confidence between 0 and 1."],
+                ),
+            ),
+            session_id="session-1",
+        )
+
+        assert result.ok is True
+        assert provider.last_options is not None
+        assert provider.last_options.response_format == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "Analysis_Contract",
+                "schema": contract_schema,
+                "strict": True,
+            },
+        }
+        assert provider.last_options.response_format_fallback == {"type": "json_object"}
+        task_prompt = provider.last_messages[1].content
+        assert "Provider-enforced structured output contract" in task_prompt
+        assert "Analysis_Contract" in task_prompt
+        assert "Use confidence between 0 and 1." in task_prompt
+
+
+def test_structured_task_runner_enforces_contract_only_on_final_no_tool_output() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        contract_schema = {
+            "type": "object",
+            "required": ["observations", "confidence"],
+            "additionalProperties": False,
+            "properties": {
+                "observations": {"type": "array", "items": {"type": "string"}},
+                "confidence": {"type": "number"},
+            },
+        }
+        provider = FakeProvider(
+            [
+                LLMCompletionResult(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-1",
+                            name="echo_tool",
+                            arguments_json=json.dumps({"value": "route"}),
+                        )
+                    ],
+                ),
+                LLMCompletionResult(content="Draft: route evidence observed."),
+                LLMCompletionResult(content=json.dumps({"observations": ["route evidence observed"], "confidence": 0.8})),
+            ]
+        )
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=provider,
+            tool_registry=registry,
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="analysis_with_tools",
+                system_prompt="Analyze the input with tools.",
+                objective="Return structured analysis.",
+                allowed_tools=["echo_tool"],
+                output_contract=StructuredOutputContract(
+                    name="analysis_contract",
+                    schema=contract_schema,
+                    strict=True,
+                ),
+            ),
+            session_id="session-1",
+        )
+
+        assert result.ok is True
+        assert result.output == {"observations": ["route evidence observed"], "confidence": 0.8}
+        assert result.metadata["contract_finalization"] is True
+        assert result.metadata["contract_name"] == "analysis_contract"
+        assert result.tool_calls_used == 1
+        assert result.iterations == 3
+        assert len(provider.options_history) == 3
+        assert provider.options_history[0] is not None
+        assert provider.options_history[0].response_format is None
+        assert provider.options_history[0].response_format_fallback is None
+        assert provider.options_history[1] is not None
+        assert provider.options_history[1].response_format is None
+        assert provider.options_history[1].response_format_fallback is None
+        assert provider.options_history[2] is not None
+        assert provider.options_history[2].response_format == {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "analysis_contract",
+                "schema": contract_schema,
+                "strict": True,
+            },
+        }
+        assert provider.options_history[2].response_format_fallback == {"type": "json_object"}
+        assert provider.tools_history[0][0].name == "echo_tool"
+        assert provider.tools_history[1][0].name == "echo_tool"
+        assert provider.tools_history[2] == []
+        assert provider.last_messages[-1].role == "system"
+        assert "Investigation is complete" in provider.last_messages[-1].content
 
 
 def test_structured_task_runner_rejects_invalid_json_output() -> None:

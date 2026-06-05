@@ -97,6 +97,7 @@ class LLMCallOptions:
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
     response_format: dict[str, Any] | None = None
+    response_format_fallback: dict[str, Any] | None = None
     max_output_tokens: int | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 

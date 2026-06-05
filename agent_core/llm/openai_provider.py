@@ -159,6 +159,7 @@ class OpenAIProvider:
                 provider_name="OpenAI",
                 logger=logger,
                 capability_resolver=self.capability_resolver,
+                response_format_fallback=options.response_format_fallback if options is not None else None,
             )
             logger.info(
                 "Received chat completion response",

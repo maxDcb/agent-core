@@ -8,6 +8,7 @@ from openai import APIStatusError, BadRequestError, RateLimitError
 from agent_core.llm.azure_openai_provider import AzureOpenAIProvider
 from agent_core.llm.base import LLMCallOptions, LLMMessage
 from agent_core.llm.openai_compat import OpenAIRateLimitRetryPolicy, create_chat_completion_with_adaptive_retry
+from agent_core.llm.openai_request_policy import OpenAIModelCapabilityResolver
 from agent_core.llm.openai_provider import OpenAIProvider
 
 
@@ -72,6 +73,19 @@ def _unsupported_max_tokens_error() -> BadRequestError:
             "error": {
                 "message": "Unsupported parameter: 'max_tokens' is not compatible with this model. Use 'max_completion_tokens' instead.",
                 "param": "max_tokens",
+            }
+        },
+    )
+
+
+def _unsupported_response_format_error() -> BadRequestError:
+    return BadRequestError(
+        "Unsupported parameter: response_format json_schema is not supported by this deployment.",
+        response=httpx.Response(400, request=httpx.Request("POST", "https://api.openai.test/v1/chat/completions")),
+        body={
+            "error": {
+                "message": "Unsupported parameter: response_format json_schema is not supported by this deployment.",
+                "param": "response_format",
             }
         },
     )
@@ -323,3 +337,34 @@ def test_openai_compat_preserves_bad_request_fallback_across_rate_limit_retry() 
     assert "reasoning_effort" not in completions.requests[1]
     assert "reasoning_effort" not in completions.requests[2]
     assert sleeps == [1.0]
+
+
+def test_openai_compat_retries_json_schema_with_response_format_fallback() -> None:
+    completions = ScriptedCompletions(
+        _unsupported_response_format_error(),
+        _text_response('{"ok": true}'),
+    )
+    resolver = OpenAIModelCapabilityResolver()
+    schema_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "example",
+            "schema": {"type": "object"},
+            "strict": False,
+        },
+    }
+    fallback_format = {"type": "json_object"}
+
+    response = create_chat_completion_with_adaptive_retry(
+        completions=completions,
+        request={"model": "deployment-name", "messages": [], "response_format": schema_format},
+        provider_name="Azure OpenAI",
+        logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
+        capability_resolver=resolver,
+        response_format_fallback=fallback_format,
+    )
+
+    assert response.choices[0].message.content == '{"ok": true}'
+    assert completions.requests[0]["response_format"] == schema_format
+    assert completions.requests[1]["response_format"] == fallback_format
+    assert "response_format" not in resolver.unsupported_parameters_for("deployment-name")

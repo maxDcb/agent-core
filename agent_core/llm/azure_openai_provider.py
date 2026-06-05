@@ -194,6 +194,7 @@ class AzureOpenAIProvider:
                 provider_name="Azure OpenAI",
                 logger=logger,
                 capability_resolver=self.capability_resolver,
+                response_format_fallback=options.response_format_fallback if options is not None else None,
             )
             logger.info(
                 "Received Azure OpenAI chat completion response",

@@ -63,6 +63,7 @@ def create_chat_completion_with_adaptive_retry(
     logger: Any,
     capability_resolver: OpenAIModelCapabilityResolver | None = None,
     rate_limit_policy: OpenAIRateLimitRetryPolicy | None = None,
+    response_format_fallback: dict[str, Any] | None = None,
     sleeper: Any = time.sleep,
     random_fn: Any = random.random,
 ) -> Any:
@@ -90,6 +91,24 @@ def create_chat_completion_with_adaptive_retry(
             retry_action = select_bad_request_retry_action(exc, fallback_request)
             if retry_action is None or retry_action.parameter in retried_without:
                 raise
+
+            if retry_action.parameter == "response_format":
+                if response_format_fallback is not None:
+                    fallback_request["response_format"] = response_format_fallback
+                else:
+                    fallback_request.pop("response_format", None)
+                    if capability_resolver is not None:
+                        capability_resolver.record_unsupported_parameter(
+                            model=str(fallback_request.get("model", "")),
+                            parameter=retry_action.parameter,
+                        )
+                retried_without.add(retry_action.parameter)
+                logger.warning(
+                    "%s rejected response_format; retrying with fallback format",
+                    provider_name,
+                    extra={"model": fallback_request.get("model")},
+                )
+                continue
 
             if capability_resolver is not None:
                 capability_resolver.record_unsupported_parameter(

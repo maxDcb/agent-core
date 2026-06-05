@@ -129,6 +129,35 @@ def _clean_positive_int(value: object, *, default: int, minimum: int = 0) -> int
     return max(minimum, normalized)
 
 
+def _clean_contract_name(value: object) -> str:
+    cleaned = _clean_string(value, default="structured_output")
+    normalized = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in cleaned)
+    normalized = normalized.strip("_-") or "structured_output"
+    return normalized[:64]
+
+
+@dataclass(slots=True)
+class StructuredOutputContract:
+    """Provider-facing structured output contract for a structured task.
+
+    `StructuredTaskSpec.output_schema` remains a prompt hint. This contract is
+    opt-in and can be sent to providers that support JSON Schema constrained
+    output, while keeping the legacy JSON-object path as fallback.
+    """
+
+    name: str
+    schema: dict[str, Any]
+    strict: bool = False
+    fallback_to_json_object: bool = True
+    instructions: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.name = _clean_contract_name(self.name)
+        if not isinstance(self.schema, dict):
+            self.schema = {"type": "object", "additionalProperties": True}
+        self.instructions = _clean_string_list(self.instructions)
+
+
 @dataclass(slots=True)
 class StructuredTaskSpec:
     """Caller-owned specification for one bounded, tool-using structured task."""
@@ -141,6 +170,7 @@ class StructuredTaskSpec:
     target: str = ""
     allowed_tools: list[str] = field(default_factory=list)
     output_schema: dict[str, Any] = field(default_factory=dict)
+    output_contract: StructuredOutputContract | None = None
     model: str | None = None
     temperature: float | None = None
     max_tool_calls: int = 8
@@ -157,6 +187,8 @@ class StructuredTaskSpec:
         self.allowed_tools = _clean_string_list(self.allowed_tools)
         if not isinstance(self.output_schema, dict):
             self.output_schema = {}
+        if not isinstance(self.output_contract, StructuredOutputContract):
+            self.output_contract = None
         if not isinstance(self.metadata, dict):
             self.metadata = {}
         self.model = _clean_string(self.model) or None
@@ -172,6 +204,35 @@ class StructuredTaskSpec:
             "target": self.target,
             "metadata": dict(self.metadata),
         }
+
+
+def _output_schema_hint_for_spec(spec: StructuredTaskSpec) -> dict[str, Any]:
+    if spec.output_contract is not None:
+        return spec.output_contract.schema
+    return spec.output_schema or {"type": "object", "additionalProperties": True}
+
+
+def _response_format_for_spec(spec: StructuredTaskSpec, *, final_output: bool = True) -> dict[str, Any] | None:
+    contract = spec.output_contract
+    if contract is None:
+        return {"type": "json_object"}
+    if not final_output:
+        return None
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": contract.name,
+            "schema": contract.schema,
+            "strict": contract.strict,
+        },
+    }
+
+
+def _response_format_fallback_for_spec(spec: StructuredTaskSpec, *, final_output: bool = True) -> dict[str, Any] | None:
+    contract = spec.output_contract
+    if contract is None or not final_output or not contract.fallback_to_json_object:
+        return None
+    return {"type": "json_object"}
 
 
 @dataclass(slots=True)
@@ -257,6 +318,7 @@ class StructuredTaskRunner:
                     spec=spec,
                     messages=messages,
                     registry=registry,
+                    final_output=not registry.list_tool_names(),
                 )
             except LLMProviderError as exc:
                 logger.error(
@@ -281,6 +343,15 @@ class StructuredTaskRunner:
             messages.append(assistant_message)
 
             if not llm_response.tool_calls:
+                if spec.output_contract is not None and registry.list_tool_names():
+                    return self._finalize_after_investigation(
+                        spec=spec,
+                        messages=messages,
+                        raw_draft_content=llm_response.content,
+                        tool_history=tool_history,
+                        iterations=iterations,
+                        tool_calls_used=tool_calls_used,
+                    )
                 return self._finalize_result(
                     task_id=spec.task_id,
                     raw_content=llm_response.content,
@@ -340,9 +411,11 @@ class StructuredTaskRunner:
         spec: StructuredTaskSpec,
         messages: list[LLMMessage],
         registry: ToolRegistry,
+        final_output: bool = False,
     ) -> LLMCompletionResult:
         options = LLMCallOptions(
-            response_format={"type": "json_object"},
+            response_format=_response_format_for_spec(spec, final_output=final_output),
+            response_format_fallback=_response_format_fallback_for_spec(spec, final_output=final_output),
             metadata={"structured_task_id": spec.task_id, **spec.metadata},
         )
         kwargs: dict[str, Any] = {
@@ -363,7 +436,8 @@ class StructuredTaskRunner:
         failure_reason: str,
     ) -> LLMCompletionResult:
         options = LLMCallOptions(
-            response_format={"type": "json_object"},
+            response_format=_response_format_for_spec(spec, final_output=True),
+            response_format_fallback=_response_format_fallback_for_spec(spec, final_output=True),
             metadata={
                 "structured_task_id": spec.task_id,
                 "structured_task_finalization": True,
@@ -407,7 +481,7 @@ class StructuredTaskRunner:
         ]
 
     def _build_task_system_prompt(self, *, spec: StructuredTaskSpec) -> str:
-        output_schema = spec.output_schema or {"type": "object", "additionalProperties": True}
+        output_schema = _output_schema_hint_for_spec(spec)
         lines = [
             f"Structured task id: {spec.task_id}",
             spec.system_prompt,
@@ -424,6 +498,21 @@ class StructuredTaskRunner:
             "Output schema or caller hint:",
             json.dumps(output_schema, ensure_ascii=False, indent=2),
         ]
+        if spec.output_contract is not None:
+            lines.extend(
+                [
+                    "",
+                    "Provider-enforced structured output contract:",
+                    f"- Contract name: {spec.output_contract.name}",
+                    f"- Strict mode requested: {str(spec.output_contract.strict).lower()}",
+                    "- The provider contract is enforced only for the final no-tool output, after investigation is complete.",
+                    "- Use the schema keys and canonical values exactly when the schema defines them.",
+                    "- Put uncertainty, non-standard labels, or unresolved values in note/unknown fields instead of inventing new top-level keys.",
+                ]
+            )
+            if spec.output_contract.instructions:
+                lines.append("- Contract-specific instructions:")
+                lines.extend(f"  - {instruction}" for instruction in spec.output_contract.instructions)
         return "\n".join(lines)
 
     def _build_scope_prompt_block(self, *, session_id: str, session_state: dict[str, Any]) -> str:
@@ -633,6 +722,59 @@ class StructuredTaskRunner:
             return finalized
         finalized.failure_reason = f"{failure_reason}; {finalized.failure_reason}"
         return finalized
+
+    def _finalize_after_investigation(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        messages: list[LLMMessage],
+        raw_draft_content: str,
+        tool_history: list[dict[str, Any]],
+        iterations: int,
+        tool_calls_used: int,
+    ) -> StructuredTaskResult:
+        try:
+            llm_response = self._call_model_for_final_output(
+                spec=spec,
+                messages=messages,
+                failure_reason="Investigation is complete.",
+            )
+        except LLMProviderError as exc:
+            return StructuredTaskResult(
+                ok=False,
+                task_id=spec.task_id,
+                raw_content=exc.detail or raw_draft_content,
+                failure_reason=f"Structured output contract finalization failed: {exc.user_message}",
+                tool_history=tool_history,
+                iterations=iterations,
+                tool_calls_used=tool_calls_used,
+                metadata={"contract_finalization": True},
+            )
+
+        if llm_response.tool_calls:
+            return StructuredTaskResult(
+                ok=False,
+                task_id=spec.task_id,
+                raw_content=llm_response.content or raw_draft_content,
+                failure_reason="Structured output contract finalization still requested tools.",
+                tool_history=tool_history,
+                iterations=iterations + 1,
+                tool_calls_used=tool_calls_used,
+                metadata={"contract_finalization": True},
+            )
+
+        return self._finalize_result(
+            task_id=spec.task_id,
+            raw_content=llm_response.content,
+            tool_history=tool_history,
+            iterations=iterations + 1,
+            tool_calls_used=tool_calls_used,
+            metadata={
+                "model": spec.model or self.settings.model,
+                "contract_finalization": True,
+                "contract_name": spec.output_contract.name,
+            },
+        )
 
     def _provider_accepts_options(self, method_name: str) -> bool:
         method = getattr(self.provider, method_name)
