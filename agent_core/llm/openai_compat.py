@@ -12,22 +12,32 @@ from openai import APIConnectionError, APIStatusError, APITimeoutError, BadReque
 from agent_core.llm.openai_request_policy import OpenAIModelCapabilityResolver, select_bad_request_retry_action
 
 
+DEFAULT_RATE_LIMIT_MAX_ATTEMPTS = 5
+DEFAULT_RATE_LIMIT_INITIAL_DELAY_SECONDS = 10.0
+DEFAULT_RATE_LIMIT_MAX_DELAY_SECONDS = 120.0
+DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER = 2.0
+DEFAULT_RATE_LIMIT_JITTER_RATIO = 0.1
+
+
 @dataclass(frozen=True, slots=True)
 class OpenAIRateLimitRetryPolicy:
-    max_attempts: int = 5
-    initial_delay_seconds: float = 10.0
-    max_delay_seconds: float = 120.0
-    backoff_multiplier: float = 2.0
-    jitter_ratio: float = 0.1
+    max_attempts: int = DEFAULT_RATE_LIMIT_MAX_ATTEMPTS
+    initial_delay_seconds: float = DEFAULT_RATE_LIMIT_INITIAL_DELAY_SECONDS
+    max_delay_seconds: float = DEFAULT_RATE_LIMIT_MAX_DELAY_SECONDS
+    backoff_multiplier: float = DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER
+    jitter_ratio: float = DEFAULT_RATE_LIMIT_JITTER_RATIO
 
     @classmethod
     def from_env(cls, prefix: str = "AGENT_CORE_LLM_RETRY_") -> "OpenAIRateLimitRetryPolicy":
         return cls(
-            max_attempts=_env_int(f"{prefix}MAX_ATTEMPTS", cls.max_attempts),
-            initial_delay_seconds=_env_float(f"{prefix}INITIAL_DELAY_SECONDS", cls.initial_delay_seconds),
-            max_delay_seconds=_env_float(f"{prefix}MAX_DELAY_SECONDS", cls.max_delay_seconds),
-            backoff_multiplier=_env_float(f"{prefix}BACKOFF_MULTIPLIER", cls.backoff_multiplier),
-            jitter_ratio=_env_float(f"{prefix}JITTER_RATIO", cls.jitter_ratio),
+            max_attempts=_env_int(f"{prefix}MAX_ATTEMPTS", DEFAULT_RATE_LIMIT_MAX_ATTEMPTS),
+            initial_delay_seconds=_env_float(
+                f"{prefix}INITIAL_DELAY_SECONDS",
+                DEFAULT_RATE_LIMIT_INITIAL_DELAY_SECONDS,
+            ),
+            max_delay_seconds=_env_float(f"{prefix}MAX_DELAY_SECONDS", DEFAULT_RATE_LIMIT_MAX_DELAY_SECONDS),
+            backoff_multiplier=_env_float(f"{prefix}BACKOFF_MULTIPLIER", DEFAULT_RATE_LIMIT_BACKOFF_MULTIPLIER),
+            jitter_ratio=_env_float(f"{prefix}JITTER_RATIO", DEFAULT_RATE_LIMIT_JITTER_RATIO),
         )
 
     def retry_delay_seconds(self, *, exc: BaseException, attempt_index: int, random_value: float) -> float:

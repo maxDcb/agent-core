@@ -311,7 +311,7 @@ class AgentOrchestrator:
     def _synthesize_session_summary(self, *, thread_state: ThreadState) -> SessionSummary:
         # SessionSummary is built only from overflow blocks, then merged with
         # the previous summary so compaction can keep shrinking prompt history
-        # without losing the long-running narrative of the engagement.
+        # without losing the long-running narrative of the session.
         new_overflow_blocks = self._unsummarized_overflow_blocks(thread_state=thread_state)
         if not new_overflow_blocks:
             raise ValueError("Cannot synthesize SessionSummary without overflow blocks")

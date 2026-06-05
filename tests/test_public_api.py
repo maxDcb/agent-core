@@ -16,7 +16,7 @@ from agent_core import (
 
 
 def test_public_api_exports_runtime_entrypoints() -> None:
-    assert agent_core.__version__ == "0.1.0"
+    assert agent_core.__version__ == "0.2.0"
     assert AgentOrchestrator is not None
     assert CoreSettings is not None
     assert InvestigationState is not None

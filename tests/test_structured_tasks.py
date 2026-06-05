@@ -118,7 +118,7 @@ def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> N
                         LLMToolCall(
                             id="call-1",
                             name="echo_tool",
-                            arguments_json=json.dumps({"value": "pre-recon"}),
+                            arguments_json=json.dumps({"value": "pre-inventory"}),
                         )
                     ],
                 ),
@@ -126,7 +126,7 @@ def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> N
                     content=json.dumps(
                         {
                             "summary": "done",
-                            "evidence": [{"tool": "echo_tool", "value": "pre-recon"}],
+                            "evidence": [{"tool": "echo_tool", "value": "pre-inventory"}],
                         }
                     )
                 ),
@@ -141,9 +141,9 @@ def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> N
 
         result = runner.run(
             spec=StructuredTaskSpec(
-                task_id="pre_recon",
-                system_prompt="Map the initial target state.",
-                objective="Build a first target summary.",
+                task_id="pre_inventory",
+                system_prompt="Map the initial workspace state.",
+                objective="Build a first workspace summary.",
                 allowed_tools=["echo_tool"],
                 output_schema={
                     "type": "object",
@@ -162,10 +162,10 @@ def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> N
         assert result.output["summary"] == "done"
         assert result.tool_calls_used == 1
         assert result.tool_history[0]["status"] == "ok"
-        assert result.tool_history[0]["content_preview"] == "echo:pre-recon"
+        assert result.tool_history[0]["content_preview"] == "echo:pre-inventory"
         assert provider.last_options is not None
         assert provider.last_options.response_format == {"type": "json_object"}
-        assert provider.last_options.metadata["structured_task_id"] == "pre_recon"
+        assert provider.last_options.metadata["structured_task_id"] == "pre_inventory"
         assert provider.last_tools[0].name == "echo_tool"
 
 
@@ -205,7 +205,7 @@ def test_structured_task_runner_recovers_first_json_object_when_output_is_duplic
 
         result = runner.run(
             spec=StructuredTaskSpec(
-                task_id="recon_auth",
+                task_id="json_recovery",
                 system_prompt="Return JSON.",
                 objective="Validate duplicated JSON recovery.",
             )
@@ -231,7 +231,7 @@ def test_structured_task_prompt_forbids_appended_second_json_object() -> None:
 
         result = runner.run(
             spec=StructuredTaskSpec(
-                task_id="recon",
+                task_id="json_prompt_guard",
                 system_prompt="Return JSON.",
                 objective="Validate prompt guard.",
             )
@@ -272,16 +272,16 @@ def test_structured_task_runner_uses_parent_session_id_for_tool_context() -> Non
 
         result = runner.run(
             spec=StructuredTaskSpec(
-                task_id="recon",
+                task_id="session_context",
                 system_prompt="Return JSON after checking session id.",
                 objective="Check session id.",
                 allowed_tools=["session_id_tool"],
             ),
-            session_id="engagement-session",
+            session_id="workspace-session",
         )
 
         assert result.ok is True
-        assert result.tool_history[0]["content_preview"] == "engagement-session"
+        assert result.tool_history[0]["content_preview"] == "workspace-session"
 
 
 def test_structured_task_runner_fails_fast_on_unknown_allowed_tool() -> None:

@@ -183,7 +183,7 @@ class CustomInvestigationHooks(DomainHooks):
     def customize_investigation_prompts(self, *, prompt_set, settings, options) -> InvestigationPromptSet:
         self.modes.append(options.mode)
         return prompt_set.append_domain_guidance(
-            "Domain investigation guidance: preserve endpoint provenance and persistence gaps."
+            "Domain investigation guidance: preserve source provenance and follow-up gaps."
         )
 
 

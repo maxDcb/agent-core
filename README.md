@@ -3,25 +3,49 @@
 Reusable, domain-agnostic runtime for tool-using LLM agents.
 
 `agent-core` provides the orchestration layer that applications can compose with
-their own prompts, tools, policy rules and domain memory. It intentionally keeps
-domain-specific prompts, checklists and integrations outside the core package.
+their own prompts, tools, policy rules, storage and domain memory. It is meant
+to be the generic runtime under an agent application, not a domain-specific
+agent package.
 
-## Features
+Version `0.2.0` is an alpha release. The runtime is usable and tested, but the
+public API may still evolve before `1.0.0`.
 
-- Tool-calling orchestration loop with pending tool result / resume support
-- Provider abstraction for OpenAI-compatible and Azure-backed LLMs
+## What It Provides
+
+- Tool-calling assistant loop with pending tool result and resume support
+- Three run modes: `direct`, `investigate`, and `deep_investigate`
+- Bounded investigation state with auditable facts, gaps, actions and confidence
+- Run trace persistence with prompt snapshots, events and compact summaries
+- Generic structured task runner for bounded JSON-producing subtasks
 - Tool registry and small tool protocol
 - Session persistence and memory lifecycle helpers
-- Policy guardrail entry points
-- Domain hooks for application-specific context and memory extensions
+- Policy guardrail entry points for tool execution
+- Domain hooks for application-specific prompt and memory extensions
+- Provider adapters for OpenAI, Azure OpenAI and Azure Anthropic backends
+- OpenAI/Azure request normalization and adaptive retry handling
 - Typed Python package marker (`py.typed`)
+
+## What Stays Outside Core
+
+`agent-core` intentionally does not ship domain-specific prompts, checklists,
+tools, reports or integrations. Domain packages should depend on this runtime
+and provide their own behavior through:
+
+- application prompts
+- `DomainHooks`
+- registered tools
+- policy rules
+- external storage or domain memory
+
+This keeps the repository usable for many application domains instead of
+specializing it for one workflow.
 
 ## Install
 
 From a tagged Git repository:
 
 ```bash
-python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.1.0"
+python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.2.0"
 ```
 
 For local development:
@@ -61,42 +85,64 @@ Or run a small REPL:
 .venv/bin/python examples/quickstart.py --interactive
 ```
 
-See [examples/README.md](examples/README.md) for the pending tool result /
+See [examples/README.md](examples/README.md) for the pending tool result and
 resume example.
 
-## Investigation Modes
+## Core Concepts
 
-Bounded investigation modes are documented in
-[docs/investigation_modes.md](docs/investigation_modes.md). They provide
-domain-agnostic planning/reflection/decision loops without storing or exposing
-raw chain-of-thought.
+- `AgentOrchestrator` coordinates one user turn from prompt build to provider
+  call, tool execution, memory persistence and optional trace persistence.
+- `ToolRegistry` stores application tools and exposes model-facing tool
+  definitions.
+- `PolicyEngine` authorizes tool calls before execution.
+- `SessionManager` and `SessionRepository` persist conversation blocks, memory
+  state, metadata and run traces.
+- `RunOptions` selects the execution mode and investigation budgets.
+- `DomainHooks` let applications add domain prompt blocks and memory payloads
+  without adding domain logic to the core package.
 
-## Public API
+## Run Modes
+
+The default mode is `direct`, which preserves the ordinary assistant/tool loop.
+For multi-step work, `investigate` and `deep_investigate` add bounded planning,
+reflection, decision and optional final critique phases while storing only
+auditable artifacts, not raw chain-of-thought.
 
 ```python
-from agent_core import (
-    AgentOrchestrator,
-    BaseTool,
-    CoreSettings,
-    DomainHooks,
-    ExecutionContext,
-    PolicyEngine,
-    SessionManager,
-    SessionRepository,
-    ToolRegistry,
-    build_tool_definition,
+from agent_core import RunOptions
+
+result = orchestrator.run_turn_result(
+    "Investigate this issue using the available tools.",
+    options=RunOptions.investigate(),
 )
 ```
 
-## Minimal Integration Pattern
+See [docs/investigation_modes.md](docs/investigation_modes.md) for mode details
+and metadata returned by completed investigation runs.
 
-1. Build `CoreSettings` from your application config.
-2. Create a `BaseLLMProvider` implementation.
-3. Register tools in `ToolRegistry`.
-4. Instantiate `SessionRepository` and `SessionManager`.
-5. Instantiate `PolicyEngine`.
-6. Optionally implement `DomainHooks`.
-7. Build `AgentOrchestrator` and call `run_turn_result()`.
+## Structured Tasks
+
+`StructuredTaskRunner` runs a bounded tool-using subtask and asks the model for
+a JSON object. It is useful when an application needs a generic sub-agent-like
+step without introducing domain-specific specialist profiles into core.
+
+```python
+from agent_core import StructuredTaskSpec
+
+spec = StructuredTaskSpec(
+    task_id="workspace_summary",
+    system_prompt="Return JSON only.",
+    objective="Summarize the provided workspace context.",
+    allowed_tools=["search_code"],
+    output_schema={
+        "type": "object",
+        "required": ["summary"],
+        "properties": {"summary": {"type": "string"}},
+    },
+)
+
+result = structured_task_runner.run(spec=spec, session_id="default")
+```
 
 ## Pending Tool Result Flow
 
@@ -121,7 +167,65 @@ completed = orchestrator.resume_turn(
 )
 ```
 
+## Minimal Integration Pattern
+
+1. Build `CoreSettings` from your application config.
+2. Create a `BaseLLMProvider` implementation or use a provider from
+   `agent_core.llm`.
+3. Register tools in `ToolRegistry`.
+4. Instantiate `SessionRepository` and `SessionManager`.
+5. Instantiate `PolicyEngine`.
+6. Optionally implement `DomainHooks`.
+7. Build `AgentOrchestrator` and call `run_turn_result()`.
+
+## Public API
+
+```python
+from agent_core import (
+    AgentOrchestrator,
+    AgentRunMode,
+    AgentTurnResult,
+    BaseTool,
+    ContextBudget,
+    CoreSettings,
+    DomainHooks,
+    EvidenceItem,
+    ExecutionContext,
+    FinalCritique,
+    Hypothesis,
+    InvestigationDecision,
+    InvestigationPromptSet,
+    InvestigationState,
+    JsonFileSessionStore,
+    PolicyEngine,
+    PromptBlock,
+    PromptSnapshot,
+    RunOptions,
+    RunTrace,
+    SessionManager,
+    SessionRepository,
+    SessionStore,
+    StepReflection,
+    StructuredTaskResult,
+    StructuredTaskRunner,
+    StructuredTaskSpec,
+    ToolRegistry,
+    ToolResult,
+    TraceEvent,
+    build_tool_definition,
+)
+```
+
+## Development Checks
+
+```bash
+.venv/bin/python -m pytest
+.venv/bin/python -m mypy agent_core
+.venv/bin/python -m build
+```
+
 ## Repository Scope
 
 This repository should stay focused on the generic runtime. Domain packages
-should depend on it instead of adding their prompts or tools here.
+should depend on it instead of adding their prompts, tools or reporting logic
+here.

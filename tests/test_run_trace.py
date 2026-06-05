@@ -178,14 +178,14 @@ def test_session_repository_persists_run_trace_summaries(tmp_path) -> None:
 
 def test_session_repository_stores_state_under_session_directory(tmp_path) -> None:
     repo = SessionRepository(tmp_path / "session.json")
-    state = repo.load("engagement-a")
+    state = repo.load("workspace-a")
     state["tool_history"].append({"tool_name": "search_code", "status": "ok"})
 
-    repo.save("engagement-a", state)
+    repo.save("workspace-a", state)
 
-    assert (tmp_path / "engagement-a" / "engagement-a.json").exists()
-    assert not (tmp_path / "engagement-a.json").exists()
-    loaded = repo.load("engagement-a")
+    assert (tmp_path / "workspace-a" / "workspace-a.json").exists()
+    assert not (tmp_path / "workspace-a.json").exists()
+    loaded = repo.load("workspace-a")
     assert loaded["tool_history"] == [{"tool_name": "search_code", "status": "ok"}]
 
 

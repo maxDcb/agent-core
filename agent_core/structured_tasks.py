@@ -118,8 +118,12 @@ def _load_json_output(raw_content: str) -> tuple[object, dict[str, Any]]:
 
 
 def _clean_positive_int(value: object, *, default: int, minimum: int = 0) -> int:
+    normalized = default
     try:
-        normalized = int(value)  # type: ignore[arg-type]
+        if isinstance(value, bool):
+            normalized = int(value)
+        elif isinstance(value, (int, float, str)):
+            normalized = int(value)
     except (TypeError, ValueError):
         normalized = default
     return max(minimum, normalized)
