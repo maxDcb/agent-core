@@ -73,12 +73,14 @@ def create_chat_completion_with_adaptive_retry(
     attempt = 1
 
     while True:
+        attempt_started_at = time.monotonic()
         try:
             return completions.create(**fallback_request)
         except RateLimitError as exc:
             attempt = _retry_after_transient_error(
                 exc=exc,
                 attempt=attempt,
+                elapsed_seconds=round(time.monotonic() - attempt_started_at, 3),
                 policy=policy,
                 provider_name=provider_name,
                 logger=logger,
@@ -106,7 +108,10 @@ def create_chat_completion_with_adaptive_retry(
                 logger.warning(
                     "%s rejected response_format; retrying with fallback format",
                     provider_name,
-                    extra={"model": fallback_request.get("model")},
+                    extra={
+                        "model": fallback_request.get("model"),
+                        "elapsed_seconds": round(time.monotonic() - attempt_started_at, 3),
+                    },
                 )
                 continue
 
@@ -123,7 +128,10 @@ def create_chat_completion_with_adaptive_retry(
                 "%s rejected %s; retrying with adjusted request",
                 provider_name,
                 retry_action.parameter,
-                extra={"model": fallback_request.get("model")},
+                extra={
+                    "model": fallback_request.get("model"),
+                    "elapsed_seconds": round(time.monotonic() - attempt_started_at, 3),
+                },
             )
             fallback_request.pop(retry_action.parameter, None)
             retried_without.add(retry_action.parameter)
@@ -133,6 +141,7 @@ def create_chat_completion_with_adaptive_retry(
             attempt = _retry_after_transient_error(
                 exc=exc,
                 attempt=attempt,
+                elapsed_seconds=round(time.monotonic() - attempt_started_at, 3),
                 policy=policy,
                 provider_name=provider_name,
                 logger=logger,
@@ -162,6 +171,7 @@ def _retry_after_transient_error(
     *,
     exc: BaseException,
     attempt: int,
+    elapsed_seconds: float,
     policy: OpenAIRateLimitRetryPolicy,
     provider_name: str,
     logger: Any,
@@ -185,6 +195,7 @@ def _retry_after_transient_error(
             "model": fallback_request.get("model"),
             "attempt": attempt,
             "max_attempts": policy.max_attempts,
+            "elapsed_seconds": elapsed_seconds,
             "delay_seconds": round(delay_seconds, 3),
             "error_type": type(exc).__name__,
             "status_code": getattr(exc, "status_code", None),

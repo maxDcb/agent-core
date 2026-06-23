@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from typing import Any
 
@@ -21,6 +22,48 @@ from agent_core.llm.openai_compat import create_chat_completion_with_adaptive_re
 from agent_core.llm.openai_request_policy import OpenAIChatRequestNormalizer, OpenAIModelCapabilityResolver
 
 logger = get_logger(__name__)
+
+
+def _jsonish_char_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _approx_token_count_from_chars(char_count: int) -> int:
+    return round(max(0, char_count) / 4)
+
+
+def _message_stats(messages: list[dict[str, Any]]) -> dict[str, int]:
+    content_lengths = [_jsonish_char_count(message.get("content")) for message in messages]
+    tool_call_lengths = [_jsonish_char_count(message.get("tool_calls")) for message in messages if message.get("tool_calls")]
+    total_chars = sum(content_lengths) + sum(tool_call_lengths)
+    return {
+        "request_message_chars": total_chars,
+        "request_message_approx_tokens": _approx_token_count_from_chars(total_chars),
+        "largest_message_chars": max(content_lengths, default=0),
+        "assistant_tool_call_chars": sum(tool_call_lengths),
+    }
+
+
+def _response_format_type(response_format: Any) -> str | None:
+    if isinstance(response_format, dict):
+        value = response_format.get("type")
+        return str(value) if value is not None else "dict"
+    if response_format is not None:
+        return type(response_format).__name__
+    return None
+
+
+def _elapsed_since(started_at: float | None) -> float | None:
+    if started_at is None:
+        return None
+    return round(time.monotonic() - started_at, 3)
 
 
 class OpenAIProvider:
@@ -120,15 +163,7 @@ class OpenAIProvider:
                 detail="Missing OPENAI_API_KEY for OpenAIProvider",
             )
 
-        logger.info(
-            "Sending chat completion request",
-            extra={
-                "model": model,
-                "message_count": len(messages),
-                "tool_count": len(tools or []),
-                "timeout_seconds": self.timeout_seconds,
-            },
-        )
+        request_started_at: float | None = None
         try:
             client = self._get_client()
             request: dict[str, Any] = {
@@ -152,7 +187,32 @@ class OpenAIProvider:
             for change in normalization.changes:
                 logger.debug("Adjusted OpenAI chat completion request", extra={"model": model, "change": change})
 
-            started_at = time.monotonic()
+            request_messages = request.get("messages", [])
+            request_message_dicts = [
+                message for message in request_messages if isinstance(message, dict)
+            ] if isinstance(request_messages, list) else []
+            request_tools = request.get("tools", [])
+            response_format = request.get("response_format")
+            metadata = options.metadata if options is not None else {}
+            logger.info(
+                "Sending chat completion request",
+                extra={
+                    "model": model,
+                    "message_count": len(request_message_dicts),
+                    "tool_count": len(request_tools),
+                    "timeout_seconds": self.timeout_seconds,
+                    "structured_task_id": metadata.get("structured_task_id"),
+                    "max_tokens": request.get("max_tokens"),
+                    "max_completion_tokens": request.get("max_completion_tokens"),
+                    "response_format_type": _response_format_type(response_format),
+                    "response_format_chars": _jsonish_char_count(response_format),
+                    "tool_schema_chars": _jsonish_char_count(request_tools),
+                    "tool_schema_approx_tokens": _approx_token_count_from_chars(_jsonish_char_count(request_tools)),
+                    **_message_stats(request_message_dicts),
+                },
+            )
+
+            request_started_at = time.monotonic()
             response = create_chat_completion_with_adaptive_retry(
                 completions=client.chat.completions,
                 request=request,
@@ -161,47 +221,77 @@ class OpenAIProvider:
                 capability_resolver=self.capability_resolver,
                 response_format_fallback=options.response_format_fallback if options is not None else None,
             )
+            choices = getattr(response, "choices", None) or []
+            message = choices[0].message if choices else None
             logger.info(
                 "Received chat completion response",
-                extra={"model": model, "elapsed_seconds": round(time.monotonic() - started_at, 3)},
+                extra={
+                    "model": model,
+                    "elapsed_seconds": _elapsed_since(request_started_at),
+                    "choice_count": len(choices),
+                    "response_content_chars": len(getattr(message, "content", None) or "") if message is not None else 0,
+                    "response_content_approx_tokens": _approx_token_count_from_chars(
+                        len(getattr(message, "content", None) or "") if message is not None else 0
+                    ),
+                    "response_tool_call_count": len(getattr(message, "tool_calls", None) or []) if message is not None else 0,
+                },
             )
         except AuthenticationError as exc:
-            logger.exception("OpenAI authentication failed")
+            logger.exception("OpenAI authentication failed", extra={"elapsed_seconds": _elapsed_since(request_started_at)})
             raise LLMProviderError(
                 kind="configuration_error",
                 user_message="The LLM provider rejected the credentials. Check OPENAI_API_KEY and provider access.",
                 detail=str(exc),
             ) from exc
         except (APIConnectionError, APITimeoutError) as exc:
-            logger.exception("OpenAI request failed due to connectivity or timeout")
+            logger.exception(
+                "OpenAI request failed due to connectivity or timeout",
+                extra={"elapsed_seconds": _elapsed_since(request_started_at), "error_type": type(exc).__name__},
+            )
             raise LLMProviderError(
                 kind="request_error",
                 user_message="The assistant could not reach the LLM provider. Check network access and try again.",
                 detail=str(exc),
             ) from exc
         except RateLimitError as exc:
-            logger.exception("OpenAI request was rate limited")
+            logger.exception(
+                "OpenAI request was rate limited",
+                extra={"elapsed_seconds": _elapsed_since(request_started_at), "error_type": type(exc).__name__},
+            )
             raise LLMProviderError(
                 kind="rate_limit_error",
                 user_message="The LLM provider rate-limited the request. Wait briefly and try again.",
                 detail=str(exc),
             ) from exc
         except (BadRequestError, APIStatusError) as exc:
-            logger.exception("OpenAI request was rejected by the API")
+            logger.exception(
+                "OpenAI request was rejected by the API",
+                extra={
+                    "elapsed_seconds": _elapsed_since(request_started_at),
+                    "error_type": type(exc).__name__,
+                    "status_code": getattr(exc, "status_code", None),
+                },
+            )
             raise LLMProviderError(
                 kind="request_error",
                 user_message="The LLM provider rejected the request. Review the model configuration and request payload.",
                 detail=str(exc),
             ) from exc
         except OpenAIError as exc:
-            logger.exception("Unexpected OpenAI provider error")
+            logger.exception(
+                "Unexpected OpenAI provider error",
+                extra={"elapsed_seconds": _elapsed_since(request_started_at), "error_type": type(exc).__name__},
+            )
             raise LLMProviderError(
                 kind="unexpected_error",
                 user_message="The LLM provider failed unexpectedly. Try again after checking the provider configuration.",
                 detail=str(exc),
             ) from exc
         except Exception as exc:
-            logger.exception("Unexpected non-OpenAI provider error")
+            logger.exception(
+                "Unexpected non-OpenAI provider error",
+                extra={"elapsed_seconds": _elapsed_since(request_started_at), "error_type": type(exc).__name__},
+            )
             raise LLMProviderError(
                 kind="unexpected_error",
                 user_message="The assistant encountered an unexpected provider failure.",

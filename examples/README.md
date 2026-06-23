@@ -28,6 +28,15 @@ Or start a small REPL:
 .venv/bin/python examples/quickstart.py --interactive
 ```
 
+You can also run a provider compatibility check against OpenAI-compatible local
+endpoints. This exercises plain chat, tool calls, `response_format` JSON object,
+`response_format` JSON schema with fallback, and `StructuredTaskRunner` final
+output:
+
+```bash
+.venv/bin/python examples/quickstart.py --compat-check
+```
+
 The example persists session memory under `.agent-core-demo/`.
 
 ## Pending tool result / resume

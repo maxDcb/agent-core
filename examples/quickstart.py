@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import shlex
 from datetime import UTC, datetime
@@ -14,10 +15,15 @@ from agent_core import (
     PolicyEngine,
     SessionManager,
     SessionRepository,
+    StructuredOutputContract,
+    StructuredTaskRunner,
+    StructuredTaskSpec,
     ToolRegistry,
     ToolResult,
     build_tool_definition,
 )
+from agent_core.llm.base import LLMCallOptions, LLMMessage, LLMToolDefinition
+from agent_core.llm.errors import LLMProviderError
 from agent_core.llm.openai_provider import OpenAIProvider
 
 
@@ -157,9 +163,214 @@ def run_repl(orchestrator: AgentOrchestrator, *, session_id: str) -> None:
         run_prompt(orchestrator, prompt, session_id=session_id)
 
 
+def _print_check(name: str, ok: bool, detail: str) -> bool:
+    status = "PASS" if ok else "FAIL"
+    print(f"[{status}] {name}: {detail}")
+    return ok
+
+
+def _json_object_matches(content: str, expected: dict[str, Any]) -> tuple[bool, str]:
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        return False, f"invalid JSON: {exc.msg}"
+    if not isinstance(payload, dict):
+        return False, f"expected object, got {type(payload).__name__}"
+
+    mismatches = {
+        key: {"expected": value, "actual": payload.get(key)}
+        for key, value in expected.items()
+        if payload.get(key) != value
+    }
+    if mismatches:
+        return False, f"mismatches={mismatches}"
+    return True, f"keys={sorted(payload.keys())}"
+
+
+def _run_plain_chat_check(provider: OpenAIProvider, *, model: str) -> bool:
+    try:
+        content = provider.complete_text(
+            messages=[
+                LLMMessage(role="system", content="You are a compatibility checker. Answer exactly as requested."),
+                LLMMessage(role="user", content="Return exactly: OK"),
+            ],
+            model=model,
+            temperature=0.0,
+        )
+    except LLMProviderError as exc:
+        return _print_check("plain chat", False, f"{exc.kind}: {exc.user_message}")
+    normalized = content.strip().strip("\"'").rstrip(".")
+    if normalized == "OK":
+        return _print_check("plain chat", True, f"content={content!r}")
+
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError:
+        payload = None
+    if isinstance(payload, dict) and payload.get("answer") == "OK":
+        return _print_check("plain chat", True, f"content={content!r}; note=json wrapper")
+
+    return _print_check("plain chat", False, f"content={content!r}")
+
+
+def _run_tool_call_check(provider: OpenAIProvider, *, model: str) -> bool:
+    try:
+        result = provider.complete_with_tools(
+            messages=[
+                LLMMessage(
+                    role="user",
+                    content="Call the echo tool once with text set to compatibility-check. Do not answer directly.",
+                )
+            ],
+            tools=[
+                LLMToolDefinition(
+                    name="echo",
+                    description="Return the provided text.",
+                    parameters={
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                        "additionalProperties": False,
+                    },
+                )
+            ],
+            model=model,
+            temperature=0.0,
+        )
+    except LLMProviderError as exc:
+        return _print_check("tool calls", False, f"{exc.kind}: {exc.user_message}")
+
+    if not result.tool_calls:
+        return _print_check("tool calls", False, f"no tool call returned; content={result.content!r}")
+    call = result.tool_calls[0]
+    try:
+        arguments = json.loads(call.arguments_json or "{}")
+    except json.JSONDecodeError:
+        arguments = {}
+    ok = call.name == "echo" and isinstance(arguments, dict) and arguments.get("text") == "compatibility-check"
+    return _print_check("tool calls", ok, f"name={call.name!r}, arguments={call.arguments_json!r}")
+
+
+def _run_json_object_check(provider: OpenAIProvider, *, model: str) -> bool:
+    try:
+        content = provider.complete_text(
+            messages=[
+                LLMMessage(
+                    role="user",
+                    content='Return one JSON object with fields "ok": true and "mode": "json_object". No prose.',
+                )
+            ],
+            model=model,
+            temperature=0.0,
+            options=LLMCallOptions(response_format={"type": "json_object"}),
+        )
+    except LLMProviderError as exc:
+        return _print_check("response_format json_object", False, f"{exc.kind}: {exc.user_message}")
+
+    ok, detail = _json_object_matches(content, {"ok": True, "mode": "json_object"})
+    return _print_check("response_format json_object", ok, detail)
+
+
+def _run_json_schema_check(provider: OpenAIProvider, *, model: str) -> bool:
+    schema = {
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "mode": {"type": "string", "enum": ["json_schema"]},
+        },
+        "required": ["ok", "mode"],
+        "additionalProperties": False,
+    }
+    try:
+        content = provider.complete_text(
+            messages=[
+                LLMMessage(
+                    role="user",
+                    content='Return one JSON object with fields "ok": true and "mode": "json_schema". No prose.',
+                )
+            ],
+            model=model,
+            temperature=0.0,
+            options=LLMCallOptions(
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "compatibility_check",
+                        "schema": schema,
+                        "strict": True,
+                    },
+                },
+                response_format_fallback={"type": "json_object"},
+            ),
+        )
+    except LLMProviderError as exc:
+        return _print_check("response_format json_schema", False, f"{exc.kind}: {exc.user_message}")
+
+    ok, detail = _json_object_matches(content, {"ok": True, "mode": "json_schema"})
+    return _print_check("response_format json_schema", ok, detail)
+
+
+def _run_structured_task_check(settings: CoreSettings, provider: OpenAIProvider) -> bool:
+    runner = StructuredTaskRunner(
+        settings=settings,
+        provider=provider,
+        tool_registry=ToolRegistry(),
+        policy_engine=PolicyEngine(),
+    )
+    result = runner.run(
+        spec=StructuredTaskSpec(
+            task_id="compatibility_check",
+            system_prompt="You are validating provider structured output support.",
+            objective='Return {"ok": true, "component": "structured_task"} as the final output.',
+            output_contract=StructuredOutputContract(
+                name="compatibility_check",
+                strict=True,
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "component": {"type": "string", "enum": ["structured_task"]},
+                    },
+                    "required": ["ok", "component"],
+                    "additionalProperties": False,
+                },
+            ),
+            allowed_tools=[],
+            max_iterations=1,
+        )
+    )
+    output = result.output or {}
+    output_matches = result.ok and output.get("ok") is True and output.get("component") == "structured_task"
+    detail = result.failure_reason or f"output={result.output}"
+    return _print_check("StructuredTaskRunner final output", output_matches, detail)
+
+
+def run_compatibility_checks(settings: CoreSettings) -> int:
+    provider = OpenAIProvider(api_key=settings.openai_api_key)
+    print(f"Running provider compatibility checks with model={settings.model!r}")
+    print("Checks cover plain chat, OpenAI-style tool calls, response_format, and StructuredTaskRunner.")
+
+    checks = [
+        _run_plain_chat_check(provider, model=settings.model),
+        _run_tool_call_check(provider, model=settings.model),
+        _run_json_object_check(provider, model=settings.model),
+        _run_json_schema_check(provider, model=settings.model),
+        _run_structured_task_check(settings, provider),
+    ]
+
+    passed = sum(1 for ok in checks if ok)
+    print(f"\nCompatibility summary: {passed}/{len(checks)} checks passed.")
+    return 0 if all(checks) else 1
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a minimal agent-core assistant.")
     parser.add_argument("prompt", nargs="?", default=DEFAULT_PROMPT, help="Prompt to send for a one-shot run.")
+    parser.add_argument(
+        "--compat-check",
+        action="store_true",
+        help="Run provider compatibility checks for local/OpenAI-compatible endpoints.",
+    )
     parser.add_argument("--interactive", action="store_true", help="Start a small REPL instead of one one-shot prompt.")
     parser.add_argument("--session-id", default="quickstart", help="Session id used for persisted memory.")
     parser.add_argument("--session-file", type=Path, default=DEMO_STATE_DIR / "session.json", help="Session JSON path.")
@@ -187,6 +398,10 @@ def main() -> int:
         memory_model=args.memory_model or os.getenv("AGENT_CORE_MEMORY_MODEL", "gpt-4.1-mini"),
         session_file=args.session_file,
     )
+
+    if args.compat_check:
+        return run_compatibility_checks(settings)
+
     orchestrator = build_orchestrator(settings)
 
     if args.interactive:

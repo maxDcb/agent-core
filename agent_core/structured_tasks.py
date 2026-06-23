@@ -117,6 +117,41 @@ def _load_json_output(raw_content: str) -> tuple[object, dict[str, Any]]:
         }
 
 
+def _approx_token_count_from_chars(char_count: int) -> int:
+    return round(max(0, char_count) / 4)
+
+
+def _jsonish_char_count(value: Any) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, str):
+        return len(value)
+    try:
+        return len(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
+    except (TypeError, ValueError):
+        return len(str(value))
+
+
+def _message_content_stats(messages: list[LLMMessage]) -> dict[str, int]:
+    content_lengths = [len(message.content or "") for message in messages]
+    tool_call_chars = sum(_jsonish_char_count(message.tool_calls) for message in messages if message.tool_calls)
+    total_chars = sum(content_lengths) + tool_call_chars
+    return {
+        "message_count": len(messages),
+        "transcript_chars": total_chars,
+        "transcript_approx_tokens": _approx_token_count_from_chars(total_chars),
+        "largest_message_chars": max(content_lengths, default=0),
+        "assistant_tool_call_chars": tool_call_chars,
+    }
+
+
+def _response_format_type(response_format: dict[str, Any] | None) -> str | None:
+    if not isinstance(response_format, dict):
+        return None
+    value = response_format.get("type")
+    return str(value) if value is not None else "dict"
+
+
 def _clean_positive_int(value: object, *, default: int, minimum: int = 0) -> int:
     normalized = default
     try:
@@ -424,6 +459,19 @@ class StructuredTaskRunner:
             "model": spec.model or self.settings.model,
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
+        logger.info(
+            "Structured task LLM request prepared",
+            extra={
+                "task_id": spec.task_id,
+                "model": kwargs["model"],
+                "final_output": final_output,
+                "tool_count": len(kwargs["tools"]),
+                "response_format_type": _response_format_type(options.response_format),
+                "response_format_chars": _jsonish_char_count(options.response_format),
+                "response_format_fallback_type": _response_format_type(options.response_format_fallback),
+                **_message_content_stats(messages),
+            },
+        )
         if self._provider_accepts_options("complete_with_tools"):
             kwargs["options"] = options
         return self.provider.complete_with_tools(**kwargs)
@@ -462,6 +510,18 @@ class StructuredTaskRunner:
             "model": spec.model or self.settings.model,
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
+        logger.info(
+            "Structured task finalization LLM request prepared",
+            extra={
+                "task_id": spec.task_id,
+                "model": kwargs["model"],
+                "failure_reason": failure_reason,
+                "response_format_type": _response_format_type(options.response_format),
+                "response_format_chars": _jsonish_char_count(options.response_format),
+                "response_format_fallback_type": _response_format_type(options.response_format_fallback),
+                **_message_content_stats(final_messages),
+            },
+        )
         if self._provider_accepts_options("complete_with_tools"):
             kwargs["options"] = options
         return self.provider.complete_with_tools(**kwargs)
@@ -628,9 +688,20 @@ class StructuredTaskRunner:
         tool_calls_used: int,
         metadata: dict[str, Any],
     ) -> StructuredTaskResult:
+        raw_content_chars = len(raw_content or "")
         try:
             payload, recovery_metadata = _load_json_output(raw_content)
         except json.JSONDecodeError:
+            logger.warning(
+                "Structured task final output was invalid JSON",
+                extra={
+                    "task_id": task_id,
+                    "raw_content_chars": raw_content_chars,
+                    "raw_content_approx_tokens": _approx_token_count_from_chars(raw_content_chars),
+                    "iterations": iterations,
+                    "tool_calls_used": tool_calls_used,
+                },
+            )
             return StructuredTaskResult(
                 ok=False,
                 task_id=task_id,
@@ -643,6 +714,17 @@ class StructuredTaskRunner:
             )
 
         if not isinstance(payload, dict):
+            logger.warning(
+                "Structured task final output was not a JSON object",
+                extra={
+                    "task_id": task_id,
+                    "raw_content_chars": raw_content_chars,
+                    "raw_content_approx_tokens": _approx_token_count_from_chars(raw_content_chars),
+                    "output_type": type(payload).__name__,
+                    "iterations": iterations,
+                    "tool_calls_used": tool_calls_used,
+                },
+            )
             return StructuredTaskResult(
                 ok=False,
                 task_id=task_id,
@@ -654,6 +736,21 @@ class StructuredTaskRunner:
                 metadata=metadata,
             )
 
+        output_compact_chars = _jsonish_char_count(payload)
+        logger.info(
+            "Structured task final output parsed",
+            extra={
+                "task_id": task_id,
+                "raw_content_chars": raw_content_chars,
+                "raw_content_approx_tokens": _approx_token_count_from_chars(raw_content_chars),
+                "output_compact_chars": output_compact_chars,
+                "output_compact_approx_tokens": _approx_token_count_from_chars(output_compact_chars),
+                "output_top_level_key_count": len(payload),
+                "iterations": iterations,
+                "tool_calls_used": tool_calls_used,
+                "json_recovery_applied": bool(recovery_metadata.get("json_recovery_applied")),
+            },
+        )
         return StructuredTaskResult(
             ok=True,
             task_id=task_id,
