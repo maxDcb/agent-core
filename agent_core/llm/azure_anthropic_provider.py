@@ -28,6 +28,10 @@ JSON_OBJECT_SYSTEM_INSTRUCTION = (
     "When a JSON object is requested, return only the raw JSON object. "
     "Do not wrap it in Markdown code fences and do not include prose before or after it."
 )
+FINAL_USER_TURN_AFTER_ASSISTANT = (
+    "Continue from the prior assistant draft and return the requested final answer now. "
+    "Follow the current system instructions exactly."
+)
 
 
 def _get_value(value: Any, key: str, default: Any = None) -> Any:
@@ -135,7 +139,8 @@ class AzureAnthropicProvider:
         self._ensure_configured()
 
         system_prompt, anthropic_messages = self._to_anthropic_messages(messages)
-        if self._uses_prompt_only_json_object(options):
+        output_config = self._output_config_from_options(options)
+        if self._uses_prompt_only_json_object(options, output_config=output_config):
             system_prompt = "\n\n".join(part for part in [system_prompt, JSON_OBJECT_SYSTEM_INSTRUCTION] if part)
         request: dict[str, Any] = {
             "model": model,
@@ -152,7 +157,6 @@ class AzureAnthropicProvider:
             request["tools"] = [self._to_anthropic_tool(tool) for tool in tools]
             request["tool_choice"] = {"type": "auto"}
 
-        output_config = self._output_config_from_options(options)
         if output_config is not None:
             request["output_config"] = output_config
 
@@ -337,6 +341,14 @@ class AzureAnthropicProvider:
             else:
                 converted.append({"role": anthropic_role, "content": content_blocks})
 
+        if converted and converted[-1]["role"] == "assistant":
+            converted.append(
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": FINAL_USER_TURN_AFTER_ASSISTANT}],
+                }
+            )
+
         return "\n\n".join(system_parts).strip(), converted
 
     def _message_to_content_blocks(self, message: LLMMessage) -> list[dict[str, Any]]:
@@ -405,9 +417,27 @@ class AzureAnthropicProvider:
         if not isinstance(schema, dict):
             return None
 
+        if not self._schema_supports_anthropic_output_config(schema):
+            return None
+
         return {"type": "json_schema", "schema": schema}
 
-    def _uses_prompt_only_json_object(self, options: LLMCallOptions | None) -> bool:
-        if options is None or not isinstance(options.response_format, dict):
+    def _uses_prompt_only_json_object(self, options: LLMCallOptions | None, *, output_config: dict[str, Any] | None) -> bool:
+        if options is None or output_config is not None:
             return False
-        return options.response_format.get("type") == "json_object"
+        return self._is_json_object_format(options.response_format) or self._is_json_object_format(options.response_format_fallback)
+
+    def _is_json_object_format(self, response_format: dict[str, Any] | None) -> bool:
+        return isinstance(response_format, dict) and response_format.get("type") == "json_object"
+
+    def _schema_supports_anthropic_output_config(self, schema: dict[str, Any]) -> bool:
+        stack: list[Any] = [schema]
+        while stack:
+            value = stack.pop()
+            if isinstance(value, dict):
+                if value.get("type") == "object" and value.get("additionalProperties") is not False:
+                    return False
+                stack.extend(value.values())
+            elif isinstance(value, list):
+                stack.extend(value)
+        return True

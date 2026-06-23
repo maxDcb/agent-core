@@ -256,3 +256,71 @@ def test_azure_anthropic_provider_maps_json_schema_response_format_to_output_con
     assert request["max_tokens"] == 1024
     assert request["output_config"] == {"format": {"type": "json_schema", "schema": schema}}
     assert "response_format" not in request
+
+
+def test_azure_anthropic_provider_falls_back_for_open_object_json_schema() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "ok": {"type": "boolean"},
+            "metadata": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+        },
+        "required": ["ok", "metadata"],
+        "additionalProperties": False,
+    }
+    scripted_messages = ScriptedMessages(_text_response('{"ok": true, "metadata": {"dynamic": "value"}}'))
+    provider = _provider_with_scripted_messages(scripted_messages)
+
+    result = provider.complete_text(
+        messages=[LLMMessage(role="user", content="Return the final object.")],
+        model="claude-opus-4-6",
+        temperature=0.0,
+        options=LLMCallOptions(
+            response_format={
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "open_object_check",
+                    "schema": schema,
+                    "strict": True,
+                },
+            },
+            response_format_fallback={"type": "json_object"},
+        ),
+    )
+
+    request = scripted_messages.requests[0]
+    assert result == '{"ok": true, "metadata": {"dynamic": "value"}}'
+    assert "output_config" not in request
+    assert "raw JSON object" in request["system"]
+
+
+def test_azure_anthropic_provider_appends_user_turn_after_trailing_assistant_message() -> None:
+    scripted_messages = ScriptedMessages(_text_response('{"ok": true}'))
+    provider = _provider_with_scripted_messages(scripted_messages)
+
+    result = provider.complete_with_tools(
+        messages=[
+            LLMMessage(role="system", content="Return JSON only."),
+            LLMMessage(role="user", content="Investigate the target."),
+            LLMMessage(role="assistant", content='Draft: {"ok": true}'),
+            LLMMessage(role="system", content="No more tools are available. Return final JSON now."),
+        ],
+        tools=[],
+        model="claude-opus-4-6",
+        temperature=0.0,
+        options=LLMCallOptions(response_format={"type": "json_object"}),
+    )
+
+    request = scripted_messages.requests[0]
+    assert result.content == '{"ok": true}'
+    assert request["system"].startswith("Return JSON only.")
+    assert "No more tools are available" in request["system"]
+    assert request["messages"][-2] == {
+        "role": "assistant",
+        "content": [{"type": "text", "text": 'Draft: {"ok": true}'}],
+    }
+    assert request["messages"][-1]["role"] == "user"
+    assert "final answer" in request["messages"][-1]["content"][0]["text"]
