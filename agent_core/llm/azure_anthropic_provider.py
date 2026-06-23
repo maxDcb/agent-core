@@ -32,6 +32,21 @@ FINAL_USER_TURN_AFTER_ASSISTANT = (
     "Continue from the prior assistant draft and return the requested final answer now. "
     "Follow the current system instructions exactly."
 )
+UNSUPPORTED_OUTPUT_SCHEMA_KEYWORDS = frozenset(
+    {
+        "minimum",
+        "maximum",
+        "exclusiveMinimum",
+        "exclusiveMaximum",
+        "minLength",
+        "maxLength",
+        "pattern",
+        "minItems",
+        "maxItems",
+        "uniqueItems",
+        "format",
+    }
+)
 
 
 def _get_value(value: Any, key: str, default: Any = None) -> Any:
@@ -390,37 +405,56 @@ class AzureAnthropicProvider:
         if options is None:
             return None
 
-        response_format = self._response_format_candidate(options.response_format)
+        response_format, rejection_reasons = self._response_format_candidate(options.response_format)
+        if response_format is None and options.response_format_fallback is not None:
+            response_format, fallback_rejection_reasons = self._response_format_candidate(options.response_format_fallback)
+            rejection_reasons.extend(fallback_rejection_reasons)
         if response_format is None:
-            response_format = self._response_format_candidate(options.response_format_fallback)
-        if response_format is None:
+            if rejection_reasons and options.response_format_fallback is None:
+                detail = "; ".join(rejection_reasons[:20])
+                if len(rejection_reasons) > 20:
+                    detail = f"{detail}; ... {len(rejection_reasons) - 20} more"
+                raise LLMProviderError(
+                    kind="configuration_error",
+                    user_message=(
+                        "Azure Anthropic cannot enforce the requested structured output schema. "
+                        "Close the schema or enable an explicit JSON-object fallback."
+                    ),
+                    detail=detail,
+                )
+            if rejection_reasons:
+                logger.warning(
+                    "Azure Anthropic structured output schema is not enforceable; using fallback response format",
+                    extra={"schema_rejection_count": len(rejection_reasons), "schema_rejection_preview": rejection_reasons[:5]},
+                )
             return None
 
         return {"format": response_format}
 
-    def _response_format_candidate(self, response_format: dict[str, Any] | None) -> dict[str, Any] | None:
+    def _response_format_candidate(self, response_format: dict[str, Any] | None) -> tuple[dict[str, Any] | None, list[str]]:
         if not isinstance(response_format, dict):
-            return None
+            return None, []
 
         response_format_type = response_format.get("type")
         if response_format_type == "json_object":
-            return None
+            return None, []
 
         if response_format_type != "json_schema":
-            return None
+            return None, []
 
         json_schema = response_format.get("json_schema")
         if not isinstance(json_schema, dict):
-            return None
+            return None, ["json_schema response_format is missing a json_schema object"]
 
         schema = json_schema.get("schema")
         if not isinstance(schema, dict):
-            return None
+            return None, ["json_schema response_format is missing a schema object"]
 
-        if not self._schema_supports_anthropic_output_config(schema):
-            return None
+        rejection_reasons = self._anthropic_output_schema_rejection_reasons(schema)
+        if rejection_reasons:
+            return None, rejection_reasons
 
-        return {"type": "json_schema", "schema": schema}
+        return {"type": "json_schema", "schema": schema}, []
 
     def _uses_prompt_only_json_object(self, options: LLMCallOptions | None, *, output_config: dict[str, Any] | None) -> bool:
         if options is None or output_config is not None:
@@ -430,14 +464,24 @@ class AzureAnthropicProvider:
     def _is_json_object_format(self, response_format: dict[str, Any] | None) -> bool:
         return isinstance(response_format, dict) and response_format.get("type") == "json_object"
 
-    def _schema_supports_anthropic_output_config(self, schema: dict[str, Any]) -> bool:
+    def _anthropic_output_schema_rejection_reasons(self, schema: dict[str, Any]) -> list[str]:
+        reasons: list[str] = []
         stack: list[Any] = [schema]
+        paths: list[str] = ["$"]
         while stack:
             value = stack.pop()
+            path = paths.pop()
             if isinstance(value, dict):
                 if value.get("type") == "object" and value.get("additionalProperties") is not False:
-                    return False
-                stack.extend(value.values())
+                    reasons.append(f"{path}: object schemas must set additionalProperties=false")
+                for keyword in sorted(UNSUPPORTED_OUTPUT_SCHEMA_KEYWORDS):
+                    if keyword in value:
+                        reasons.append(f"{path}: unsupported JSON Schema keyword {keyword}")
+                for key, child in value.items():
+                    stack.append(child)
+                    paths.append(f"{path}.{key}")
             elif isinstance(value, list):
-                stack.extend(value)
-        return True
+                for index, child in enumerate(value):
+                    stack.append(child)
+                    paths.append(f"{path}[{index}]")
+        return reasons

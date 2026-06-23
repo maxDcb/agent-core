@@ -6,6 +6,7 @@ from typing import Any
 from agent_core.llm import azure_anthropic_provider as provider_module
 from agent_core.llm.azure_anthropic_provider import AzureAnthropicProvider
 from agent_core.llm.base import LLMCallOptions, LLMMessage, LLMToolDefinition
+from agent_core.llm.errors import LLMProviderError
 
 
 class ScriptedMessages:
@@ -295,6 +296,49 @@ def test_azure_anthropic_provider_falls_back_for_open_object_json_schema() -> No
     assert result == '{"ok": true, "metadata": {"dynamic": "value"}}'
     assert "output_config" not in request
     assert "raw JSON object" in request["system"]
+
+
+def test_azure_anthropic_provider_rejects_unenforceable_schema_without_fallback() -> None:
+    schema = {
+        "type": "object",
+        "properties": {
+            "count": {"type": "integer", "minimum": 0},
+            "metadata": {
+                "type": "object",
+                "additionalProperties": True,
+            },
+        },
+        "required": ["count", "metadata"],
+        "additionalProperties": False,
+    }
+    scripted_messages = ScriptedMessages(_text_response('{"count": 1, "metadata": {"dynamic": "value"}}'))
+    provider = _provider_with_scripted_messages(scripted_messages)
+
+    try:
+        provider.complete_text(
+            messages=[LLMMessage(role="user", content="Return the final object.")],
+            model="claude-opus-4-6",
+            temperature=0.0,
+            options=LLMCallOptions(
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "strict_open_object_check",
+                        "schema": schema,
+                        "strict": True,
+                    },
+                },
+            ),
+        )
+    except LLMProviderError as exc:
+        assert exc.kind == "configuration_error"
+        assert "cannot enforce" in exc.user_message
+        assert "additionalProperties=false" in exc.detail
+        assert "minimum" in exc.detail
+    else:  # pragma: no cover - keeps the assertion message useful
+        raise AssertionError("expected Azure Anthropic to reject the unenforceable strict schema")
+
+    assert scripted_messages.requests == []
 
 
 def test_azure_anthropic_provider_appends_user_turn_after_trailing_assistant_message() -> None:
