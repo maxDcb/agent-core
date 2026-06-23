@@ -323,6 +323,88 @@ def test_structured_task_runner_enforces_contract_only_on_final_no_tool_output()
         assert "Investigation is complete" in provider.last_messages[-1].content
 
 
+def test_structured_task_runner_passes_configured_max_output_tokens_to_final_output() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        provider = FakeProvider([LLMCompletionResult(content=json.dumps({"summary": "done"}))])
+        settings = _settings(root)
+        settings.llm_max_output_tokens = 12345
+        runner = StructuredTaskRunner(
+            settings=settings,
+            provider=provider,
+            tool_registry=ToolRegistry(),
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="max_output_tokens",
+                system_prompt="Return JSON.",
+                objective="Validate max output token forwarding.",
+            )
+        )
+
+        assert result.ok is True
+        assert provider.last_options is not None
+        assert provider.last_options.max_output_tokens == 12345
+
+
+def test_structured_task_runner_does_not_pass_configured_max_output_tokens_to_tool_loop() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        contract_schema = {
+            "type": "object",
+            "required": ["summary"],
+            "additionalProperties": False,
+            "properties": {"summary": {"type": "string"}},
+        }
+        provider = FakeProvider(
+            [
+                LLMCompletionResult(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(
+                            id="call-1",
+                            name="echo_tool",
+                            arguments_json=json.dumps({"value": "route"}),
+                        )
+                    ],
+                ),
+                LLMCompletionResult(content="Draft after tool evidence."),
+                LLMCompletionResult(content=json.dumps({"summary": "done"})),
+            ]
+        )
+        settings = _settings(root)
+        settings.llm_max_output_tokens = 12345
+        runner = StructuredTaskRunner(
+            settings=settings,
+            provider=provider,
+            tool_registry=registry,
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="max_output_tokens_tool_loop",
+                system_prompt="Return JSON after checking the tool.",
+                objective="Validate max output token forwarding.",
+                allowed_tools=["echo_tool"],
+                output_contract=StructuredOutputContract(name="summary_contract", schema=contract_schema),
+            )
+        )
+
+        assert result.ok is True
+        assert len(provider.options_history) == 3
+        assert provider.options_history[0] is not None
+        assert provider.options_history[0].max_output_tokens is None
+        assert provider.options_history[1] is not None
+        assert provider.options_history[1].max_output_tokens is None
+        assert provider.options_history[2] is not None
+        assert provider.options_history[2].max_output_tokens == 12345
+
+
 def test_structured_task_runner_rejects_invalid_json_output() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)

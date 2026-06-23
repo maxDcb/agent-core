@@ -164,6 +164,19 @@ def _clean_positive_int(value: object, *, default: int, minimum: int = 0) -> int
     return max(minimum, normalized)
 
 
+def _clean_optional_positive_int(value: object) -> int | None:
+    try:
+        if isinstance(value, bool):
+            normalized = int(value)
+        elif isinstance(value, (int, float, str)):
+            normalized = int(value)
+        else:
+            return None
+    except (TypeError, ValueError):
+        return None
+    return normalized if normalized > 0 else None
+
+
 def _clean_contract_name(value: object) -> str:
     cleaned = _clean_string(value, default="structured_output")
     normalized = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in cleaned)
@@ -451,6 +464,7 @@ class StructuredTaskRunner:
         options = LLMCallOptions(
             response_format=_response_format_for_spec(spec, final_output=final_output),
             response_format_fallback=_response_format_fallback_for_spec(spec, final_output=final_output),
+            max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens) if final_output else None,
             metadata={"structured_task_id": spec.task_id, **spec.metadata},
         )
         kwargs: dict[str, Any] = {
@@ -469,6 +483,7 @@ class StructuredTaskRunner:
                 "response_format_type": _response_format_type(options.response_format),
                 "response_format_chars": _jsonish_char_count(options.response_format),
                 "response_format_fallback_type": _response_format_type(options.response_format_fallback),
+                "max_output_tokens": options.max_output_tokens,
                 **_message_content_stats(messages),
             },
         )
@@ -486,6 +501,7 @@ class StructuredTaskRunner:
         options = LLMCallOptions(
             response_format=_response_format_for_spec(spec, final_output=True),
             response_format_fallback=_response_format_fallback_for_spec(spec, final_output=True),
+            max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens),
             metadata={
                 "structured_task_id": spec.task_id,
                 "structured_task_finalization": True,
@@ -519,6 +535,7 @@ class StructuredTaskRunner:
                 "response_format_type": _response_format_type(options.response_format),
                 "response_format_chars": _jsonish_char_count(options.response_format),
                 "response_format_fallback_type": _response_format_type(options.response_format_fallback),
+                "max_output_tokens": options.max_output_tokens,
                 **_message_content_stats(final_messages),
             },
         )

@@ -29,6 +29,7 @@ class CoreSettings:
     max_active_context_tokens: int = 16000
     max_tool_calls_per_turn: int = 100
     llm_timeout_seconds: float = 120.0
+    llm_max_output_tokens: int | None = None
     log_synthesis_payloads: bool = False
 
     debug: bool = False

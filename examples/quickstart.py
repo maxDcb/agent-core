@@ -118,6 +118,7 @@ def build_settings(*, model: str, memory_model: str, session_file: Path) -> Core
         azure_anthropic_api_version=os.getenv("AZURE_ANTHROPIC_API_VERSION"),
         azure_anthropic_version=os.getenv("AZURE_ANTHROPIC_VERSION"),
         llm_timeout_seconds=float(os.getenv("AGENT_CORE_LLM_TIMEOUT_SECONDS", "120")),
+        llm_max_output_tokens=_optional_positive_int(os.getenv("AGENT_CORE_LLM_MAX_OUTPUT_TOKENS")),
         model=model,
         memory_model=memory_model,
         session_file=session_file,
@@ -320,6 +321,16 @@ def _run_structured_task_check(settings: CoreSettings, provider: BaseLLMProvider
         tool_registry=ToolRegistry(),
         policy_engine=PolicyEngine(),
     )
+
+
+def _optional_positive_int(value: str | None) -> int | None:
+    if value is None or value.strip() == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
     result = runner.run(
         spec=StructuredTaskSpec(
             task_id="compatibility_check",
