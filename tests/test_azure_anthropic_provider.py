@@ -3,6 +3,9 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+from anthropic import APIStatusError
+
 from agent_core.llm import azure_anthropic_provider as provider_module
 from agent_core.llm.azure_anthropic_provider import AzureAnthropicProvider
 from agent_core.llm.base import LLMCallOptions, LLMMessage, LLMToolDefinition
@@ -52,6 +55,24 @@ def _tool_response(*, tool_id: str, name: str, arguments: dict[str, Any]) -> Sim
                 input=arguments,
             )
         ]
+    )
+
+
+def _api_status_error(
+    status_code: int,
+    *,
+    body: dict[str, Any] | None = None,
+    retry_after: str | None = None,
+) -> APIStatusError:
+    headers = {"Retry-After": retry_after} if retry_after is not None else {}
+    return APIStatusError(
+        f"HTTP {status_code}",
+        response=httpx.Response(
+            status_code,
+            headers=headers,
+            request=httpx.Request("POST", "https://example.services.ai.azure.com/anthropic/v1/messages"),
+        ),
+        body=body or {"error": {"type": "server_error", "message": f"HTTP {status_code}"}},
     )
 
 
@@ -339,6 +360,63 @@ def test_azure_anthropic_provider_rejects_unenforceable_schema_without_fallback(
         raise AssertionError("expected Azure Anthropic to reject the unenforceable strict schema")
 
     assert scripted_messages.requests == []
+
+
+def test_azure_anthropic_provider_retries_overloaded_status(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_CORE_LLM_RETRY_MAX_ATTEMPTS", "2")
+    monkeypatch.setenv("AGENT_CORE_LLM_RETRY_INITIAL_DELAY_SECONDS", "0")
+    monkeypatch.setenv("AGENT_CORE_LLM_RETRY_JITTER_RATIO", "0")
+    scripted_messages = ScriptedMessages(
+        _api_status_error(
+            529,
+            body={
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"},
+                "request_id": "req_overloaded",
+            },
+        ),
+        _text_response("OK"),
+    )
+    provider = _provider_with_scripted_messages(scripted_messages)
+
+    result = provider.complete_text(
+        messages=[LLMMessage(role="user", content="Return exactly OK")],
+        model="claude-opus-4-6",
+        temperature=0.0,
+    )
+
+    assert result == "OK"
+    assert len(scripted_messages.requests) == 2
+
+
+def test_azure_anthropic_provider_reports_overloaded_after_retries(monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_CORE_LLM_RETRY_MAX_ATTEMPTS", "1")
+    scripted_messages = ScriptedMessages(
+        _api_status_error(
+            529,
+            body={
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Overloaded"},
+                "request_id": "req_overloaded",
+            },
+        )
+    )
+    provider = _provider_with_scripted_messages(scripted_messages)
+
+    try:
+        provider.complete_text(
+            messages=[LLMMessage(role="user", content="Return exactly OK")],
+            model="claude-opus-4-6",
+            temperature=0.0,
+        )
+    except LLMProviderError as exc:
+        assert exc.kind == "rate_limit_error"
+        assert "overloaded" in exc.user_message
+        assert "status_code=529" in exc.detail
+        assert "provider_error_type=overloaded_error" in exc.detail
+        assert "request_id=req_overloaded" in exc.detail
+    else:  # pragma: no cover
+        raise AssertionError("expected overloaded API status to be reported")
 
 
 def test_azure_anthropic_provider_appends_user_turn_after_trailing_assistant_message() -> None:

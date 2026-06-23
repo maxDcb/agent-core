@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 import json
+import os
+import random
 import time
 from typing import Any
 
@@ -24,6 +28,11 @@ logger = get_logger(__name__)
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_TIMEOUT_SECONDS = 60
+DEFAULT_RETRY_MAX_ATTEMPTS = 5
+DEFAULT_RETRY_INITIAL_DELAY_SECONDS = 10.0
+DEFAULT_RETRY_MAX_DELAY_SECONDS = 120.0
+DEFAULT_RETRY_BACKOFF_MULTIPLIER = 2.0
+DEFAULT_RETRY_JITTER_RATIO = 0.1
 JSON_OBJECT_SYSTEM_INSTRUCTION = (
     "When a JSON object is requested, return only the raw JSON object. "
     "Do not wrap it in Markdown code fences and do not include prose before or after it."
@@ -59,6 +68,42 @@ def _elapsed_since(started_at: float | None) -> float | None:
     if started_at is None:
         return None
     return round(time.monotonic() - started_at, 3)
+
+
+@dataclass(frozen=True, slots=True)
+class AzureAnthropicRetryPolicy:
+    max_attempts: int = DEFAULT_RETRY_MAX_ATTEMPTS
+    initial_delay_seconds: float = DEFAULT_RETRY_INITIAL_DELAY_SECONDS
+    max_delay_seconds: float = DEFAULT_RETRY_MAX_DELAY_SECONDS
+    backoff_multiplier: float = DEFAULT_RETRY_BACKOFF_MULTIPLIER
+    jitter_ratio: float = DEFAULT_RETRY_JITTER_RATIO
+
+    @classmethod
+    def from_env(cls, prefix: str = "AGENT_CORE_LLM_RETRY_") -> "AzureAnthropicRetryPolicy":
+        return cls(
+            max_attempts=_env_int(f"{prefix}MAX_ATTEMPTS", DEFAULT_RETRY_MAX_ATTEMPTS),
+            initial_delay_seconds=_env_float(
+                f"{prefix}INITIAL_DELAY_SECONDS",
+                DEFAULT_RETRY_INITIAL_DELAY_SECONDS,
+            ),
+            max_delay_seconds=_env_float(f"{prefix}MAX_DELAY_SECONDS", DEFAULT_RETRY_MAX_DELAY_SECONDS),
+            backoff_multiplier=_env_float(f"{prefix}BACKOFF_MULTIPLIER", DEFAULT_RETRY_BACKOFF_MULTIPLIER),
+            jitter_ratio=_env_float(f"{prefix}JITTER_RATIO", DEFAULT_RETRY_JITTER_RATIO),
+        )
+
+    def retry_delay_seconds(self, *, exc: BaseException, attempt_index: int, random_value: float) -> float:
+        retry_after = _retry_after_seconds(exc)
+        if retry_after is not None:
+            return min(self.max_delay_seconds, max(0.0, retry_after))
+
+        base_delay = self.initial_delay_seconds * (self.backoff_multiplier ** max(attempt_index - 1, 0))
+        capped_delay = min(self.max_delay_seconds, max(0.0, base_delay))
+        if self.jitter_ratio <= 0 or capped_delay <= 0:
+            return capped_delay
+
+        jitter_window = capped_delay * self.jitter_ratio
+        jitter = (random_value * 2.0 - 1.0) * jitter_window
+        return max(0.0, min(self.max_delay_seconds, capped_delay + jitter))
 
 
 class AzureAnthropicProvider:
@@ -195,7 +240,10 @@ class AzureAnthropicProvider:
         try:
             client = self._get_client()
             request_started_at = time.monotonic()
-            response = client.messages.create(**request)
+            response = self._create_message_with_retry(
+                messages_api=client.messages,
+                request=request,
+            )
             logger.info(
                 "Received Azure Anthropic messages response",
                 extra={
@@ -217,7 +265,7 @@ class AzureAnthropicProvider:
             ) from exc
         except (APIConnectionError, APITimeoutError) as exc:
             logger.exception(
-                "Azure Anthropic request failed due to connectivity or timeout",
+                "Azure Anthropic request failed due to connectivity or timeout after retries",
                 extra={"elapsed_seconds": _elapsed_since(request_started_at), "error_type": type(exc).__name__},
             )
             raise LLMProviderError(
@@ -226,8 +274,8 @@ class AzureAnthropicProvider:
                 detail=str(exc),
             ) from exc
         except RateLimitError as exc:
-            logger.exception(
-                "Azure Anthropic request was rate limited",
+            logger.warning(
+                "Azure Anthropic request was rate limited after retries",
                 extra={"elapsed_seconds": _elapsed_since(request_started_at), "error_type": type(exc).__name__},
             )
             raise LLMProviderError(
@@ -235,15 +283,58 @@ class AzureAnthropicProvider:
                 user_message="Azure Anthropic rate-limited the request. Wait briefly and try again.",
                 detail=str(exc),
             ) from exc
-        except (BadRequestError, APIStatusError) as exc:
+        except BadRequestError as exc:
             logger.exception(
                 "Azure Anthropic request was rejected by the API",
-                extra={"elapsed_seconds": _elapsed_since(request_started_at), "error_type": type(exc).__name__},
+                extra={
+                    "elapsed_seconds": _elapsed_since(request_started_at),
+                    "error_type": type(exc).__name__,
+                    "status_code": getattr(exc, "status_code", None),
+                    "provider_error_type": _provider_error_type(exc),
+                },
             )
             raise LLMProviderError(
                 kind="request_error",
                 user_message="Azure Anthropic rejected the request. Review the deployment name, API version, and payload.",
-                detail=str(exc),
+                detail=_provider_error_detail(exc),
+            ) from exc
+        except APIStatusError as exc:
+            status_code = getattr(exc, "status_code", None)
+            provider_error_type = _provider_error_type(exc)
+            if _is_retryable_transient_error(exc):
+                logger.warning(
+                    "Azure Anthropic transient API status persisted after retries",
+                    extra={
+                        "elapsed_seconds": _elapsed_since(request_started_at),
+                        "error_type": type(exc).__name__,
+                        "status_code": status_code,
+                        "provider_error_type": provider_error_type,
+                    },
+                )
+                if _is_overloaded_error(exc):
+                    raise LLMProviderError(
+                        kind="rate_limit_error",
+                        user_message="Azure Anthropic is temporarily overloaded. Wait briefly and retry.",
+                        detail=_provider_error_detail(exc),
+                    ) from exc
+                raise LLMProviderError(
+                    kind="request_error",
+                    user_message="Azure Anthropic returned a transient server error after retries. Wait briefly and retry.",
+                    detail=_provider_error_detail(exc),
+                ) from exc
+            logger.exception(
+                "Azure Anthropic request failed with API status",
+                extra={
+                    "elapsed_seconds": _elapsed_since(request_started_at),
+                    "error_type": type(exc).__name__,
+                    "status_code": status_code,
+                    "provider_error_type": provider_error_type,
+                },
+            )
+            raise LLMProviderError(
+                kind="request_error",
+                user_message="Azure Anthropic rejected the request. Review the deployment name, API version, and payload.",
+                detail=_provider_error_detail(exc),
             ) from exc
         except AnthropicError as exc:
             logger.exception(
@@ -279,6 +370,78 @@ class AzureAnthropicProvider:
                 user_message="The Azure Anthropic API key is not configured. Set AZURE_ANTHROPIC_API_KEY.",
                 detail="Missing AZURE_ANTHROPIC_API_KEY for AzureAnthropicProvider",
             )
+
+    def _create_message_with_retry(self, *, messages_api: Any, request: dict[str, Any]) -> Any:
+        policy = AzureAnthropicRetryPolicy.from_env()
+        attempt = 1
+
+        while True:
+            attempt_started_at = time.monotonic()
+            try:
+                return messages_api.create(**request)
+            except RateLimitError as exc:
+                attempt = self._retry_after_transient_error(
+                    exc=exc,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.monotonic() - attempt_started_at, 3),
+                    policy=policy,
+                    request=request,
+                    log_message="Azure Anthropic rate-limited messages request; retrying",
+                )
+            except (APIConnectionError, APITimeoutError) as exc:
+                attempt = self._retry_after_transient_error(
+                    exc=exc,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.monotonic() - attempt_started_at, 3),
+                    policy=policy,
+                    request=request,
+                    log_message="Azure Anthropic connectivity or timeout error; retrying",
+                )
+            except APIStatusError as exc:
+                if not _is_retryable_transient_error(exc):
+                    raise
+                attempt = self._retry_after_transient_error(
+                    exc=exc,
+                    attempt=attempt,
+                    elapsed_seconds=round(time.monotonic() - attempt_started_at, 3),
+                    policy=policy,
+                    request=request,
+                    log_message="Azure Anthropic transient messages status error; retrying",
+                )
+
+    def _retry_after_transient_error(
+        self,
+        *,
+        exc: BaseException,
+        attempt: int,
+        elapsed_seconds: float,
+        policy: AzureAnthropicRetryPolicy,
+        request: dict[str, Any],
+        log_message: str,
+    ) -> int:
+        if attempt >= policy.max_attempts:
+            raise exc
+
+        delay_seconds = policy.retry_delay_seconds(
+            exc=exc,
+            attempt_index=attempt,
+            random_value=random.random(),
+        )
+        logger.warning(
+            log_message,
+            extra={
+                "model": request.get("model"),
+                "attempt": attempt,
+                "max_attempts": policy.max_attempts,
+                "elapsed_seconds": elapsed_seconds,
+                "delay_seconds": round(delay_seconds, 3),
+                "error_type": type(exc).__name__,
+                "status_code": getattr(exc, "status_code", None),
+                "provider_error_type": _provider_error_type(exc),
+            },
+        )
+        time.sleep(delay_seconds)
+        return attempt + 1
 
     def _get_client(self) -> AnthropicFoundry:
         if self.client is None:
@@ -485,3 +648,97 @@ class AzureAnthropicProvider:
                     stack.append(child)
                     paths.append(f"{path}[{index}]")
         return reasons
+
+
+def _is_retryable_transient_error(exc: BaseException) -> bool:
+    if isinstance(exc, (APIConnectionError, APITimeoutError)):
+        return True
+    if isinstance(exc, APIStatusError):
+        status_code = getattr(exc, "status_code", None)
+        return status_code in {408, 409, 425, 429, 529} or (isinstance(status_code, int) and status_code >= 500)
+    return False
+
+
+def _is_overloaded_error(exc: BaseException) -> bool:
+    if getattr(exc, "status_code", None) == 529:
+        return True
+    return _provider_error_type(exc) == "overloaded_error"
+
+
+def _provider_error_type(exc: BaseException) -> str | None:
+    body = getattr(exc, "body", None)
+    if isinstance(body, dict):
+        error = body.get("error")
+        if isinstance(error, dict):
+            value = error.get("type") or error.get("code")
+            return str(value) if value is not None else None
+        value = body.get("type") or body.get("code")
+        return str(value) if value is not None else None
+    return None
+
+
+def _provider_error_detail(exc: BaseException) -> str:
+    body = getattr(exc, "body", None)
+    status_code = getattr(exc, "status_code", None)
+    parts: list[str] = []
+    if status_code is not None:
+        parts.append(f"status_code={status_code}")
+    provider_error_type = _provider_error_type(exc)
+    if provider_error_type:
+        parts.append(f"provider_error_type={provider_error_type}")
+    if isinstance(body, dict):
+        request_id = body.get("request_id")
+        if request_id:
+            parts.append(f"request_id={request_id}")
+        error = body.get("error")
+        if isinstance(error, dict):
+            message = error.get("message")
+            if message:
+                parts.append(f"message={message}")
+    detail = "; ".join(parts)
+    raw = str(exc)
+    if detail and raw:
+        return f"{detail}; raw={raw}"
+    return detail or raw
+
+
+def _retry_after_seconds(exc: BaseException) -> float | None:
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", None)
+    if not headers:
+        return None
+
+    retry_after = headers.get("retry-after") or headers.get("Retry-After")
+    if not retry_after:
+        return None
+
+    try:
+        return max(0.0, float(retry_after))
+    except ValueError:
+        pass
+
+    try:
+        parsed = parsedate_to_datetime(retry_after)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, parsed.timestamp() - time.time())
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return max(1, int(value))
+    except ValueError:
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        return default
