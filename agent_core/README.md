@@ -46,6 +46,7 @@ from agent_core import (
 
 Built-in provider adapters are available under `agent_core.llm`.
 The runtime depends on:
+- `anthropic`
 - `openai`
 - `requests`
 

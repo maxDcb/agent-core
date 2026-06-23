@@ -22,9 +22,9 @@ from agent_core import (
     ToolResult,
     build_tool_definition,
 )
-from agent_core.llm.base import LLMCallOptions, LLMMessage, LLMToolDefinition
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
-from agent_core.llm.openai_provider import OpenAIProvider
+from agent_core.llm.provider_factory import build_provider, normalize_provider_name
 
 
 DEFAULT_PROMPT = "What time is it? Use get_current_time, then answer in one sentence."
@@ -106,15 +106,18 @@ def load_dotenv(path: Path) -> None:
             os.environ[key] = parsed_value
 
 
-def build_settings(
-    *,
-    api_key: str | None,
-    model: str,
-    memory_model: str,
-    session_file: Path,
-) -> CoreSettings:
+def build_settings(*, model: str, memory_model: str, session_file: Path) -> CoreSettings:
     return CoreSettings(
-        openai_api_key=api_key,
+        llm_provider=os.getenv("LLM_PROVIDER", "openai"),
+        openai_api_key=os.getenv("OPENAI_API_KEY"),
+        azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        azure_openai_api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+        azure_anthropic_endpoint=os.getenv("AZURE_ANTHROPIC_ENDPOINT"),
+        azure_anthropic_api_key=os.getenv("AZURE_ANTHROPIC_API_KEY"),
+        azure_anthropic_api_version=os.getenv("AZURE_ANTHROPIC_API_VERSION"),
+        azure_anthropic_version=os.getenv("AZURE_ANTHROPIC_VERSION"),
+        llm_timeout_seconds=float(os.getenv("AGENT_CORE_LLM_TIMEOUT_SECONDS", "120")),
         model=model,
         memory_model=memory_model,
         session_file=session_file,
@@ -137,7 +140,7 @@ def build_registry() -> ToolRegistry:
 def build_orchestrator(settings: CoreSettings) -> AgentOrchestrator:
     return AgentOrchestrator(
         settings=settings,
-        provider=OpenAIProvider(api_key=settings.openai_api_key),
+        provider=build_provider(settings),
         registry=build_registry(),
         session_manager=SessionManager(SessionRepository(settings.session_file)),
         policy_engine=PolicyEngine(),
@@ -187,7 +190,7 @@ def _json_object_matches(content: str, expected: dict[str, Any]) -> tuple[bool, 
     return True, f"keys={sorted(payload.keys())}"
 
 
-def _run_plain_chat_check(provider: OpenAIProvider, *, model: str) -> bool:
+def _run_plain_chat_check(provider: BaseLLMProvider, *, model: str) -> bool:
     try:
         content = provider.complete_text(
             messages=[
@@ -213,7 +216,7 @@ def _run_plain_chat_check(provider: OpenAIProvider, *, model: str) -> bool:
     return _print_check("plain chat", False, f"content={content!r}")
 
 
-def _run_tool_call_check(provider: OpenAIProvider, *, model: str) -> bool:
+def _run_tool_call_check(provider: BaseLLMProvider, *, model: str) -> bool:
     try:
         result = provider.complete_with_tools(
             messages=[
@@ -251,7 +254,7 @@ def _run_tool_call_check(provider: OpenAIProvider, *, model: str) -> bool:
     return _print_check("tool calls", ok, f"name={call.name!r}, arguments={call.arguments_json!r}")
 
 
-def _run_json_object_check(provider: OpenAIProvider, *, model: str) -> bool:
+def _run_json_object_check(provider: BaseLLMProvider, *, model: str) -> bool:
     try:
         content = provider.complete_text(
             messages=[
@@ -271,7 +274,7 @@ def _run_json_object_check(provider: OpenAIProvider, *, model: str) -> bool:
     return _print_check("response_format json_object", ok, detail)
 
 
-def _run_json_schema_check(provider: OpenAIProvider, *, model: str) -> bool:
+def _run_json_schema_check(provider: BaseLLMProvider, *, model: str) -> bool:
     schema = {
         "type": "object",
         "properties": {
@@ -310,7 +313,7 @@ def _run_json_schema_check(provider: OpenAIProvider, *, model: str) -> bool:
     return _print_check("response_format json_schema", ok, detail)
 
 
-def _run_structured_task_check(settings: CoreSettings, provider: OpenAIProvider) -> bool:
+def _run_structured_task_check(settings: CoreSettings, provider: BaseLLMProvider) -> bool:
     runner = StructuredTaskRunner(
         settings=settings,
         provider=provider,
@@ -346,8 +349,8 @@ def _run_structured_task_check(settings: CoreSettings, provider: OpenAIProvider)
 
 
 def run_compatibility_checks(settings: CoreSettings) -> int:
-    provider = OpenAIProvider(api_key=settings.openai_api_key)
-    print(f"Running provider compatibility checks with model={settings.model!r}")
+    provider = build_provider(settings)
+    print(f"Running provider compatibility checks with provider={settings.llm_provider!r}, model={settings.model!r}")
     print("Checks cover plain chat, OpenAI-style tool calls, response_format, and StructuredTaskRunner.")
 
     checks = [
@@ -363,13 +366,34 @@ def run_compatibility_checks(settings: CoreSettings) -> int:
     return 0 if all(checks) else 1
 
 
+def missing_provider_config(settings: CoreSettings) -> list[str]:
+    provider_name = normalize_provider_name(settings.llm_provider)
+    if provider_name == "openai":
+        return [] if settings.openai_api_key else ["OPENAI_API_KEY"]
+    if provider_name == "azure_openai":
+        missing = []
+        if not settings.azure_openai_endpoint:
+            missing.append("AZURE_OPENAI_ENDPOINT")
+        if not settings.azure_openai_api_key:
+            missing.append("AZURE_OPENAI_API_KEY")
+        return missing
+    if provider_name == "azure_anthropic":
+        missing = []
+        if not settings.azure_anthropic_endpoint:
+            missing.append("AZURE_ANTHROPIC_ENDPOINT")
+        if not settings.azure_anthropic_api_key:
+            missing.append("AZURE_ANTHROPIC_API_KEY")
+        return missing
+    return [f"unsupported LLM_PROVIDER={settings.llm_provider!r}"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run a minimal agent-core assistant.")
     parser.add_argument("prompt", nargs="?", default=DEFAULT_PROMPT, help="Prompt to send for a one-shot run.")
     parser.add_argument(
         "--compat-check",
         action="store_true",
-        help="Run provider compatibility checks for local/OpenAI-compatible endpoints.",
+        help="Run compatibility checks for the configured LLM provider.",
     )
     parser.add_argument("--interactive", action="store_true", help="Start a small REPL instead of one one-shot prompt.")
     parser.add_argument("--session-id", default="quickstart", help="Session id used for persisted memory.")
@@ -387,17 +411,19 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     load_dotenv(args.env_file)
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        print("Missing OPENAI_API_KEY. Set it in the environment or create a .env file from .env.example.")
-        return 2
 
     settings = build_settings(
-        api_key=api_key,
         model=args.model or os.getenv("AGENT_CORE_MODEL", "gpt-4.1-mini"),
         memory_model=args.memory_model or os.getenv("AGENT_CORE_MEMORY_MODEL", "gpt-4.1-mini"),
         session_file=args.session_file,
     )
+    missing_config = missing_provider_config(settings)
+    if missing_config:
+        print(
+            f"Missing provider configuration for LLM_PROVIDER={settings.llm_provider!r}: "
+            f"{', '.join(missing_config)}"
+        )
+        return 2
 
     if args.compat_check:
         return run_compatibility_checks(settings)

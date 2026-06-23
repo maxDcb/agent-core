@@ -49,6 +49,30 @@ def test_quickstart_loads_dotenv_without_overwriting_existing_values(tmp_path, m
     assert quickstart.os.environ["AGENT_CORE_MEMORY_MODEL"] == "demo-memory-model"
 
 
+def test_quickstart_build_settings_reads_azure_anthropic_env(tmp_path, monkeypatch) -> None:
+    quickstart = load_example("quickstart")
+    monkeypatch.setenv("LLM_PROVIDER", "azure_anthropic")
+    monkeypatch.setenv("AZURE_ANTHROPIC_ENDPOINT", "https://example.services.ai.azure.com/anthropic")
+    monkeypatch.setenv("AZURE_ANTHROPIC_API_KEY", "test-key")
+    monkeypatch.delenv("AZURE_ANTHROPIC_API_VERSION", raising=False)
+    monkeypatch.setenv("AZURE_ANTHROPIC_VERSION", "2023-06-01")
+    monkeypatch.setenv("AGENT_CORE_LLM_TIMEOUT_SECONDS", "321")
+
+    settings = quickstart.build_settings(
+        model="claude-opus-4-6",
+        memory_model="claude-opus-4-6",
+        session_file=tmp_path / "session.json",
+    )
+
+    assert settings.llm_provider == "azure_anthropic"
+    assert settings.azure_anthropic_endpoint == "https://example.services.ai.azure.com/anthropic"
+    assert settings.azure_anthropic_api_key == "test-key"
+    assert settings.azure_anthropic_api_version is None
+    assert settings.azure_anthropic_version == "2023-06-01"
+    assert settings.llm_timeout_seconds == 321
+    assert quickstart.missing_provider_config(settings) == []
+
+
 def test_pending_tool_resume_example_runs(tmp_path) -> None:
     pending_demo = load_example("pending_tool_resume")
 

@@ -32,6 +32,7 @@ def build_provider(settings: CoreSettings):
             endpoint=settings.azure_anthropic_endpoint,
             api_key=settings.azure_anthropic_api_key,
             api_version=settings.azure_anthropic_api_version,
+            anthropic_version=settings.azure_anthropic_version,
             timeout_seconds=settings.llm_timeout_seconds,
         )
 

@@ -28,14 +28,28 @@ Or start a small REPL:
 .venv/bin/python examples/quickstart.py --interactive
 ```
 
-You can also run a provider compatibility check against OpenAI-compatible local
-endpoints. This exercises plain chat, tool calls, `response_format` JSON object,
-`response_format` JSON schema with fallback, and `StructuredTaskRunner` final
-output:
+You can also run a provider compatibility check against the provider selected
+by `LLM_PROVIDER`. This exercises plain chat, tool calls, `response_format` JSON
+object, `response_format` JSON schema with fallback, and `StructuredTaskRunner`
+final output:
 
 ```bash
 .venv/bin/python examples/quickstart.py --compat-check
 ```
+
+For Azure Anthropic / Claude on Azure Foundry, use the `/anthropic` endpoint:
+
+```bash
+LLM_PROVIDER=azure_anthropic
+AZURE_ANTHROPIC_ENDPOINT=https://<resource>.services.ai.azure.com/anthropic
+AZURE_ANTHROPIC_API_KEY=...
+AZURE_ANTHROPIC_VERSION=2023-06-01
+AGENT_CORE_MODEL=claude-opus-4-6
+AGENT_CORE_MEMORY_MODEL=claude-opus-4-6
+```
+
+The Azure model version shown in the portal, for example `1`, is the model
+deployment version and is not the runtime `api-version` query parameter.
 
 The example persists session memory under `.agent-core-demo/`.
 

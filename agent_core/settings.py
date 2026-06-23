@@ -19,6 +19,7 @@ class CoreSettings:
     azure_anthropic_endpoint: str | None = None
     azure_anthropic_api_key: str | None = None
     azure_anthropic_api_version: str | None = None
+    azure_anthropic_version: str | None = None
 
     model: str = "gpt-4.1-mini"
     memory_model: str = "gpt-4.1-mini"
