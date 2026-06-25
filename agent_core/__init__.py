@@ -22,7 +22,7 @@ from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import BaseTool, build_tool_definition
 from agent_core.types import AgentTurnResult, ToolResult
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AgentOrchestrator",

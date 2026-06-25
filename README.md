@@ -7,7 +7,7 @@ their own prompts, tools, policy rules, storage and domain memory. It is meant
 to be the generic runtime under an agent application, not a domain-specific
 agent package.
 
-Version `0.2.0` is an alpha release. The runtime is usable and tested, but the
+Version `0.3.0` is an alpha release. The runtime is usable and tested, but the
 public API may still evolve before `1.0.0`.
 
 ## What It Provides
@@ -22,6 +22,7 @@ public API may still evolve before `1.0.0`.
 - Policy guardrail entry points for tool execution
 - Domain hooks for application-specific prompt and memory extensions
 - Provider adapters for OpenAI, Azure OpenAI and Azure Anthropic backends
+- Provider-enforced JSON Schema contracts for structured task final outputs
 - OpenAI/Azure request normalization and adaptive retry handling
 - Typed Python package marker (`py.typed`)
 
@@ -45,7 +46,7 @@ specializing it for one workflow.
 From a tagged Git repository:
 
 ```bash
-python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.2.0"
+python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.3.0"
 ```
 
 For local development:
