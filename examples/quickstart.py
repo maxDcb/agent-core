@@ -321,16 +321,6 @@ def _run_structured_task_check(settings: CoreSettings, provider: BaseLLMProvider
         tool_registry=ToolRegistry(),
         policy_engine=PolicyEngine(),
     )
-
-
-def _optional_positive_int(value: str | None) -> int | None:
-    if value is None or value.strip() == "":
-        return None
-    try:
-        parsed = int(value)
-    except ValueError:
-        return None
-    return parsed if parsed > 0 else None
     result = runner.run(
         spec=StructuredTaskSpec(
             task_id="compatibility_check",
@@ -357,6 +347,16 @@ def _optional_positive_int(value: str | None) -> int | None:
     output_matches = result.ok and output.get("ok") is True and output.get("component") == "structured_task"
     detail = result.failure_reason or f"output={result.output}"
     return _print_check("StructuredTaskRunner final output", output_matches, detail)
+
+
+def _optional_positive_int(value: str | None) -> int | None:
+    if value is None or value.strip() == "":
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        return None
+    return parsed if parsed > 0 else None
 
 
 def run_compatibility_checks(settings: CoreSettings) -> int:

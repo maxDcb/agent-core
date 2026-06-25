@@ -3,6 +3,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+from agent_core.llm.base import LLMCompletionResult
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -73,6 +75,22 @@ def test_quickstart_build_settings_reads_azure_anthropic_env(tmp_path, monkeypat
     assert settings.llm_timeout_seconds == 321
     assert settings.llm_max_output_tokens == 12345
     assert quickstart.missing_provider_config(settings) == []
+
+
+def test_quickstart_structured_task_compat_check_returns_bool(tmp_path) -> None:
+    quickstart = load_example("quickstart")
+
+    class FakeProvider:
+        def complete_with_tools(self, **kwargs):
+            return LLMCompletionResult(content='{"ok": true, "component": "structured_task"}')
+
+    settings = quickstart.build_settings(
+        model="fake-model",
+        memory_model="fake-memory-model",
+        session_file=tmp_path / "session.json",
+    )
+
+    assert quickstart._run_structured_task_check(settings, FakeProvider()) is True
 
 
 def test_pending_tool_resume_example_runs(tmp_path) -> None:
