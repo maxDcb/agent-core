@@ -268,7 +268,6 @@ def test_azure_anthropic_provider_maps_json_schema_response_format_to_output_con
                     "strict": True,
                 },
             },
-            response_format_fallback={"type": "json_object"},
             max_output_tokens=1024,
         ),
     )
@@ -280,7 +279,7 @@ def test_azure_anthropic_provider_maps_json_schema_response_format_to_output_con
     assert "response_format" not in request
 
 
-def test_azure_anthropic_provider_falls_back_for_open_object_json_schema() -> None:
+def test_azure_anthropic_provider_rejects_open_object_json_schema_even_with_fallback() -> None:
     schema = {
         "type": "object",
         "properties": {
@@ -296,27 +295,31 @@ def test_azure_anthropic_provider_falls_back_for_open_object_json_schema() -> No
     scripted_messages = ScriptedMessages(_text_response('{"ok": true, "metadata": {"dynamic": "value"}}'))
     provider = _provider_with_scripted_messages(scripted_messages)
 
-    result = provider.complete_text(
-        messages=[LLMMessage(role="user", content="Return the final object.")],
-        model="claude-opus-4-6",
-        temperature=0.0,
-        options=LLMCallOptions(
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "open_object_check",
-                    "schema": schema,
-                    "strict": True,
+    try:
+        provider.complete_text(
+            messages=[LLMMessage(role="user", content="Return the final object.")],
+            model="claude-opus-4-6",
+            temperature=0.0,
+            options=LLMCallOptions(
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "open_object_check",
+                        "schema": schema,
+                        "strict": True,
+                    },
                 },
-            },
-            response_format_fallback={"type": "json_object"},
-        ),
-    )
+                response_format_fallback={"type": "json_object"},
+            ),
+        )
+    except LLMProviderError as exc:
+        assert exc.kind == "configuration_error"
+        assert "cannot enforce" in exc.user_message
+        assert "additionalProperties=false" in exc.detail
+    else:  # pragma: no cover
+        raise AssertionError("expected Azure Anthropic to reject the unenforceable schema")
 
-    request = scripted_messages.requests[0]
-    assert result == '{"ok": true, "metadata": {"dynamic": "value"}}'
-    assert "output_config" not in request
-    assert "raw JSON object" in request["system"]
+    assert scripted_messages.requests == []
 
 
 def test_azure_anthropic_provider_rejects_unenforceable_schema_without_fallback() -> None:

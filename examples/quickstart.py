@@ -303,8 +303,7 @@ def _run_json_schema_check(provider: BaseLLMProvider, *, model: str) -> bool:
                         "schema": schema,
                         "strict": True,
                     },
-                },
-                response_format_fallback={"type": "json_object"},
+                }
             ),
         )
     except LLMProviderError as exc:

@@ -95,6 +95,17 @@ def create_chat_completion_with_adaptive_retry(
                 raise
 
             if retry_action.parameter == "response_format":
+                if _response_format_type(fallback_request.get("response_format")) == "json_schema":
+                    logger.warning(
+                        "%s rejected json_schema response_format; not downgrading structured output contract",
+                        provider_name,
+                        extra={
+                            "model": fallback_request.get("model"),
+                            "elapsed_seconds": round(time.monotonic() - attempt_started_at, 3),
+                        },
+                    )
+                    raise
+                fallback_description = "fallback response_format" if response_format_fallback is not None else "no response_format"
                 if response_format_fallback is not None:
                     fallback_request["response_format"] = response_format_fallback
                 else:
@@ -106,8 +117,9 @@ def create_chat_completion_with_adaptive_retry(
                         )
                 retried_without.add(retry_action.parameter)
                 logger.warning(
-                    "%s rejected response_format; retrying with fallback format",
+                    "%s rejected response_format; retrying with %s",
                     provider_name,
+                    fallback_description,
                     extra={
                         "model": fallback_request.get("model"),
                         "elapsed_seconds": round(time.monotonic() - attempt_started_at, 3),
@@ -234,6 +246,13 @@ def _retry_after_seconds(exc: BaseException) -> float | None:
     except (TypeError, ValueError):
         return None
     return max(0.0, parsed.timestamp() - time.time())
+
+
+def _response_format_type(response_format: Any) -> str | None:
+    if isinstance(response_format, dict):
+        value = response_format.get("type")
+        return str(value) if value is not None else None
+    return None
 
 
 def _env_int(name: str, default: int) -> int:

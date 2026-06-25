@@ -339,7 +339,7 @@ def test_openai_compat_preserves_bad_request_fallback_across_rate_limit_retry() 
     assert sleeps == [1.0]
 
 
-def test_openai_compat_retries_json_schema_with_response_format_fallback() -> None:
+def test_openai_compat_does_not_downgrade_rejected_json_schema_response_format() -> None:
     completions = ScriptedCompletions(
         _unsupported_response_format_error(),
         _text_response('{"ok": true}'),
@@ -353,18 +353,21 @@ def test_openai_compat_retries_json_schema_with_response_format_fallback() -> No
             "strict": False,
         },
     }
-    fallback_format = {"type": "json_object"}
 
-    response = create_chat_completion_with_adaptive_retry(
-        completions=completions,
-        request={"model": "deployment-name", "messages": [], "response_format": schema_format},
-        provider_name="Azure OpenAI",
-        logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
-        capability_resolver=resolver,
-        response_format_fallback=fallback_format,
-    )
+    try:
+        create_chat_completion_with_adaptive_retry(
+            completions=completions,
+            request={"model": "deployment-name", "messages": [], "response_format": schema_format},
+            provider_name="Azure OpenAI",
+            logger=SimpleNamespace(warning=lambda *args, **kwargs: None),
+            capability_resolver=resolver,
+            response_format_fallback={"type": "json_object"},
+        )
+    except BadRequestError:
+        pass
+    else:
+        raise AssertionError("Expected json_schema response_format rejection to be surfaced")
 
-    assert response.choices[0].message.content == '{"ok": true}'
+    assert len(completions.requests) == 1
     assert completions.requests[0]["response_format"] == schema_format
-    assert completions.requests[1]["response_format"] == fallback_format
     assert "response_format" not in resolver.unsupported_parameters_for("deployment-name")

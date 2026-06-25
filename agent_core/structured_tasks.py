@@ -190,13 +190,13 @@ class StructuredOutputContract:
 
     `StructuredTaskSpec.output_schema` remains a prompt hint. This contract is
     opt-in and can be sent to providers that support JSON Schema constrained
-    output, while keeping the legacy JSON-object path as fallback.
+    output. Schema contracts are hard requirements: if a provider cannot enforce
+    the schema, the task should fail instead of silently downgrading to JSON mode.
     """
 
     name: str
     schema: dict[str, Any]
     strict: bool = False
-    fallback_to_json_object: bool = True
     instructions: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -277,10 +277,7 @@ def _response_format_for_spec(spec: StructuredTaskSpec, *, final_output: bool = 
 
 
 def _response_format_fallback_for_spec(spec: StructuredTaskSpec, *, final_output: bool = True) -> dict[str, Any] | None:
-    contract = spec.output_contract
-    if contract is None or not final_output or not contract.fallback_to_json_object:
-        return None
-    return {"type": "json_object"}
+    return None
 
 
 @dataclass(slots=True)

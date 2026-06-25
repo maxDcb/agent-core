@@ -569,27 +569,18 @@ class AzureAnthropicProvider:
             return None
 
         response_format, rejection_reasons = self._response_format_candidate(options.response_format)
+        if self._is_json_schema_format(options.response_format) and rejection_reasons:
+            self._raise_unenforceable_json_schema(rejection_reasons)
+
         if response_format is None and options.response_format_fallback is not None:
             response_format, fallback_rejection_reasons = self._response_format_candidate(options.response_format_fallback)
+            if self._is_json_schema_format(options.response_format_fallback) and fallback_rejection_reasons:
+                self._raise_unenforceable_json_schema(fallback_rejection_reasons)
             rejection_reasons.extend(fallback_rejection_reasons)
+
         if response_format is None:
             if rejection_reasons and options.response_format_fallback is None:
-                detail = "; ".join(rejection_reasons[:20])
-                if len(rejection_reasons) > 20:
-                    detail = f"{detail}; ... {len(rejection_reasons) - 20} more"
-                raise LLMProviderError(
-                    kind="configuration_error",
-                    user_message=(
-                        "Azure Anthropic cannot enforce the requested structured output schema. "
-                        "Close the schema or enable an explicit JSON-object fallback."
-                    ),
-                    detail=detail,
-                )
-            if rejection_reasons:
-                logger.warning(
-                    "Azure Anthropic structured output schema is not enforceable; using fallback response format",
-                    extra={"schema_rejection_count": len(rejection_reasons), "schema_rejection_preview": rejection_reasons[:5]},
-                )
+                self._raise_unenforceable_json_schema(rejection_reasons)
             return None
 
         return {"format": response_format}
@@ -626,6 +617,19 @@ class AzureAnthropicProvider:
 
     def _is_json_object_format(self, response_format: dict[str, Any] | None) -> bool:
         return isinstance(response_format, dict) and response_format.get("type") == "json_object"
+
+    def _is_json_schema_format(self, response_format: dict[str, Any] | None) -> bool:
+        return isinstance(response_format, dict) and response_format.get("type") == "json_schema"
+
+    def _raise_unenforceable_json_schema(self, rejection_reasons: list[str]) -> None:
+        detail = "; ".join(rejection_reasons[:20])
+        if len(rejection_reasons) > 20:
+            detail = f"{detail}; ... {len(rejection_reasons) - 20} more"
+        raise LLMProviderError(
+            kind="configuration_error",
+            user_message="Azure Anthropic cannot enforce the requested structured output schema.",
+            detail=detail,
+        )
 
     def _anthropic_output_schema_rejection_reasons(self, schema: dict[str, Any]) -> list[str]:
         reasons: list[str] = []

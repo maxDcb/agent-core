@@ -234,7 +234,7 @@ def test_structured_task_runner_uses_structured_output_contract_when_requested()
                 "strict": True,
             },
         }
-        assert provider.last_options.response_format_fallback == {"type": "json_object"}
+        assert provider.last_options.response_format_fallback is None
         task_prompt = provider.last_messages[1].content
         assert "Provider-enforced structured output contract" in task_prompt
         assert "Analysis_Contract" in task_prompt
@@ -315,7 +315,7 @@ def test_structured_task_runner_enforces_contract_only_on_final_no_tool_output()
                 "strict": True,
             },
         }
-        assert provider.options_history[2].response_format_fallback == {"type": "json_object"}
+        assert provider.options_history[2].response_format_fallback is None
         assert provider.tools_history[0][0].name == "echo_tool"
         assert provider.tools_history[1][0].name == "echo_tool"
         assert provider.tools_history[2] == []
