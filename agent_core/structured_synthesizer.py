@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from inspect import Parameter, signature
 from typing import Any, Callable, Generic, TypeVar
 
-from agent_core.logging_utils import get_logger
+from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage
 from agent_core.settings import CoreSettings
 
@@ -79,11 +79,7 @@ class StructuredSynthesizer:
                 raw_content,
             )
 
-        try:
-            candidate = json.loads(raw_content)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"{request.target_name} synthesis returned invalid JSON") from exc
-
+        candidate = _load_json_object(raw_content, target_name=request.target_name)
         if not isinstance(candidate, dict):
             raise ValueError(f"{request.target_name} synthesis returned a non-object payload")
 
@@ -125,3 +121,60 @@ class StructuredSynthesizer:
                 json.dumps(output_format, ensure_ascii=False, indent=2),
             ]
         )
+
+
+def _load_json_object(raw_content: str, *, target_name: str) -> object:
+    try:
+        return json.loads(raw_content)
+    except json.JSONDecodeError as exc:
+        original_exc = exc
+
+    for candidate in _json_recovery_candidates(raw_content):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            stripped = candidate.lstrip()
+            if not stripped.startswith("{"):
+                continue
+            try:
+                payload, end_index = json.JSONDecoder().raw_decode(stripped)
+            except json.JSONDecodeError:
+                continue
+            trailing = stripped[end_index:].strip()
+            if trailing:
+                logger.warning(
+                    "Structured synthesis response for %s had trailing content after JSON; using first object",
+                    target_name,
+                    extra={"trailing_preview": safe_preview(trailing, limit=300)},
+                )
+            return payload
+
+    raise ValueError(f"{target_name} synthesis returned invalid JSON") from original_exc
+
+
+def _json_recovery_candidates(raw_content: str) -> list[str]:
+    stripped = raw_content.strip()
+    candidates: list[str] = []
+    if stripped:
+        candidates.append(stripped)
+
+    fenced = _extract_markdown_json_fence(stripped)
+    if fenced is not None:
+        candidates.append(fenced)
+
+    first_brace = stripped.find("{")
+    if first_brace > 0:
+        candidates.append(stripped[first_brace:])
+    return candidates
+
+
+def _extract_markdown_json_fence(value: str) -> str | None:
+    if not value.startswith("```"):
+        return None
+    first_newline = value.find("\n")
+    if first_newline < 0:
+        return None
+    closing_fence = value.rfind("```")
+    if closing_fence <= first_newline:
+        return None
+    return value[first_newline + 1 : closing_fence].strip()

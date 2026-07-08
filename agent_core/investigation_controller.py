@@ -12,7 +12,7 @@ from agent_core.investigation_prompts import (
 from agent_core.investigation_state import InvestigationState
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage
 from agent_core.llm.errors import LLMProviderError
-from agent_core.logging_utils import get_logger
+from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.run_options import RunOptions
 from agent_core.settings import CoreSettings
 from agent_core.structured_synthesizer import StructuredSynthesisRequest, StructuredSynthesizer
@@ -100,6 +100,10 @@ def with_investigation_guidance(
     return [*messages, guidance]
 
 
+def _soft_structured_synthesis(options: RunOptions) -> bool:
+    return bool(options.metadata.get("soft_structured_synthesis"))
+
+
 class InvestigationController:
     """Bounded, domain-agnostic investigation loop.
 
@@ -184,11 +188,28 @@ class InvestigationController:
                     stop_reason="provider_failure",
                     state=state,
                 )
-            self._record_event(
-                event_type="initial_plan_created",
-                summary="Initial investigation plan created",
-                payload={"investigation_state": state.compact_summary()},
-            )
+            except ValueError as exc:
+                if not _soft_structured_synthesis(options):
+                    raise
+                logger.warning(
+                    "Initial investigation plan synthesis failed; continuing with template state",
+                    extra={"error_preview": safe_preview(str(exc), limit=200)},
+                )
+                state.metadata["initial_plan_synthesis_error"] = safe_preview(str(exc), limit=200)
+                self._record_event(
+                    event_type="structured_synthesis_recovered",
+                    summary="Initial plan synthesis failed; continuing with template investigation state",
+                    payload={
+                        "target": "investigation_initial_plan",
+                        "error_preview": state.metadata["initial_plan_synthesis_error"],
+                    },
+                )
+            else:
+                self._record_event(
+                    event_type="initial_plan_created",
+                    summary="Initial investigation plan created",
+                    payload={"investigation_state": state.compact_summary()},
+                )
 
         return self._run_loop(
             user_input=user_input,
@@ -442,7 +463,25 @@ class InvestigationController:
         no_progress_iterations: int,
     ) -> tuple[AgentTurnResult | None, int]:
         previous_fingerprint = state.progress_fingerprint()
-        reflection = self._synthesize_reflection(state=state, tool_step=tool_step, options=options)
+        try:
+            reflection = self._synthesize_reflection(state=state, tool_step=tool_step, options=options)
+        except ValueError as exc:
+            if not _soft_structured_synthesis(options):
+                raise
+            logger.warning(
+                "Investigation reflection synthesis failed; continuing without state update",
+                extra={"error_preview": safe_preview(str(exc), limit=200)},
+            )
+            self._record_event(
+                event_type="structured_synthesis_recovered",
+                summary="Reflection synthesis failed; continuing the conversation without state update",
+                iteration=iterations_used,
+                payload={
+                    "target": "investigation_step_reflection",
+                    "error_preview": safe_preview(str(exc), limit=200),
+                },
+            )
+            return None, no_progress_iterations + 1
         state.apply_reflection(reflection)
         if state.progress_fingerprint() == previous_fingerprint:
             no_progress_iterations += 1
@@ -459,13 +498,45 @@ class InvestigationController:
             },
         )
 
-        decision = self._synthesize_decision(
-            state=state,
-            reflection=reflection,
-            options=options,
-            iterations_used=iterations_used,
-            tool_calls_used=tool_step.tool_calls_used,
-        )
+        try:
+            decision = self._synthesize_decision(
+                state=state,
+                reflection=reflection,
+                options=options,
+                iterations_used=iterations_used,
+                tool_calls_used=tool_step.tool_calls_used,
+            )
+        except ValueError as exc:
+            if not _soft_structured_synthesis(options):
+                raise
+            logger.warning(
+                "Investigation decision synthesis failed; falling back to reflection state",
+                extra={"error_preview": safe_preview(str(exc), limit=200)},
+            )
+            self._record_event(
+                event_type="structured_synthesis_recovered",
+                summary="Decision synthesis failed; using reflection state as fallback",
+                iteration=iterations_used,
+                payload={
+                    "target": "investigation_decision",
+                    "error_preview": safe_preview(str(exc), limit=200),
+                },
+            )
+            if reflection.should_continue and tool_step.tool_calls_used < options.max_tool_calls:
+                return None, no_progress_iterations
+            return (
+                self._complete_turn(
+                    user_input=user_input,
+                    turn_index=turn_index,
+                    options=options,
+                    state=state,
+                    content=self._answer_from_state(state=state, final=not reflection.should_continue),
+                    iterations_used=iterations_used,
+                    tool_calls_used=tool_step.tool_calls_used,
+                    stop_reason=reflection.stop_reason or "decision_synthesis_unavailable",
+                ),
+                no_progress_iterations,
+            )
         self._record_event(
             event_type="decision_completed",
             summary="Investigation decision completed",
@@ -595,7 +666,34 @@ class InvestigationController:
             iteration=iterations_used,
             payload={"draft_length": len(final_draft)},
         )
-        critique = self._synthesize_final_critique(state=state, final_draft=final_draft, options=options)
+        try:
+            critique = self._synthesize_final_critique(state=state, final_draft=final_draft, options=options)
+        except ValueError as exc:
+            if not _soft_structured_synthesis(options):
+                raise
+            logger.warning(
+                "Final critique synthesis failed; returning assistant draft",
+                extra={"error_preview": safe_preview(str(exc), limit=200)},
+            )
+            self._record_event(
+                event_type="structured_synthesis_recovered",
+                summary="Final critique synthesis failed; returning assistant draft",
+                iteration=iterations_used,
+                payload={
+                    "target": "investigation_final_critique",
+                    "error_preview": safe_preview(str(exc), limit=200),
+                },
+            )
+            return self._complete_turn(
+                user_input=user_input,
+                turn_index=turn_index,
+                options=options,
+                state=state,
+                content=final_draft,
+                iterations_used=iterations_used,
+                tool_calls_used=tool_calls_used,
+                stop_reason="final_critique_unavailable",
+            )
         self._record_event(
             event_type="final_critique_completed",
             summary="Final critique completed",
