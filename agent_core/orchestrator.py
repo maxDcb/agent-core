@@ -58,6 +58,7 @@ class AgentOrchestrator:
         *,
         settings: CoreSettings,
         provider: BaseLLMProvider,
+        memory_provider: BaseLLMProvider | None = None,
         registry: ToolRegistry,
         session_manager: SessionManager,
         policy_engine: PolicyEngine,
@@ -65,6 +66,7 @@ class AgentOrchestrator:
     ) -> None:
         self.settings = settings
         self.provider = provider
+        self.memory_provider = memory_provider if memory_provider is not None else provider
         self.registry = registry
         self.session_manager = session_manager
         self.policy_engine = policy_engine
@@ -76,7 +78,7 @@ class AgentOrchestrator:
         )
         self.structured_synthesizer = StructuredSynthesizer(
             settings=settings,
-            provider=provider,
+            provider=self.memory_provider,
         )
 
     def _build_tool_history_item(

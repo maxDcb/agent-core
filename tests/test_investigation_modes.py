@@ -194,6 +194,7 @@ def build_orchestrator(
     tmp_path,
     provider,
     *,
+    memory_provider=None,
     policy_engine: PolicyEngine | None = None,
     pending: bool = False,
     domain_hooks: DomainHooks | None = None,
@@ -214,6 +215,7 @@ def build_orchestrator(
     return AgentOrchestrator(
         settings=settings,
         provider=provider,
+        memory_provider=memory_provider,
         registry=registry,
         session_manager=SessionManager(SessionRepository(settings.session_file)),
         policy_engine=policy_engine or PolicyEngine(),
@@ -420,6 +422,44 @@ def test_domain_hooks_customize_investigation_prompts_and_guidance(tmp_path) -> 
         message.content for message in provider.chat_messages[0] if message.role == "system"
     ]
     assert any("Domain investigation guidance" in content for content in first_chat_system_messages)
+
+
+def test_investigation_internal_synthesis_can_use_dedicated_memory_provider(tmp_path) -> None:
+    class AgentOnlyProvider(ScriptedProvider):
+        def complete_text(self, *, messages, model, temperature, options=None):
+            raise AssertionError("main provider should not be used for internal synthesis")
+
+    primary_provider = AgentOnlyProvider(chat=[LLMCompletionResult(content="primary final")])
+    memory_provider = ScriptedProvider(
+        chat=[],
+        plans=[
+            {
+                "objective": "investigate with memory provider",
+                "plan": ["collect the answer"],
+                "facts": [],
+                "hypotheses": [],
+                "evidence_gaps": [],
+                "completed_actions": [],
+                "next_actions": [],
+                "risk_notes": [],
+                "confidence": 0.2,
+                "stop_reason": None,
+                "metadata": {},
+            }
+        ],
+    )
+    orchestrator = build_orchestrator(tmp_path, primary_provider, memory_provider=memory_provider)
+
+    result = orchestrator.run_turn_result(
+        "investigate with memory provider",
+        options=RunOptions.investigate(max_iterations=1),
+    )
+
+    assert result.content == "primary final"
+    assert primary_provider.chat_messages
+    assert not primary_provider.text_options
+    assert len(memory_provider.text_options) >= 2
+    assert (memory_provider.text_options[0].metadata or {}).get("target") == "investigation_initial_plan"
 
 
 def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_path) -> None:

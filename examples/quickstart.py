@@ -24,7 +24,7 @@ from agent_core import (
 )
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
-from agent_core.llm.provider_factory import build_provider, normalize_provider_name
+from agent_core.llm.provider_factory import build_memory_provider, build_provider, normalize_provider_name
 
 
 DEFAULT_PROMPT = "What time is it? Use get_current_time, then answer in one sentence."
@@ -117,6 +117,15 @@ def build_settings(*, model: str, memory_model: str, session_file: Path) -> Core
         azure_anthropic_api_key=os.getenv("AZURE_ANTHROPIC_API_KEY"),
         azure_anthropic_api_version=os.getenv("AZURE_ANTHROPIC_API_VERSION"),
         azure_anthropic_version=os.getenv("AZURE_ANTHROPIC_VERSION"),
+        memory_llm_provider=os.getenv("AGENT_CORE_MEMORY_LLM_PROVIDER"),
+        memory_openai_api_key=os.getenv("AGENT_CORE_MEMORY_OPENAI_API_KEY"),
+        memory_azure_openai_endpoint=os.getenv("AGENT_CORE_MEMORY_AZURE_OPENAI_ENDPOINT"),
+        memory_azure_openai_api_key=os.getenv("AGENT_CORE_MEMORY_AZURE_OPENAI_API_KEY"),
+        memory_azure_openai_api_version=os.getenv("AGENT_CORE_MEMORY_AZURE_OPENAI_API_VERSION"),
+        memory_azure_anthropic_endpoint=os.getenv("AGENT_CORE_MEMORY_AZURE_ANTHROPIC_ENDPOINT"),
+        memory_azure_anthropic_api_key=os.getenv("AGENT_CORE_MEMORY_AZURE_ANTHROPIC_API_KEY"),
+        memory_azure_anthropic_api_version=os.getenv("AGENT_CORE_MEMORY_AZURE_ANTHROPIC_API_VERSION"),
+        memory_azure_anthropic_version=os.getenv("AGENT_CORE_MEMORY_AZURE_ANTHROPIC_VERSION"),
         llm_timeout_seconds=float(os.getenv("AGENT_CORE_LLM_TIMEOUT_SECONDS", "120")),
         llm_max_output_tokens=_optional_positive_int(os.getenv("AGENT_CORE_LLM_MAX_OUTPUT_TOKENS")),
         model=model,
@@ -142,6 +151,7 @@ def build_orchestrator(settings: CoreSettings) -> AgentOrchestrator:
     return AgentOrchestrator(
         settings=settings,
         provider=build_provider(settings),
+        memory_provider=build_memory_provider(settings),
         registry=build_registry(),
         session_manager=SessionManager(SessionRepository(settings.session_file)),
         policy_engine=PolicyEngine(),

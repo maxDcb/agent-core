@@ -58,6 +58,10 @@ def test_quickstart_build_settings_reads_azure_anthropic_env(tmp_path, monkeypat
     monkeypatch.setenv("AZURE_ANTHROPIC_API_KEY", "test-key")
     monkeypatch.delenv("AZURE_ANTHROPIC_API_VERSION", raising=False)
     monkeypatch.setenv("AZURE_ANTHROPIC_VERSION", "2023-06-01")
+    monkeypatch.setenv("AGENT_CORE_MEMORY_LLM_PROVIDER", "azure_openai")
+    monkeypatch.setenv("AGENT_CORE_MEMORY_AZURE_OPENAI_ENDPOINT", "https://memory.openai.azure.com")
+    monkeypatch.setenv("AGENT_CORE_MEMORY_AZURE_OPENAI_API_KEY", "memory-key")
+    monkeypatch.setenv("AGENT_CORE_MEMORY_AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
     monkeypatch.setenv("AGENT_CORE_LLM_TIMEOUT_SECONDS", "321")
     monkeypatch.setenv("AGENT_CORE_LLM_MAX_OUTPUT_TOKENS", "12345")
 
@@ -72,6 +76,10 @@ def test_quickstart_build_settings_reads_azure_anthropic_env(tmp_path, monkeypat
     assert settings.azure_anthropic_api_key == "test-key"
     assert settings.azure_anthropic_api_version is None
     assert settings.azure_anthropic_version == "2023-06-01"
+    assert settings.memory_llm_provider == "azure_openai"
+    assert settings.memory_azure_openai_endpoint == "https://memory.openai.azure.com"
+    assert settings.memory_azure_openai_api_key == "memory-key"
+    assert settings.memory_azure_openai_api_version == "2025-01-01-preview"
     assert settings.llm_timeout_seconds == 321
     assert settings.llm_max_output_tokens == 12345
     assert quickstart.missing_provider_config(settings) == []
