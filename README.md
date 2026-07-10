@@ -109,6 +109,13 @@ For multi-step work, `investigate` and `deep_investigate` add bounded planning,
 reflection, decision and optional final critique phases while storing only
 auditable artifacts, not raw chain-of-thought.
 
+Investigation modes are conversation modes by default: their user-visible
+answer is text. Their planning, reflection, decision and critique phases use
+internal JSON synthesis. If a caller needs a structured final answer, pass
+`final_output_mode="json_schema"` with a `StructuredOutputContract`; the
+investigation still runs normally, then a final no-tool turn renders the answer
+through the provider-enforced JSON Schema contract.
+
 ```python
 from agent_core import RunOptions
 
@@ -123,23 +130,31 @@ and metadata returned by completed investigation runs.
 
 ## Structured Tasks
 
-`StructuredTaskRunner` runs a bounded tool-using subtask and asks the model for
-a JSON object. It is useful when an application needs a generic sub-agent-like
-step without introducing domain-specific specialist profiles into core.
+`StructuredTaskRunner` runs a bounded tool-using subtask. Without an
+`output_contract`, it returns raw text and the caller owns any parsing. With an
+`output_contract`, the provider JSON Schema contract is enforced only on the
+final no-tool output, after any tool investigation is complete. Providers that
+cannot enforce the contract fail the task instead of silently downgrading to
+loose JSON mode.
 
 ```python
-from agent_core import StructuredTaskSpec
+from agent_core import StructuredOutputContract, StructuredTaskSpec
 
 spec = StructuredTaskSpec(
     task_id="workspace_summary",
     system_prompt="Return JSON only.",
     objective="Summarize the provided workspace context.",
     allowed_tools=["search_code"],
-    output_schema={
-        "type": "object",
-        "required": ["summary"],
-        "properties": {"summary": {"type": "string"}},
-    },
+    output_contract=StructuredOutputContract(
+        name="workspace_summary",
+        strict=True,
+        schema={
+            "type": "object",
+            "required": ["summary"],
+            "additionalProperties": False,
+            "properties": {"summary": {"type": "string"}},
+        },
+    ),
 )
 
 result = structured_task_runner.run(spec=spec, session_id="default")

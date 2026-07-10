@@ -114,7 +114,7 @@ def test_safe_tool_argument_summary_keeps_useful_context_without_sensitive_value
     assert summary["redacted_argument_keys"] == ["fields", "password"]
 
 
-def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> None:
+def test_structured_task_runner_without_contract_returns_raw_text_after_tool_loop() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         registry = ToolRegistry()
@@ -131,14 +131,7 @@ def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> N
                         )
                     ],
                 ),
-                LLMCompletionResult(
-                    content=json.dumps(
-                        {
-                            "summary": "done",
-                            "evidence": [{"tool": "echo_tool", "value": "pre-inventory"}],
-                        }
-                    )
-                ),
+                LLMCompletionResult(content="done after pre-inventory"),
             ]
         )
         runner = StructuredTaskRunner(
@@ -154,26 +147,19 @@ def test_structured_task_runner_executes_tool_loop_and_parses_json_output() -> N
                 system_prompt="Map the initial workspace state.",
                 objective="Build a first workspace summary.",
                 allowed_tools=["echo_tool"],
-                output_schema={
-                    "type": "object",
-                    "required": ["summary", "evidence"],
-                    "properties": {
-                        "summary": {"type": "string"},
-                        "evidence": {"type": "array"},
-                    },
-                },
             ),
             session_id="session-1",
         )
 
         assert result.ok is True
-        assert result.output is not None
-        assert result.output["summary"] == "done"
+        assert result.output is None
+        assert result.raw_content == "done after pre-inventory"
+        assert result.metadata["final_output_mode"] == "text"
         assert result.tool_calls_used == 1
         assert result.tool_history[0]["status"] == "ok"
         assert result.tool_history[0]["content_preview"] == "echo:pre-inventory"
         assert provider.last_options is not None
-        assert provider.last_options.response_format == {"type": "json_object"}
+        assert provider.last_options.response_format is None
         assert provider.last_options.metadata["structured_task_id"] == "pre_inventory"
         assert provider.last_tools[0].name == "echo_tool"
 
@@ -326,7 +312,7 @@ def test_structured_task_runner_enforces_contract_only_on_final_no_tool_output()
 def test_structured_task_runner_passes_configured_max_output_tokens_to_final_output() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
-        provider = FakeProvider([LLMCompletionResult(content=json.dumps({"summary": "done"}))])
+        provider = FakeProvider([LLMCompletionResult(content="done")])
         settings = _settings(root)
         settings.llm_max_output_tokens = 12345
         runner = StructuredTaskRunner(
@@ -417,21 +403,22 @@ def test_structured_task_runner_rejects_invalid_json_output() -> None:
 
         result = runner.run(
             spec=StructuredTaskSpec(
-                task_id="bad_output",
-                system_prompt="Return JSON.",
-                objective="Validate strict output parsing.",
+                task_id="text_output",
+                system_prompt="Return a concise answer.",
+                objective="Validate text output.",
             )
         )
 
-        assert result.ok is False
-        assert result.failure_reason == "Structured task returned invalid JSON output."
+        assert result.ok is True
+        assert result.output is None
+        assert result.raw_content == "not-json"
 
 
-def test_structured_task_runner_recovers_first_json_object_when_output_is_duplicated() -> None:
+def test_structured_task_runner_rejects_invalid_json_schema_output() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
-        first = {"summary": "keep this", "items": [1]}
-        second = {"summary": "duplicate object should be ignored"}
+        first = {"summary": "first object"}
+        second = {"summary": "duplicate object should be rejected"}
         runner = StructuredTaskRunner(
             settings=_settings(root),
             provider=FakeProvider([LLMCompletionResult(content=json.dumps(first) + "\n" + json.dumps(second))]),
@@ -441,20 +428,26 @@ def test_structured_task_runner_recovers_first_json_object_when_output_is_duplic
 
         result = runner.run(
             spec=StructuredTaskSpec(
-                task_id="json_recovery",
+                task_id="json_schema_strict_parse",
                 system_prompt="Return JSON.",
-                objective="Validate duplicated JSON recovery.",
+                objective="Validate strict JSON Schema parsing.",
+                output_contract=StructuredOutputContract(
+                    name="strict_output",
+                    schema={
+                        "type": "object",
+                        "required": ["summary"],
+                        "additionalProperties": False,
+                        "properties": {"summary": {"type": "string"}},
+                    },
+                ),
             )
         )
 
-        assert result.ok is True
-        assert result.output == first
-        assert result.metadata["json_recovery_applied"] is True
-        assert result.metadata["json_recovery_reason"] == "ignored_trailing_content_after_first_json_object"
-        assert "duplicate object should be ignored" in result.metadata["json_recovery_trailing_preview"]
+        assert result.ok is False
+        assert result.failure_reason == "Structured task returned invalid JSON Schema output."
 
 
-def test_structured_task_prompt_forbids_appended_second_json_object() -> None:
+def test_structured_task_prompt_forbids_appended_second_json_object_for_schema_contract() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         provider = FakeProvider([LLMCompletionResult(content=json.dumps({"summary": "done"}))])
@@ -470,13 +463,22 @@ def test_structured_task_prompt_forbids_appended_second_json_object() -> None:
                 task_id="json_prompt_guard",
                 system_prompt="Return JSON.",
                 objective="Validate prompt guard.",
+                output_contract=StructuredOutputContract(
+                    name="guarded_output",
+                    schema={
+                        "type": "object",
+                        "required": ["summary"],
+                        "additionalProperties": False,
+                        "properties": {"summary": {"type": "string"}},
+                    },
+                ),
             )
         )
 
         assert result.ok is True
         task_prompt = provider.last_messages[1].content
         assert "no second JSON object after it" in task_prompt
-        assert "replacement JSON object instead of appending another object" in task_prompt
+        assert "Provider-enforced structured output contract" in task_prompt
 
 
 def test_structured_task_runner_uses_parent_session_id_for_tool_context() -> None:
@@ -545,7 +547,7 @@ def test_structured_task_runner_fails_fast_on_unknown_allowed_tool() -> None:
         assert provider.responses == []
 
 
-def test_structured_task_runner_forces_json_finalization_after_iteration_budget() -> None:
+def test_structured_task_runner_forces_schema_finalization_after_iteration_budget() -> None:
     with tempfile.TemporaryDirectory() as temp_dir:
         root = Path(temp_dir)
         registry = ToolRegistry()
@@ -578,6 +580,15 @@ def test_structured_task_runner_forces_json_finalization_after_iteration_budget(
                 system_prompt="Return JSON after using the echo tool.",
                 objective="Exercise forced finalization.",
                 allowed_tools=["echo_tool"],
+                output_contract=StructuredOutputContract(
+                    name="budgeted_output",
+                    schema={
+                        "type": "object",
+                        "required": ["summary"],
+                        "additionalProperties": False,
+                        "properties": {"summary": {"type": "string"}},
+                    },
+                ),
                 max_iterations=1,
                 max_tool_calls=3,
             )

@@ -13,6 +13,7 @@ from agent_core.investigation_prompts import (
     STEP_REFLECTION_PROMPT,
 )
 from agent_core.investigation_state import InvestigationState
+from agent_core.output_contracts import StructuredOutputContract
 from agent_core.run_options import RunOptions
 
 
@@ -23,11 +24,13 @@ def test_run_options_defaults_and_presets() -> None:
     assert investigate.mode == "investigate"
     assert investigate.max_iterations == 10
     assert investigate.max_tool_calls > 0
+    assert investigate.recover_internal_synthesis_errors is False
 
     deep = RunOptions.deep_investigate()
     assert deep.mode == "deep_investigate"
     assert deep.require_final_critique is True
     assert deep.max_iterations == 20
+    assert deep.final_output_mode == "text"
 
 
 def test_run_options_reject_invalid_budgets_and_confidence() -> None:
@@ -39,6 +42,44 @@ def test_run_options_reject_invalid_budgets_and_confidence() -> None:
         RunOptions(max_no_progress_iterations=-1)
     with pytest.raises(ValueError):
         RunOptions(min_confidence_to_answer=1.2)
+    with pytest.raises(ValueError):
+        RunOptions.direct(
+            final_output_mode="json_schema",
+            final_output_contract=StructuredOutputContract(name="x", schema={"type": "object"}),
+        )
+    with pytest.raises(ValueError):
+        RunOptions.investigate(final_output_mode="json_schema")
+    with pytest.raises(ValueError):
+        RunOptions.investigate(
+            final_output_contract=StructuredOutputContract(name="x", schema={"type": "object"}),
+        )
+
+
+def test_run_options_accepts_explicit_internal_synthesis_recovery() -> None:
+    options = RunOptions.investigate(
+        recover_internal_synthesis_errors=True,
+        metadata={"surface": "conversation_api"},
+    )
+
+    assert options.recover_internal_synthesis_errors is True
+    assert options.metadata == {"surface": "conversation_api"}
+
+
+def test_run_options_accepts_json_schema_final_output_contract() -> None:
+    options = RunOptions.investigate(
+        final_output_mode="json_schema",
+        final_output_contract={
+            "name": "final_answer",
+            "schema": {"type": "object", "additionalProperties": False, "properties": {}},
+            "strict": True,
+            "instructions": ["Return final answer fields only."],
+        },
+    )
+
+    assert options.final_output_mode == "json_schema"
+    assert options.final_output_contract is not None
+    assert options.final_output_contract.name == "final_answer"
+    assert options.final_output_contract.strict is True
 
 
 def test_investigation_state_has_no_private_reasoning_fields() -> None:

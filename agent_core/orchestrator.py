@@ -752,6 +752,7 @@ class AgentOrchestrator:
             settings=self.settings,
             structured_synthesizer=self.structured_synthesizer,
             call_model_once=self._call_model_once,
+            call_final_model_once=self._call_final_model_once,
             execute_tool_calls_once=lambda **kwargs: self._execute_tool_calls_once(**kwargs, trace=trace),
             persist_conversation_turn_once=self._persist_conversation_turn_once,
             refresh_memory_after_turn=self._refresh_memory_after_turn,
@@ -790,6 +791,22 @@ class AgentOrchestrator:
             model=self.settings.model,
             temperature=self.settings.temperature,
         )
+
+    def _call_final_model_once(
+        self,
+        *,
+        messages: list[LLMMessage],
+        options: LLMCallOptions | None = None,
+    ) -> LLMCompletionResult:
+        kwargs: dict[str, Any] = {
+            "messages": messages,
+            "tools": [],
+            "model": self.settings.model,
+            "temperature": self.settings.temperature,
+        }
+        if options is not None and self._provider_accepts_options("complete_with_tools"):
+            kwargs["options"] = options
+        return self.provider.complete_with_tools(**kwargs)
 
     def _execute_tool_calls_once(
         self,

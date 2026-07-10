@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
+from agent_core.output_contracts import FinalOutputMode, StructuredOutputContract
+
 AgentRunMode: TypeAlias = Literal["direct", "investigate", "deep_investigate"]
 
 
@@ -14,6 +16,9 @@ class RunOptions:
     max_no_progress_iterations: int = 2
     require_initial_plan: bool = False
     require_final_critique: bool = False
+    recover_internal_synthesis_errors: bool = False
+    final_output_mode: FinalOutputMode = "text"
+    final_output_contract: StructuredOutputContract | None = None
     min_confidence_to_answer: float = 0.70
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
@@ -22,6 +27,8 @@ class RunOptions:
     def __post_init__(self) -> None:
         if self.mode not in {"direct", "investigate", "deep_investigate"}:
             raise ValueError(f"Unsupported agent run mode: {self.mode}")
+        if self.final_output_mode not in {"text", "json_schema"}:
+            raise ValueError(f"Unsupported final output mode: {self.final_output_mode}")
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be at least 1")
         if self.max_tool_calls < 0:
@@ -31,6 +38,13 @@ class RunOptions:
         if not 0.0 <= self.min_confidence_to_answer <= 1.0:
             raise ValueError("min_confidence_to_answer must be between 0.0 and 1.0")
         self.metadata = dict(self.metadata)
+        self.final_output_contract = StructuredOutputContract.from_any(self.final_output_contract)
+        if self.mode == "direct" and self.final_output_mode != "text":
+            raise ValueError("json_schema final output requires investigate or deep_investigate mode")
+        if self.final_output_mode == "json_schema" and self.final_output_contract is None:
+            raise ValueError("final_output_contract is required when final_output_mode is json_schema")
+        if self.final_output_mode == "text" and self.final_output_contract is not None:
+            raise ValueError("final_output_contract requires final_output_mode json_schema")
 
     @classmethod
     def direct(cls, **overrides: Any) -> "RunOptions":

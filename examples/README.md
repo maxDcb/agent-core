@@ -29,9 +29,8 @@ Or start a small REPL:
 ```
 
 You can also run a provider compatibility check against the provider selected
-by `LLM_PROVIDER`. This exercises plain chat, tool calls, `response_format` JSON
-object, `response_format` JSON schema enforcement, and `StructuredTaskRunner`
-final output:
+by `LLM_PROVIDER`. This exercises plain chat, tool calls, `response_format`
+JSON Schema enforcement, and `StructuredTaskRunner` final output:
 
 ```bash
 .venv/bin/python examples/quickstart.py --compat-check

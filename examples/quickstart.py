@@ -255,26 +255,6 @@ def _run_tool_call_check(provider: BaseLLMProvider, *, model: str) -> bool:
     return _print_check("tool calls", ok, f"name={call.name!r}, arguments={call.arguments_json!r}")
 
 
-def _run_json_object_check(provider: BaseLLMProvider, *, model: str) -> bool:
-    try:
-        content = provider.complete_text(
-            messages=[
-                LLMMessage(
-                    role="user",
-                    content='Return one JSON object with fields "ok": true and "mode": "json_object". No prose.',
-                )
-            ],
-            model=model,
-            temperature=0.0,
-            options=LLMCallOptions(response_format={"type": "json_object"}),
-        )
-    except LLMProviderError as exc:
-        return _print_check("response_format json_object", False, f"{exc.kind}: {exc.user_message}")
-
-    ok, detail = _json_object_matches(content, {"ok": True, "mode": "json_object"})
-    return _print_check("response_format json_object", ok, detail)
-
-
 def _run_json_schema_check(provider: BaseLLMProvider, *, model: str) -> bool:
     schema = {
         "type": "object",
@@ -361,12 +341,11 @@ def _optional_positive_int(value: str | None) -> int | None:
 def run_compatibility_checks(settings: CoreSettings) -> int:
     provider = build_provider(settings)
     print(f"Running provider compatibility checks with provider={settings.llm_provider!r}, model={settings.model!r}")
-    print("Checks cover plain chat, OpenAI-style tool calls, response_format, and StructuredTaskRunner.")
+    print("Checks cover plain chat, OpenAI-style tool calls, JSON Schema response_format, and StructuredTaskRunner.")
 
     checks = [
         _run_plain_chat_check(provider, model=settings.model),
         _run_tool_call_check(provider, model=settings.model),
-        _run_json_object_check(provider, model=settings.model),
         _run_json_schema_check(provider, model=settings.model),
         _run_structured_task_check(settings, provider),
     ]

@@ -50,6 +50,28 @@ def test_structured_synthesizer_passes_llm_call_options_when_supported(tmp_path)
     assert provider.options_seen == [options]
 
 
+def test_structured_synthesizer_requests_json_object_by_default(tmp_path) -> None:
+    provider = RecordingProvider()
+    synthesizer = StructuredSynthesizer(
+        settings=CoreSettings(session_file=tmp_path / "session.json", memory_model="fake"),
+        provider=provider,
+    )
+
+    result = synthesizer.synthesize(
+        request=StructuredSynthesisRequest(
+            target_name="value",
+            instructions="Return JSON only.",
+            output_format={"value": ""},
+            payload={"input": "x"},
+            parser=lambda payload: payload if isinstance(payload, dict) else None,
+        )
+    )
+
+    assert result == {"value": "ok"}
+    assert provider.options_seen[0] is not None
+    assert provider.options_seen[0].response_format == {"type": "json_object"}
+
+
 def test_structured_synthesizer_keeps_legacy_provider_working(tmp_path) -> None:
     synthesizer = StructuredSynthesizer(
         settings=CoreSettings(session_file=tmp_path / "session.json", memory_model="fake"),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+import json
 from typing import Any, Protocol
 
 from agent_core.execution_context import ExecutionContext
@@ -13,6 +14,7 @@ from agent_core.investigation_state import InvestigationState
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
+from agent_core.output_contracts import parse_json_object, render_json_object
 from agent_core.run_options import RunOptions
 from agent_core.settings import CoreSettings
 from agent_core.structured_synthesizer import StructuredSynthesisRequest, StructuredSynthesizer
@@ -23,6 +25,16 @@ logger = get_logger(__name__)
 
 
 class ModelCaller(Protocol):
+    def __call__(
+        self,
+        *,
+        messages: list[LLMMessage],
+        options: LLMCallOptions | None = None,
+    ) -> LLMCompletionResult:
+        ...
+
+
+class FinalModelCaller(Protocol):
     def __call__(
         self,
         *,
@@ -99,11 +111,6 @@ def with_investigation_guidance(
         return [*messages[:-1], guidance, messages[-1]]
     return [*messages, guidance]
 
-
-def _soft_structured_synthesis(options: RunOptions) -> bool:
-    return bool(options.metadata.get("soft_structured_synthesis"))
-
-
 class InvestigationController:
     """Bounded, domain-agnostic investigation loop.
 
@@ -118,6 +125,7 @@ class InvestigationController:
         settings: CoreSettings,
         structured_synthesizer: StructuredSynthesizer,
         call_model_once: ModelCaller,
+        call_final_model_once: FinalModelCaller,
         execute_tool_calls_once: ToolExecutor,
         persist_conversation_turn_once: ConversationPersister,
         refresh_memory_after_turn: MemoryRefresher,
@@ -128,6 +136,7 @@ class InvestigationController:
         self.settings = settings
         self.structured_synthesizer = structured_synthesizer
         self.call_model_once = call_model_once
+        self.call_final_model_once = call_final_model_once
         self.execute_tool_calls_once = execute_tool_calls_once
         self.persist_conversation_turn_once = persist_conversation_turn_once
         self.refresh_memory_after_turn = refresh_memory_after_turn
@@ -189,7 +198,7 @@ class InvestigationController:
                     state=state,
                 )
             except ValueError as exc:
-                if not _soft_structured_synthesis(options):
+                if not options.recover_internal_synthesis_errors:
                     raise
                 logger.warning(
                     "Initial investigation plan synthesis failed; continuing with template state",
@@ -367,6 +376,7 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_calls_used,
                     stop_reason="max_tool_calls",
@@ -422,6 +432,7 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_calls_used,
                     stop_reason="max_tool_calls",
@@ -445,6 +456,7 @@ class InvestigationController:
             turn_index=turn_index,
             options=options,
             state=state,
+            messages=messages,
             iterations_used=iterations_used,
             tool_calls_used=tool_calls_used,
             stop_reason="max_iterations",
@@ -466,7 +478,7 @@ class InvestigationController:
         try:
             reflection = self._synthesize_reflection(state=state, tool_step=tool_step, options=options)
         except ValueError as exc:
-            if not _soft_structured_synthesis(options):
+            if not options.recover_internal_synthesis_errors:
                 raise
             logger.warning(
                 "Investigation reflection synthesis failed; continuing without state update",
@@ -507,7 +519,7 @@ class InvestigationController:
                 tool_calls_used=tool_step.tool_calls_used,
             )
         except ValueError as exc:
-            if not _soft_structured_synthesis(options):
+            if not options.recover_internal_synthesis_errors:
                 raise
             logger.warning(
                 "Investigation decision synthesis failed; falling back to reflection state",
@@ -531,6 +543,7 @@ class InvestigationController:
                     options=options,
                     state=state,
                     content=self._answer_from_state(state=state, final=not reflection.should_continue),
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason=reflection.stop_reason or "decision_synthesis_unavailable",
@@ -553,6 +566,7 @@ class InvestigationController:
                     options=options,
                     state=state,
                     content=question,
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="ask_user",
@@ -568,6 +582,7 @@ class InvestigationController:
                     options=options,
                     state=state,
                     content=f"Investigation blocked: {decision.reason_summary}",
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="blocked",
@@ -595,6 +610,7 @@ class InvestigationController:
                     options=options,
                     state=state,
                     content=self._answer_from_state(state=state, final=True),
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason=decision.reason_summary or reflection.stop_reason or "final",
@@ -609,6 +625,7 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="max_tool_calls",
@@ -623,6 +640,7 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
+                    messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="no_progress",
@@ -655,6 +673,7 @@ class InvestigationController:
                 options=options,
                 state=state,
                 content=final_draft,
+                messages=messages,
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final",
@@ -669,7 +688,7 @@ class InvestigationController:
         try:
             critique = self._synthesize_final_critique(state=state, final_draft=final_draft, options=options)
         except ValueError as exc:
-            if not _soft_structured_synthesis(options):
+            if not options.recover_internal_synthesis_errors:
                 raise
             logger.warning(
                 "Final critique synthesis failed; returning assistant draft",
@@ -690,6 +709,7 @@ class InvestigationController:
                 options=options,
                 state=state,
                 content=final_draft,
+                messages=messages,
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final_critique_unavailable",
@@ -707,6 +727,7 @@ class InvestigationController:
                 options=options,
                 state=state,
                 content=final_draft,
+                messages=messages,
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final_critique_approved",
@@ -719,6 +740,7 @@ class InvestigationController:
                 turn_index=turn_index,
                 options=options,
                 state=state,
+                messages=messages,
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final_critique_rejected",
@@ -750,11 +772,22 @@ class InvestigationController:
         options: RunOptions,
         state: InvestigationState,
         content: str,
+        messages: list[LLMMessage],
         iterations_used: int,
         tool_calls_used: int,
         stop_reason: str,
     ) -> AgentTurnResult:
         state.stop_reason = stop_reason
+        final_content = content
+        final_metadata: dict[str, Any] = {}
+        if options.final_output_mode == "json_schema":
+            final_content, final_metadata = self._render_final_json_schema(
+                content=content,
+                messages=messages,
+                options=options,
+                state=state,
+                stop_reason=stop_reason,
+            )
         self._record_event(
             event_type="investigation_completed",
             summary="Investigation completed",
@@ -768,20 +801,93 @@ class InvestigationController:
         self.persist_conversation_turn_once(
             turn_index=turn_index,
             user_input=user_input,
-            assistant_content=content,
+            assistant_content=final_content,
         )
         self.refresh_memory_after_turn(turn_index=turn_index)
         return AgentTurnResult(
             status="completed",
-            content=content,
-            metadata=self._metadata(
-                options=options,
-                iterations_used=iterations_used,
-                tool_calls_used=tool_calls_used,
-                stop_reason=stop_reason,
-                state=state,
+            content=final_content,
+            metadata={
+                **self._metadata(
+                    options=options,
+                    iterations_used=iterations_used,
+                    tool_calls_used=tool_calls_used,
+                    stop_reason=stop_reason,
+                    state=state,
+                ),
+                **final_metadata,
+            },
+        )
+
+    def _render_final_json_schema(
+        self,
+        *,
+        content: str,
+        messages: list[LLMMessage],
+        options: RunOptions,
+        state: InvestigationState,
+        stop_reason: str,
+    ) -> tuple[str, dict[str, Any]]:
+        contract = options.final_output_contract
+        if contract is None:
+            raise ValueError("json_schema final output requires a final output contract")
+
+        payload = {
+            "candidate_final_answer": content,
+            "stop_reason": stop_reason,
+            "investigation_state": state.to_dict(),
+            "contract_name": contract.name,
+            "contract_instructions": list(contract.instructions),
+        }
+        instruction_lines = [
+            "Formalize the final answer as one JSON object matching the provider-enforced JSON Schema.",
+            "Use only the candidate answer and investigation state already present in this transcript.",
+            "Do not request tools. Do not add prose, markdown fences, comments, or a second JSON object.",
+            "Preserve uncertainty from the investigation state instead of inventing missing facts.",
+        ]
+        if contract.instructions:
+            instruction_lines.append("Contract-specific instructions:")
+            instruction_lines.extend(f"- {instruction}" for instruction in contract.instructions)
+
+        final_messages = [
+            *messages,
+            LLMMessage(role="system", content="\n".join(instruction_lines)),
+            LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+        ]
+        llm_response = self.call_final_model_once(
+            messages=final_messages,
+            options=LLMCallOptions(
+                reasoning_effort=options.reasoning_effort,
+                reasoning_summary=options.reasoning_summary,
+                response_format=contract.response_format(),
+                max_output_tokens=self.settings.llm_max_output_tokens,
+                metadata={
+                    "mode": options.mode,
+                    "target": "final_output_json_schema",
+                    "final_output_contract": contract.name,
+                    **options.metadata,
+                },
             ),
         )
+        if llm_response.tool_calls:
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The final JSON Schema renderer unexpectedly requested tools.",
+                detail=f"tool_call_count={len(llm_response.tool_calls)}",
+            )
+        try:
+            rendered_payload = parse_json_object(llm_response.content, target_name="final_output_json_schema")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The final JSON Schema renderer returned invalid JSON.",
+                detail=str(exc),
+            ) from exc
+
+        return render_json_object(rendered_payload), {
+            "final_output_mode": "json_schema",
+            "final_output_contract": contract.name,
+        }
 
     def _complete_with_budget_answer(
         self,
@@ -790,6 +896,7 @@ class InvestigationController:
         turn_index: int,
         options: RunOptions,
         state: InvestigationState,
+        messages: list[LLMMessage],
         iterations_used: int,
         tool_calls_used: int,
         stop_reason: str,
@@ -801,6 +908,7 @@ class InvestigationController:
             options=options,
             state=state,
             content=self._answer_from_state(state=state, final=False),
+            messages=messages,
             iterations_used=iterations_used,
             tool_calls_used=tool_calls_used,
             stop_reason=stop_reason,
@@ -975,6 +1083,7 @@ class InvestigationController:
     ) -> dict[str, Any]:
         return {
             "mode": options.mode,
+            "final_output_mode": options.final_output_mode,
             "iterations_used": iterations_used,
             "tool_calls_used": tool_calls_used,
             "stop_reason": stop_reason,

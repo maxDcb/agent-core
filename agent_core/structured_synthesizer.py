@@ -70,7 +70,8 @@ class StructuredSynthesizer:
                 ),
             )
 
-        raw_content = self._complete_text(messages=messages, options=request.options)
+        options = request.options or LLMCallOptions(response_format={"type": "json_object"})
+        raw_content = self._complete_text(messages=messages, options=options)
 
         if self.settings.log_synthesis_payloads:
             logger.info(

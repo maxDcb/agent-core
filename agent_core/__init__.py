@@ -6,6 +6,7 @@ from agent_core.investigation_models import FinalCritique, InvestigationDecision
 from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.investigation_state import EvidenceItem, Hypothesis, InvestigationState
 from agent_core.orchestrator import AgentOrchestrator
+from agent_core.output_contracts import FinalOutputMode, StructuredOutputContract
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_trace import ContextBudget, PromptBlock, PromptSnapshot, RunTrace, TraceEvent
 from agent_core.run_options import AgentRunMode, RunOptions
@@ -13,7 +14,6 @@ from agent_core.session_manager import SessionManager
 from agent_core.session_repo import JsonFileSessionStore, SessionRepository, SessionStore
 from agent_core.settings import CoreSettings
 from agent_core.structured_tasks import (
-    StructuredOutputContract,
     StructuredTaskResult,
     StructuredTaskRunner,
     StructuredTaskSpec,
@@ -32,6 +32,7 @@ __all__ = [
     "DomainHooks",
     "EvidenceItem",
     "ExecutionContext",
+    "FinalOutputMode",
     "FinalCritique",
     "Hypothesis",
     "InvestigationDecision",

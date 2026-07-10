@@ -8,6 +8,7 @@ from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.memory.thread_state import render_context_blocks_to_messages
 from agent_core.orchestrator import AgentOrchestrator
+from agent_core.output_contracts import StructuredOutputContract
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_options import RunOptions
 from agent_core.session_manager import SessionManager
@@ -101,12 +102,14 @@ class ScriptedProvider:
         self.decisions = list(decisions or [])
         self.critiques = list(critiques or [])
         self.tool_options = []
+        self.chat_tools = []
         self.text_options = []
         self.chat_messages = []
         self.text_prompts = []
 
     def complete_with_tools(self, *, messages, tools, model, temperature, options=None):
         self.tool_options.append(options)
+        self.chat_tools.append(list(tools))
         self.chat_messages.append(list(messages))
         if not self.chat:
             raise AssertionError("No scripted chat response left")
@@ -303,6 +306,84 @@ def test_investigation_no_tool_no_critique_returns_final(tmp_path) -> None:
     assert result.metadata["mode"] == "investigate"
     assert result.metadata["iterations_used"] == 1
     assert "reasoning" not in json.dumps(result.metadata)
+
+
+def test_investigation_json_schema_final_output_uses_last_no_tool_turn(tmp_path) -> None:
+    contract_schema = {
+        "type": "object",
+        "required": ["summary", "confidence"],
+        "additionalProperties": False,
+        "properties": {
+            "summary": {"type": "string"},
+            "confidence": {"type": "number"},
+        },
+    }
+    provider = ScriptedProvider(
+        chat=[
+            LLMCompletionResult(content="plain final draft"),
+            LLMCompletionResult(content=json.dumps({"summary": "plain final draft", "confidence": 0.82})),
+        ]
+    )
+    orchestrator = build_orchestrator(tmp_path, provider)
+
+    result = orchestrator.run_turn_result(
+        "answer as schema",
+        options=RunOptions.investigate(
+            max_iterations=1,
+            require_initial_plan=False,
+            final_output_mode="json_schema",
+            final_output_contract=StructuredOutputContract(
+                name="investigation_final",
+                schema=contract_schema,
+                strict=True,
+                instructions=["Keep confidence as a number."],
+            ),
+            reasoning_effort="high",
+        ),
+    )
+
+    assert json.loads(result.content) == {"summary": "plain final draft", "confidence": 0.82}
+    assert result.metadata["final_output_mode"] == "json_schema"
+    assert result.metadata["final_output_contract"] == "investigation_final"
+    assert provider.chat_tools[0]
+    assert provider.chat_tools[1] == []
+    assert provider.tool_options[0].response_format is None
+    assert provider.tool_options[1].response_format == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "investigation_final",
+            "schema": contract_schema,
+            "strict": True,
+        },
+    }
+    assert provider.tool_options[1].reasoning_effort == "high"
+    assert provider.chat_messages[1][-1].role == "user"
+    assert "candidate_final_answer" in provider.chat_messages[1][-1].content
+
+
+def test_internal_synthesis_recovery_option_recovers_invalid_initial_plan_json(tmp_path) -> None:
+    class InvalidInitialPlanProvider(ScriptedProvider):
+        def complete_text(self, *, messages, model, temperature, options=None):
+            self.text_options.append(options)
+            target = (options.metadata or {}).get("target") if options is not None else None
+            if target == "investigation_initial_plan":
+                return "not-json"
+            return super().complete_text(messages=messages, model=model, temperature=temperature, options=options)
+
+    provider = InvalidInitialPlanProvider(chat=[LLMCompletionResult(content="final after internal synthesis failure")])
+    orchestrator = build_orchestrator(tmp_path, provider)
+
+    result = orchestrator.run_turn_result(
+        "recover from invalid initial plan",
+        options=RunOptions.investigate(
+            max_iterations=1,
+            recover_internal_synthesis_errors=True,
+        ),
+    )
+
+    assert result.content == "final after internal synthesis failure"
+    assert result.metadata["stop_reason"] == "final"
+    assert provider.text_options[0].response_format == {"type": "json_object"}
 
 
 def test_domain_hooks_customize_investigation_prompts_and_guidance(tmp_path) -> None:

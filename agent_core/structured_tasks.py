@@ -14,6 +14,7 @@ from agent_core.execution_context import (
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
+from agent_core.output_contracts import StructuredOutputContract, parse_json_object
 from agent_core.policy_engine import PolicyEngine
 from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
@@ -87,36 +88,6 @@ def _safe_tool_argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
-def _load_json_output(raw_content: str) -> tuple[object, dict[str, Any]]:
-    """Load a structured-task JSON response, recovering from duplicated final JSON.
-
-    Chat JSON mode prevents most malformed prose, but models can still emit a
-    complete JSON object and then append a second complete object. That is
-    invalid JSON as a whole, yet the first object is the controller contract we
-    asked for. Keep that first complete object and record metadata instead of
-    failing the whole phase.
-    """
-
-    try:
-        return json.loads(raw_content), {}
-    except json.JSONDecodeError as original_exc:
-        stripped = raw_content.lstrip()
-        if not stripped.startswith("{"):
-            raise original_exc
-        try:
-            payload, end_index = json.JSONDecoder().raw_decode(stripped)
-        except json.JSONDecodeError:
-            raise original_exc
-        trailing = stripped[end_index:].strip()
-        if not trailing:
-            return payload, {}
-        return payload, {
-            "json_recovery_applied": True,
-            "json_recovery_reason": "ignored_trailing_content_after_first_json_object",
-            "json_recovery_trailing_preview": safe_preview(trailing, limit=500),
-        }
-
-
 def _approx_token_count_from_chars(char_count: int) -> int:
     return round(max(0, char_count) / 4)
 
@@ -177,35 +148,6 @@ def _clean_optional_positive_int(value: object) -> int | None:
     return normalized if normalized > 0 else None
 
 
-def _clean_contract_name(value: object) -> str:
-    cleaned = _clean_string(value, default="structured_output")
-    normalized = "".join(ch if ch.isalnum() or ch in {"_", "-"} else "_" for ch in cleaned)
-    normalized = normalized.strip("_-") or "structured_output"
-    return normalized[:64]
-
-
-@dataclass(slots=True)
-class StructuredOutputContract:
-    """Provider-facing structured output contract for a structured task.
-
-    `StructuredTaskSpec.output_schema` remains a prompt hint. This contract is
-    opt-in and can be sent to providers that support JSON Schema constrained
-    output. Schema contracts are hard requirements: if a provider cannot enforce
-    the schema, the task should fail instead of silently downgrading to JSON mode.
-    """
-
-    name: str
-    schema: dict[str, Any]
-    strict: bool = False
-    instructions: list[str] = field(default_factory=list)
-
-    def __post_init__(self) -> None:
-        self.name = _clean_contract_name(self.name)
-        if not isinstance(self.schema, dict):
-            self.schema = {"type": "object", "additionalProperties": True}
-        self.instructions = _clean_string_list(self.instructions)
-
-
 @dataclass(slots=True)
 class StructuredTaskSpec:
     """Caller-owned specification for one bounded, tool-using structured task."""
@@ -217,7 +159,6 @@ class StructuredTaskSpec:
     constraints: list[str] = field(default_factory=list)
     target: str = ""
     allowed_tools: list[str] = field(default_factory=list)
-    output_schema: dict[str, Any] = field(default_factory=dict)
     output_contract: StructuredOutputContract | None = None
     model: str | None = None
     temperature: float | None = None
@@ -233,10 +174,7 @@ class StructuredTaskSpec:
         self.target = _clean_string(self.target)
         self.constraints = _clean_string_list(self.constraints)
         self.allowed_tools = _clean_string_list(self.allowed_tools)
-        if not isinstance(self.output_schema, dict):
-            self.output_schema = {}
-        if not isinstance(self.output_contract, StructuredOutputContract):
-            self.output_contract = None
+        self.output_contract = StructuredOutputContract.from_any(self.output_contract)
         if not isinstance(self.metadata, dict):
             self.metadata = {}
         self.model = _clean_string(self.model) or None
@@ -253,31 +191,10 @@ class StructuredTaskSpec:
             "metadata": dict(self.metadata),
         }
 
-
-def _output_schema_hint_for_spec(spec: StructuredTaskSpec) -> dict[str, Any]:
-    if spec.output_contract is not None:
-        return spec.output_contract.schema
-    return spec.output_schema or {"type": "object", "additionalProperties": True}
-
-
 def _response_format_for_spec(spec: StructuredTaskSpec, *, final_output: bool = True) -> dict[str, Any] | None:
-    contract = spec.output_contract
-    if contract is None:
-        return {"type": "json_object"}
-    if not final_output:
+    if spec.output_contract is None or not final_output:
         return None
-    return {
-        "type": "json_schema",
-        "json_schema": {
-            "name": contract.name,
-            "schema": contract.schema,
-            "strict": contract.strict,
-        },
-    }
-
-
-def _response_format_fallback_for_spec(spec: StructuredTaskSpec, *, final_output: bool = True) -> dict[str, Any] | None:
-    return None
+    return spec.output_contract.response_format()
 
 
 @dataclass(slots=True)
@@ -403,7 +320,10 @@ class StructuredTaskRunner:
                     tool_history=tool_history,
                     iterations=iterations,
                     tool_calls_used=tool_calls_used,
-                    metadata={"model": spec.model or self.settings.model},
+                    metadata={
+                        "model": spec.model or self.settings.model,
+                        "contract_name": spec.output_contract.name if spec.output_contract is not None else None,
+                    },
                 )
 
             if tool_calls_used >= spec.max_tool_calls:
@@ -460,7 +380,7 @@ class StructuredTaskRunner:
     ) -> LLMCompletionResult:
         options = LLMCallOptions(
             response_format=_response_format_for_spec(spec, final_output=final_output),
-            response_format_fallback=_response_format_fallback_for_spec(spec, final_output=final_output),
+            response_format_fallback=None,
             max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens) if final_output else None,
             metadata={"structured_task_id": spec.task_id, **spec.metadata},
         )
@@ -497,7 +417,7 @@ class StructuredTaskRunner:
     ) -> LLMCompletionResult:
         options = LLMCallOptions(
             response_format=_response_format_for_spec(spec, final_output=True),
-            response_format_fallback=_response_format_fallback_for_spec(spec, final_output=True),
+            response_format_fallback=None,
             max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens),
             metadata={
                 "structured_task_id": spec.task_id,
@@ -505,16 +425,24 @@ class StructuredTaskRunner:
                 **spec.metadata,
             },
         )
+        if spec.output_contract is None:
+            final_instruction = (
+                f"{failure_reason} No more tools are available. "
+                "Return the best possible final answer now, using only the evidence already present "
+                "in the transcript. Do not request tools."
+            )
+        else:
+            final_instruction = (
+                f"{failure_reason} No more tools are available. "
+                "Return the best possible final JSON object now, using only the evidence already present "
+                "in the transcript. Do not request tools. Return one JSON object only, with no prose, "
+                "no markdown fences, and no second JSON object after it."
+            )
         final_messages = [
             *messages,
             LLMMessage(
                 role="system",
-                content=(
-                    f"{failure_reason} No more tools are available. "
-                    "Return the best possible final JSON object now, using only the evidence already present "
-                    "in the transcript. Do not request tools. Return one JSON object only, with no prose, "
-                    "no markdown fences, and no second JSON object after it."
-                ),
+                content=final_instruction,
             ),
         ]
         kwargs: dict[str, Any] = {
@@ -555,7 +483,6 @@ class StructuredTaskRunner:
         ]
 
     def _build_task_system_prompt(self, *, spec: StructuredTaskSpec) -> str:
-        output_schema = _output_schema_hint_for_spec(spec)
         lines = [
             f"Structured task id: {spec.task_id}",
             spec.system_prompt,
@@ -565,12 +492,6 @@ class StructuredTaskRunner:
             "- Use only the tools exposed in this run. Do not assume hidden tools exist.",
             "- Drive the task to a bounded conclusion within this one run.",
             "- Base conclusions only on observed evidence and tool results.",
-            "- Return exactly one JSON object when you are done.",
-            "- The final assistant message must contain only that one JSON object: no prose before it, no markdown fences, no comments, and no second JSON object after it.",
-            "- If you need to correct or revise the final output, produce one complete replacement JSON object instead of appending another object.",
-            "",
-            "Output schema or caller hint:",
-            json.dumps(output_schema, ensure_ascii=False, indent=2),
         ]
         if spec.output_contract is not None:
             lines.extend(
@@ -580,8 +501,13 @@ class StructuredTaskRunner:
                     f"- Contract name: {spec.output_contract.name}",
                     f"- Strict mode requested: {str(spec.output_contract.strict).lower()}",
                     "- The provider contract is enforced only for the final no-tool output, after investigation is complete.",
+                    "- Return exactly one JSON object when you are done.",
+                    "- The final assistant message must contain only that one JSON object: no prose before it, no markdown fences, no comments, and no second JSON object after it.",
                     "- Use the schema keys and canonical values exactly when the schema defines them.",
                     "- Put uncertainty, non-standard labels, or unresolved values in note/unknown fields instead of inventing new top-level keys.",
+                    "",
+                    "Output JSON Schema:",
+                    json.dumps(spec.output_contract.schema, ensure_ascii=False, indent=2),
                 ]
             )
             if spec.output_contract.instructions:
@@ -703,11 +629,9 @@ class StructuredTaskRunner:
         metadata: dict[str, Any],
     ) -> StructuredTaskResult:
         raw_content_chars = len(raw_content or "")
-        try:
-            payload, recovery_metadata = _load_json_output(raw_content)
-        except json.JSONDecodeError:
-            logger.warning(
-                "Structured task final output was invalid JSON",
+        if metadata.get("contract_name") is None:
+            logger.info(
+                "Structured task final text output accepted",
                 extra={
                     "task_id": task_id,
                     "raw_content_chars": raw_content_chars,
@@ -717,24 +641,25 @@ class StructuredTaskRunner:
                 },
             )
             return StructuredTaskResult(
-                ok=False,
+                ok=True,
                 task_id=task_id,
+                output=None,
                 raw_content=raw_content,
-                failure_reason="Structured task returned invalid JSON output.",
                 tool_history=tool_history,
                 iterations=iterations,
                 tool_calls_used=tool_calls_used,
-                metadata=metadata,
+                metadata={**metadata, "final_output_mode": "text"},
             )
 
-        if not isinstance(payload, dict):
+        try:
+            payload = parse_json_object(raw_content, target_name=task_id)
+        except (json.JSONDecodeError, ValueError):
             logger.warning(
-                "Structured task final output was not a JSON object",
+                "Structured task final schema output was invalid JSON",
                 extra={
                     "task_id": task_id,
                     "raw_content_chars": raw_content_chars,
                     "raw_content_approx_tokens": _approx_token_count_from_chars(raw_content_chars),
-                    "output_type": type(payload).__name__,
                     "iterations": iterations,
                     "tool_calls_used": tool_calls_used,
                 },
@@ -743,7 +668,7 @@ class StructuredTaskRunner:
                 ok=False,
                 task_id=task_id,
                 raw_content=raw_content,
-                failure_reason="Structured task returned a non-object JSON output.",
+                failure_reason="Structured task returned invalid JSON Schema output.",
                 tool_history=tool_history,
                 iterations=iterations,
                 tool_calls_used=tool_calls_used,
@@ -752,7 +677,7 @@ class StructuredTaskRunner:
 
         output_compact_chars = _jsonish_char_count(payload)
         logger.info(
-            "Structured task final output parsed",
+            "Structured task final schema output parsed",
             extra={
                 "task_id": task_id,
                 "raw_content_chars": raw_content_chars,
@@ -762,7 +687,6 @@ class StructuredTaskRunner:
                 "output_top_level_key_count": len(payload),
                 "iterations": iterations,
                 "tool_calls_used": tool_calls_used,
-                "json_recovery_applied": bool(recovery_metadata.get("json_recovery_applied")),
             },
         )
         return StructuredTaskResult(
@@ -773,7 +697,7 @@ class StructuredTaskRunner:
             tool_history=tool_history,
             iterations=iterations,
             tool_calls_used=tool_calls_used,
-            metadata={**metadata, **recovery_metadata},
+            metadata={**metadata, "final_output_mode": "json_schema"},
         )
 
     def _finalize_after_budget(
@@ -827,6 +751,7 @@ class StructuredTaskRunner:
                 "model": spec.model or self.settings.model,
                 "forced_finalization": True,
                 "budget_failure_reason": failure_reason,
+                "contract_name": spec.output_contract.name if spec.output_contract is not None else None,
             },
         )
         if finalized.ok:

@@ -10,6 +10,19 @@ Investigation state is domain-agnostic. It stores concise, auditable artifacts o
 
 Domain-specific behavior still belongs in `DomainHooks`, tools, or an external domain package. Core investigation prompts intentionally avoid domain-specific assumptions.
 
+The final answer from `investigate` and `deep_investigate` is text by default.
+Internal planning, reflection, decision and critique phases synthesize JSON
+state, but this does not make JSON a public output mode. Use
+`final_output_mode="json_schema"` with a `StructuredOutputContract` when a
+caller needs a tool-backed investigation whose final phase is forced to one
+provider-enforced JSON Schema object. The schema rendering happens in a final
+no-tool model call and does not alter the configured reasoning options.
+
+Set `RunOptions.recover_internal_synthesis_errors=True` for interactive
+conversation surfaces that should continue when internal JSON state synthesis is
+malformed. Leave it `False` for batch or pipeline flows where malformed
+structured state should fail loudly.
+
 ```python
 from agent_core import RunOptions
 
