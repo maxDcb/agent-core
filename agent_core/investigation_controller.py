@@ -244,21 +244,23 @@ class InvestigationController:
         state: InvestigationState,
         iterations_used: int,
         no_progress_iterations: int,
+        tool_step: ToolExecutionStepResult | None = None,
     ) -> AgentTurnResult:
+        completed_tool_step = tool_step or ToolExecutionStepResult(
+            messages=pending.messages,
+            tool_messages=pending.tool_messages,
+            exchange_index=pending.exchange_index,
+            tool_calls_used=pending.tool_calls_used,
+            tool_statuses=pending.tool_statuses or [pending.tool_status],
+            tool_names=pending.tool_names or [str(pending.pending_payload.get("tool_name") or "unknown")],
+        )
         result, no_progress_iterations = self._reflect_and_decide_after_tools(
             user_input=pending.user_input,
             turn_index=pending.turn_index,
             options=options,
             state=state,
-            messages=pending.messages,
-            tool_step=ToolExecutionStepResult(
-                messages=pending.messages,
-                tool_messages=pending.tool_messages,
-                exchange_index=pending.exchange_index,
-                tool_calls_used=pending.tool_calls_used,
-                tool_statuses=[pending.tool_status],
-                tool_names=[str(pending.pending_payload.get("tool_name") or "unknown")],
-            ),
+            messages=completed_tool_step.messages,
+            tool_step=completed_tool_step,
             iterations_used=iterations_used,
             no_progress_iterations=no_progress_iterations,
         )
@@ -269,13 +271,13 @@ class InvestigationController:
             user_input=pending.user_input,
             session_id=session_id,
             context=context,
-            messages=pending.messages,
+            messages=completed_tool_step.messages,
             turn_index=pending.turn_index,
             options=options,
             state=state,
             iterations_used=iterations_used,
-            tool_calls_used=pending.tool_calls_used,
-            exchange_index=pending.exchange_index,
+            tool_calls_used=completed_tool_step.tool_calls_used,
+            exchange_index=completed_tool_step.exchange_index,
             no_progress_iterations=no_progress_iterations,
         )
 

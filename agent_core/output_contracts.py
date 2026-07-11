@@ -57,9 +57,10 @@ class StructuredOutputContract:
             return value
         if not isinstance(value, dict):
             return None
+        raw_schema = value.get("schema")
         return cls(
             name=value.get("name") or "structured_output",
-            schema=value.get("schema") if isinstance(value.get("schema"), dict) else {},
+            schema=dict(raw_schema) if isinstance(raw_schema, dict) else {},
             strict=bool(value.get("strict", True)),
             instructions=_clean_string_list(value.get("instructions")),
         )

@@ -11,7 +11,7 @@ from agent_core.execution_context import (
     effective_allowed_http_methods,
     effective_allowed_read_roots,
 )
-from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.output_contracts import StructuredOutputContract, parse_json_object
@@ -326,19 +326,13 @@ class StructuredTaskRunner:
                     },
                 )
 
-            if tool_calls_used >= spec.max_tool_calls:
-                return self._finalize_after_budget(
-                    spec=spec,
-                    messages=messages,
-                    raw_failure_content=llm_response.content,
-                    failure_reason="Maximum number of structured task tool calls reached.",
-                    tool_history=tool_history,
-                    iterations=iterations,
-                    tool_calls_used=tool_calls_used,
-                )
-
-            for tool_call in llm_response.tool_calls:
+            for tool_call_offset, tool_call in enumerate(llm_response.tool_calls):
                 if tool_calls_used >= spec.max_tool_calls:
+                    self._append_budget_exhausted_tool_responses(
+                        messages=messages,
+                        tool_calls=llm_response.tool_calls[tool_call_offset:],
+                        tool_history=tool_history,
+                    )
                     return self._finalize_after_budget(
                         spec=spec,
                         messages=messages,
@@ -369,6 +363,25 @@ class StructuredTaskRunner:
             iterations=iterations,
             tool_calls_used=tool_calls_used,
         )
+
+    def _append_budget_exhausted_tool_responses(
+        self,
+        *,
+        messages: list[LLMMessage],
+        tool_calls: list[LLMToolCall],
+        tool_history: list[dict[str, Any]],
+    ) -> None:
+        for tool_call in tool_calls:
+            content = f"Tool call skipped: maximum tool-call budget reached before executing {tool_call.name}."
+            messages.append(LLMMessage(role="tool", tool_call_id=tool_call.id, content=content))
+            tool_history.append(
+                {
+                    "tool_name": tool_call.name,
+                    "arguments": {},
+                    "status": "budget_exhausted",
+                    "content_preview": content,
+                }
+            )
 
     def _call_model_once(
         self,
@@ -769,6 +782,8 @@ class StructuredTaskRunner:
         iterations: int,
         tool_calls_used: int,
     ) -> StructuredTaskResult:
+        if spec.output_contract is None:
+            raise ValueError("Contract finalization requires an output contract")
         try:
             llm_response = self._call_model_for_final_output(
                 spec=spec,

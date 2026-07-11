@@ -599,3 +599,45 @@ def test_structured_task_runner_forces_schema_finalization_after_iteration_budge
         assert result.metadata["forced_finalization"] is True
         assert result.metadata["budget_failure_reason"] == "Maximum number of structured task iterations reached."
         assert provider.last_tools == []
+
+
+def test_structured_task_budget_answers_every_tool_call_before_finalization() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        registry = ToolRegistry()
+        registry.register(EchoTool())
+        provider = FakeProvider(
+            [
+                LLMCompletionResult(
+                    content="",
+                    tool_calls=[
+                        LLMToolCall(id="call-1", name="echo_tool", arguments_json=json.dumps({"value": "run"})),
+                        LLMToolCall(id="call-2", name="echo_tool", arguments_json=json.dumps({"value": "skip"})),
+                    ],
+                ),
+                LLMCompletionResult(content="finalized"),
+            ]
+        )
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=provider,
+            tool_registry=registry,
+            policy_engine=PolicyEngine(),
+        )
+
+        result = runner.run(
+            spec=StructuredTaskSpec(
+                task_id="partial_tool_budget",
+                system_prompt="Use tools when useful.",
+                objective="Exercise a partial tool-call budget.",
+                allowed_tools=["echo_tool"],
+                max_iterations=2,
+                max_tool_calls=1,
+            )
+        )
+
+        assert result.ok is True
+        tool_messages = [message for message in provider.last_messages if message.role == "tool"]
+        assert [message.tool_call_id for message in tool_messages] == ["call-1", "call-2"]
+        assert "maximum tool-call budget" in tool_messages[1].content
+        assert [item["status"] for item in result.tool_history] == ["ok", "budget_exhausted"]
