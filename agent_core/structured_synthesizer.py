@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from inspect import Parameter, signature
-from typing import Any, Callable, Generic, TypeVar
+from typing import Any, Generic, TypeVar
 
-from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage
+from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.settings import CoreSettings
 
 logger = get_logger(__name__)

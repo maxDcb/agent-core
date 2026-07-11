@@ -3,10 +3,10 @@ from __future__ import annotations
 from typing import Any
 
 from agent_core.execution_context import ExecutionContext
-from agent_core.logging_utils import get_logger
-from agent_core.types import ToolResult
 from agent_core.llm.base import LLMToolDefinition
+from agent_core.logging_utils import get_logger
 from agent_core.tools import BaseTool
+from agent_core.types import ToolResult
 
 logger = get_logger(__name__)
 
@@ -36,7 +36,7 @@ class ToolRegistry:
     def get_tool(self, tool_name: str) -> BaseTool | None:
         return self._tools.get(tool_name)
 
-    def build_subset(self, tool_names: list[str]) -> "ToolRegistry":
+    def build_subset(self, tool_names: list[str]) -> ToolRegistry:
         subset = ToolRegistry()
         for tool_name in tool_names:
             tool = self.get_tool(tool_name)

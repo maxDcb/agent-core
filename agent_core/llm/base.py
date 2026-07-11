@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
 
-
 LLMMessageRole = Literal["system", "user", "assistant", "tool"]
 
 
@@ -14,7 +13,7 @@ class LLMToolCall:
     arguments_json: str
 
     @classmethod
-    def from_history_dict(cls, payload: dict[str, Any]) -> "LLMToolCall | None":
+    def from_history_dict(cls, payload: dict[str, Any]) -> LLMToolCall | None:
         tool_call_id = payload.get("id")
         function_payload = payload.get("function")
         if not isinstance(tool_call_id, str) or not isinstance(function_payload, dict):
@@ -49,7 +48,7 @@ class LLMMessage:
     tool_calls: list[LLMToolCall] = field(default_factory=list)
 
     @classmethod
-    def from_history_dict(cls, payload: dict[str, Any]) -> "LLMMessage":
+    def from_history_dict(cls, payload: dict[str, Any]) -> LLMMessage:
         role = str(payload.get("role", "user"))
         content = str(payload.get("content", ""))
         tool_calls = [

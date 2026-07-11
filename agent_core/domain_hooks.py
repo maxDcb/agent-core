@@ -4,11 +4,11 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from agent_core.investigation_prompts import InvestigationPromptSet
-    from agent_core.run_options import RunOptions
     from agent_core.memory.context_block import ContextBlock
-    from agent_core.settings import CoreSettings
     from agent_core.memory.thread_state import ThreadState
+    from agent_core.run_options import RunOptions
     from agent_core.session_manager import SessionManager
+    from agent_core.settings import CoreSettings
 
 
 class DomainHooks:

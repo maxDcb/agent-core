@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import json
+from dataclasses import dataclass, field
 from typing import Any, Literal
 
 
@@ -80,7 +80,7 @@ class StepReflection:
         }
 
     @classmethod
-    def from_any(cls, payload: object) -> "StepReflection | None":
+    def from_any(cls, payload: object) -> StepReflection | None:
         if isinstance(payload, StepReflection):
             return payload
         if not isinstance(payload, dict):
@@ -103,7 +103,7 @@ class StepReflection:
         )
 
     @classmethod
-    def create_template(cls) -> "StepReflection":
+    def create_template(cls) -> StepReflection:
         return cls(observation_summary="")
 
 
@@ -128,7 +128,7 @@ class InvestigationDecision:
         }
 
     @classmethod
-    def from_any(cls, payload: object) -> "InvestigationDecision | None":
+    def from_any(cls, payload: object) -> InvestigationDecision | None:
         if isinstance(payload, InvestigationDecision):
             return payload
         if not isinstance(payload, dict):
@@ -146,7 +146,7 @@ class InvestigationDecision:
         )
 
     @classmethod
-    def create_template(cls) -> "InvestigationDecision":
+    def create_template(cls) -> InvestigationDecision:
         return cls(kind="continue", reason_summary="", next_action=None, question=None)
 
 
@@ -168,7 +168,7 @@ class FinalCritique:
         }
 
     @classmethod
-    def from_any(cls, payload: object) -> "FinalCritique | None":
+    def from_any(cls, payload: object) -> FinalCritique | None:
         if isinstance(payload, FinalCritique):
             return payload
         if not isinstance(payload, dict):
@@ -185,5 +185,5 @@ class FinalCritique:
         )
 
     @classmethod
-    def create_template(cls) -> "FinalCritique":
+    def create_template(cls) -> FinalCritique:
         return cls(approved=False)

@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from agent_core.llm.base import LLMMessage
 from agent_core.memory.context_block import ContextBlock
 from agent_core.memory.history_compactor import CompactionPolicy, HistoryCompactor
 from agent_core.memory.thread_state import ThreadState, render_context_blocks_to_messages
 from agent_core.session_manager import SessionManager
 from agent_core.settings import CoreSettings
-from agent_core.llm.base import LLMMessage
 
 
 @dataclass(slots=True)

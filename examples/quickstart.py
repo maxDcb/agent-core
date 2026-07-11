@@ -13,6 +13,7 @@ from agent_core import (
     CoreSettings,
     ExecutionContext,
     PolicyEngine,
+    RunContext,
     SessionManager,
     SessionRepository,
     StructuredOutputContract,
@@ -25,7 +26,6 @@ from agent_core import (
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
 from agent_core.llm.provider_factory import build_memory_provider, build_provider, normalize_provider_name
-
 
 DEFAULT_PROMPT = "What time is it? Use get_current_time, then answer in one sentence."
 DEMO_STATE_DIR = Path(".agent-core-demo")
@@ -159,7 +159,11 @@ def build_orchestrator(settings: CoreSettings) -> AgentOrchestrator:
 
 
 def run_prompt(orchestrator: AgentOrchestrator, prompt: str, *, session_id: str) -> None:
-    result = orchestrator.run_turn_result(prompt, session_id=session_id)
+    result = orchestrator.run_turn_result(
+        user_input=prompt,
+        thread_id=session_id,
+        context=RunContext(namespace_id=session_id, thread_id=session_id),
+    )
     print(result.content)
     if result.is_pending:
         print(f"\nPending tool result: {result.pending_id}")
@@ -330,7 +334,11 @@ def _run_structured_task_check(settings: CoreSettings, provider: BaseLLMProvider
             ),
             allowed_tools=[],
             max_iterations=1,
-        )
+        ),
+        context=ExecutionContext.from_run_context(
+            context=RunContext(namespace_id="compatibility", run_id="compatibility-check"),
+            settings=settings,
+        ),
     )
     output = result.output or {}
     output_matches = result.ok and output.get("ok") is True and output.get("component") == "structured_task"

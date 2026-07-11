@@ -51,7 +51,7 @@ class ContextBudget:
     status: ContextBudgetStatus
 
     @classmethod
-    def from_estimate(cls, *, estimated_prompt_tokens: int, context_window_tokens: int | None) -> "ContextBudget":
+    def from_estimate(cls, *, estimated_prompt_tokens: int, context_window_tokens: int | None) -> ContextBudget:
         if context_window_tokens is None or context_window_tokens <= 0:
             return cls(
                 estimated_prompt_tokens=max(0, estimated_prompt_tokens),
@@ -77,7 +77,7 @@ class ContextBudget:
         )
 
     @classmethod
-    def from_any(cls, payload: Any) -> "ContextBudget | None":
+    def from_any(cls, payload: Any) -> ContextBudget | None:
         data = _coerce_dict(payload)
         if not data:
             return None
@@ -113,7 +113,7 @@ class PromptBlock:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def from_message(cls, *, message: LLMMessage, index: int, is_last: bool) -> "PromptBlock":
+    def from_message(cls, *, message: LLMMessage, index: int, is_last: bool) -> PromptBlock:
         history_payload = message.to_history_dict()
         block_type = _classify_message(message=message, index=index, is_last=is_last)
         return cls(
@@ -132,7 +132,7 @@ class PromptBlock:
         )
 
     @classmethod
-    def from_any(cls, payload: Any) -> "PromptBlock | None":
+    def from_any(cls, payload: Any) -> PromptBlock | None:
         data = _coerce_dict(payload)
         if not data:
             return None
@@ -187,7 +187,7 @@ class PromptSnapshot:
         messages: list[LLMMessage],
         context_window_tokens: int | None,
         extra_blocks: list[PromptBlock] | None = None,
-    ) -> "PromptSnapshot":
+    ) -> PromptSnapshot:
         blocks = [
             PromptBlock.from_message(
                 message=message,
@@ -213,7 +213,7 @@ class PromptSnapshot:
         )
 
     @classmethod
-    def from_any(cls, payload: Any) -> "PromptSnapshot | None":
+    def from_any(cls, payload: Any) -> PromptSnapshot | None:
         data = _coerce_dict(payload)
         if not data:
             return None
@@ -267,7 +267,7 @@ class TraceEvent:
         payload: dict[str, Any] | None = None,
         related_tool_call_id: str | None = None,
         related_prompt_block_ids: list[str] | None = None,
-    ) -> "TraceEvent":
+    ) -> TraceEvent:
         return cls(
             event_id=event_id,
             timestamp=utc_now_iso(),
@@ -280,7 +280,7 @@ class TraceEvent:
         )
 
     @classmethod
-    def from_any(cls, payload: Any) -> "TraceEvent | None":
+    def from_any(cls, payload: Any) -> TraceEvent | None:
         data = _coerce_dict(payload)
         if not data:
             return None
@@ -345,7 +345,7 @@ class RunTrace:
         turn_index: int,
         options: dict[str, Any] | None = None,
         prompt_snapshot: PromptSnapshot | None = None,
-    ) -> "RunTrace":
+    ) -> RunTrace:
         trace = cls(
             run_id=run_id,
             session_id=session_id,
@@ -373,7 +373,7 @@ class RunTrace:
         return trace
 
     @classmethod
-    def from_any(cls, payload: Any) -> "RunTrace | None":
+    def from_any(cls, payload: Any) -> RunTrace | None:
         data = _coerce_dict(payload)
         if not data:
             return None

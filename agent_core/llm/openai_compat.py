@@ -1,16 +1,15 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from email.utils import parsedate_to_datetime
 import os
 import random
 import time
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, BadRequestError, RateLimitError
 
 from agent_core.llm.openai_request_policy import OpenAIModelCapabilityResolver, select_bad_request_retry_action
-
 
 DEFAULT_RATE_LIMIT_MAX_ATTEMPTS = 5
 DEFAULT_RATE_LIMIT_INITIAL_DELAY_SECONDS = 10.0
@@ -28,7 +27,7 @@ class OpenAIRateLimitRetryPolicy:
     jitter_ratio: float = DEFAULT_RATE_LIMIT_JITTER_RATIO
 
     @classmethod
-    def from_env(cls, prefix: str = "AGENT_CORE_LLM_RETRY_") -> "OpenAIRateLimitRetryPolicy":
+    def from_env(cls, prefix: str = "AGENT_CORE_LLM_RETRY_") -> OpenAIRateLimitRetryPolicy:
         return cls(
             max_attempts=_env_int(f"{prefix}MAX_ATTEMPTS", DEFAULT_RATE_LIMIT_MAX_ATTEMPTS),
             initial_delay_seconds=_env_float(

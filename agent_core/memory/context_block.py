@@ -66,7 +66,7 @@ class ContextBlock:
         }
 
     @classmethod
-    def from_dict(cls, payload: object) -> "ContextBlock | None":
+    def from_dict(cls, payload: object) -> ContextBlock | None:
         if not isinstance(payload, dict):
             return None
 

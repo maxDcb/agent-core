@@ -5,20 +5,15 @@ from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any
 
-from agent_core.execution_context import (
-    ExecutionContext,
-    effective_allowed_http_hosts,
-    effective_allowed_http_methods,
-    effective_allowed_read_roots,
-)
-from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage
+from agent_core.execution_context import ExecutionContext
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.output_contracts import StructuredOutputContract, parse_json_object
 from agent_core.policy_engine import PolicyEngine
 from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
-from agent_core.types import ToolExecutionStatus, build_empty_session_state
+from agent_core.types import ToolExecutionStatus
 
 logger = get_logger(__name__)
 
@@ -243,8 +238,7 @@ class StructuredTaskRunner:
         self,
         *,
         spec: StructuredTaskSpec,
-        session_id: str = "default",
-        session_state: dict[str, Any] | None = None,
+        context: ExecutionContext,
     ) -> StructuredTaskResult:
         try:
             registry = self.tool_registry.build_subset(spec.allowed_tools)
@@ -255,12 +249,7 @@ class StructuredTaskRunner:
                 failure_reason=str(exc),
             )
 
-        context = ExecutionContext(
-            session_id=session_id,
-            settings=self.settings,
-            session_state=session_state or build_empty_session_state(session_id=session_id),
-        )
-        messages = self._build_messages(spec=spec, session_id=session_id, session_state=context.session_state)
+        messages = self._build_messages(spec=spec, context=context)
         tool_history: list[dict[str, Any]] = []
         iterations = 0
         tool_calls_used = 0
@@ -326,19 +315,13 @@ class StructuredTaskRunner:
                     },
                 )
 
-            if tool_calls_used >= spec.max_tool_calls:
-                return self._finalize_after_budget(
-                    spec=spec,
-                    messages=messages,
-                    raw_failure_content=llm_response.content,
-                    failure_reason="Maximum number of structured task tool calls reached.",
-                    tool_history=tool_history,
-                    iterations=iterations,
-                    tool_calls_used=tool_calls_used,
-                )
-
-            for tool_call in llm_response.tool_calls:
+            for tool_call_offset, tool_call in enumerate(llm_response.tool_calls):
                 if tool_calls_used >= spec.max_tool_calls:
+                    self._append_budget_exhausted_tool_responses(
+                        messages=messages,
+                        tool_calls=llm_response.tool_calls[tool_call_offset:],
+                        tool_history=tool_history,
+                    )
                     return self._finalize_after_budget(
                         spec=spec,
                         messages=messages,
@@ -369,6 +352,25 @@ class StructuredTaskRunner:
             iterations=iterations,
             tool_calls_used=tool_calls_used,
         )
+
+    def _append_budget_exhausted_tool_responses(
+        self,
+        *,
+        messages: list[LLMMessage],
+        tool_calls: list[LLMToolCall],
+        tool_history: list[dict[str, Any]],
+    ) -> None:
+        for tool_call in tool_calls:
+            content = f"Tool call skipped: maximum tool-call budget reached before executing {tool_call.name}."
+            messages.append(LLMMessage(role="tool", tool_call_id=tool_call.id, content=content))
+            tool_history.append(
+                {
+                    "tool_name": tool_call.name,
+                    "arguments": {},
+                    "status": "budget_exhausted",
+                    "content_preview": content,
+                }
+            )
 
     def _call_model_once(
         self,
@@ -472,13 +474,12 @@ class StructuredTaskRunner:
         self,
         *,
         spec: StructuredTaskSpec,
-        session_id: str,
-        session_state: dict[str, Any],
+        context: ExecutionContext,
     ) -> list[LLMMessage]:
         return [
             LLMMessage(role="system", content=self.settings.base_system_prompt),
             LLMMessage(role="system", content=self._build_task_system_prompt(spec=spec)),
-            LLMMessage(role="system", content=self._build_scope_prompt_block(session_id=session_id, session_state=session_state)),
+            LLMMessage(role="system", content=self._build_scope_prompt_block(context=context)),
             LLMMessage(role="user", content=json.dumps(spec.to_payload(), ensure_ascii=False, indent=2)),
         ]
 
@@ -515,14 +516,15 @@ class StructuredTaskRunner:
                 lines.extend(f"  - {instruction}" for instruction in spec.output_contract.instructions)
         return "\n".join(lines)
 
-    def _build_scope_prompt_block(self, *, session_id: str, session_state: dict[str, Any]) -> str:
-        allowed_roots = [str(path.resolve()) for path in effective_allowed_read_roots(self.settings, session_state)]
+    def _build_scope_prompt_block(self, *, context: ExecutionContext) -> str:
+        allowed_roots = [str(path.resolve()) for path in context.allowed_read_roots()]
         knowledge_root = str(self.settings.knowledge_base_dir.resolve())
-        allowed_hosts = effective_allowed_http_hosts(self.settings, session_state)
-        allowed_methods = effective_allowed_http_methods(self.settings, session_state)
+        allowed_hosts = context.allowed_http_hosts()
+        allowed_methods = context.allowed_http_methods()
         lines = [
             "Execution scope:",
-            f"- Parent session ID: {session_id}",
+            f"- Namespace ID: {context.namespace_id}",
+            f"- Run ID: {context.run_id}",
             "- Allowed local code roots:",
         ]
         if allowed_roots:
@@ -572,7 +574,8 @@ class StructuredTaskRunner:
             logger.info(
                 "Structured task tool call started",
                 extra={
-                    "session_id": context.session_id,
+                    "namespace_id": context.namespace_id,
+                    "run_id": context.run_id,
                     "tool_name": tool_name,
                     "argument_keys": sorted(arguments.keys()),
                     "arguments_summary": _safe_tool_argument_summary(arguments),
@@ -585,7 +588,8 @@ class StructuredTaskRunner:
                 logger.info(
                     "Structured task tool call denied",
                     extra={
-                        "session_id": context.session_id,
+                        "namespace_id": context.namespace_id,
+                        "run_id": context.run_id,
                         "tool_name": tool_name,
                         "reason": authz.reason,
                     },
@@ -598,7 +602,8 @@ class StructuredTaskRunner:
                     logger.info(
                         "Structured task tool call completed",
                         extra={
-                            "session_id": context.session_id,
+                            "namespace_id": context.namespace_id,
+                            "run_id": context.run_id,
                             "tool_name": tool_name,
                             "status": tool_status,
                             "content_length": len(tool_content),
@@ -769,6 +774,8 @@ class StructuredTaskRunner:
         iterations: int,
         tool_calls_used: int,
     ) -> StructuredTaskResult:
+        if spec.output_contract is None:
+            raise ValueError("Contract finalization requires an output contract")
         try:
             llm_response = self._call_model_for_final_output(
                 spec=spec,

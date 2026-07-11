@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.policy_engine import PolicyEngine
@@ -14,6 +16,7 @@ from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
+from tests.run_helpers import run_turn
 
 
 def task_state_payload() -> dict[str, Any]:
@@ -137,6 +140,24 @@ def event_types(trace_payload: dict[str, object]) -> set[str]:
     return {event["type"] for event in events if isinstance(event, dict)}
 
 
+@pytest.mark.chaos
+def test_trace_persistence_failure_does_not_fail_user_turn(tmp_path, monkeypatch) -> None:
+    orchestrator = build_orchestrator(
+        tmp_path,
+        ScriptedProvider(chat=[LLMCompletionResult(content="answer survives trace failure")]),
+    )
+
+    def fail_trace_save(trace: object) -> None:
+        raise OSError("simulated trace storage failure")
+
+    monkeypatch.setattr(orchestrator.session_manager, "save_run_trace", fail_trace_save)
+    result = run_turn(orchestrator, "answer directly")
+
+    assert result.status == "completed"
+    assert result.content == "answer survives trace failure"
+    assert [block.kind for block in orchestrator.session_manager.get_context_blocks()] == ["conversation_turn"]
+
+
 def test_prompt_snapshot_tracks_messages_and_context_budget() -> None:
     snapshot = PromptSnapshot.from_messages(
         messages=[
@@ -189,14 +210,14 @@ def test_session_repository_stores_state_under_session_directory(tmp_path) -> No
     assert loaded["tool_history"] == [{"tool_name": "search_code", "status": "ok"}]
 
 
-def test_direct_run_persists_tool_audit_trace_without_changing_default_metadata(tmp_path) -> None:
+def test_direct_run_persists_tool_audit_trace_and_exposes_run_id(tmp_path) -> None:
     provider = ScriptedProvider(chat=[tool_call(), LLMCompletionResult(content="final")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result("echo")
+    result = run_turn(orchestrator, "echo")
 
     assert result.status == "completed"
-    assert result.metadata == {}
+    assert result.metadata["run_trace_id"].startswith("test-run-")
     summaries = orchestrator.session_manager.list_run_traces()
     assert len(summaries) == 1
     trace_payload = orchestrator.session_manager.load_run_trace(str(summaries[0]["run_id"]))
@@ -218,7 +239,7 @@ def test_investigation_run_persists_process_events_and_trace_id(tmp_path) -> Non
     provider = ScriptedProvider(chat=[tool_call(value="fact")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )

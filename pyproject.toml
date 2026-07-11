@@ -32,9 +32,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "build>=1.2.0",
+    "hypothesis>=6.100.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "mypy>=1.0.0",
+    "ruff>=0.5.0",
 ]
 
 [project.urls]
@@ -54,9 +56,33 @@ agent_core = ["py.typed"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = ["test_*.py"]
+addopts = "--strict-markers"
+markers = [
+    "chaos: deterministic fault-injection and resilience tests",
+]
 
 [tool.mypy]
 python_version = "3.11"
 warn_return_any = true
 warn_unused_configs = true
-disallow_untyped_defs = false
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+extend-exclude = ["build", "dist"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
+
+[tool.coverage.run]
+branch = true
+source = ["agent_core"]
+
+[tool.coverage.report]
+fail_under = 75
+show_missing = true
+skip_covered = true

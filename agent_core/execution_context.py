@@ -4,58 +4,56 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from agent_core.run_context import ExecutionScope, RunContext
 from agent_core.settings import CoreSettings
 
 
-EXECUTION_SCOPE_STATE_KEY = "execution_scope"
+def effective_allowed_read_roots(settings: CoreSettings, scope: ExecutionScope) -> list[Path]:
+    roots = scope.allowed_read_roots
+    return [path.resolve() for path in (roots if roots is not None else tuple(settings.allowed_read_roots))]
 
 
-def _scope_from_state(session_state: dict[str, Any]) -> dict[str, Any]:
-    scope = session_state.get(EXECUTION_SCOPE_STATE_KEY)
-    return scope if isinstance(scope, dict) else {}
+def effective_allowed_http_hosts(settings: CoreSettings, scope: ExecutionScope) -> list[str]:
+    hosts = scope.allowed_http_hosts
+    return list(hosts if hosts is not None else tuple(settings.allowed_http_hosts))
 
 
-def _clean_string_list(raw_value: object) -> list[str]:
-    if not isinstance(raw_value, list):
-        return []
-    cleaned: list[str] = []
-    for item in raw_value:
-        if isinstance(item, str) and item.strip():
-            cleaned.append(item.strip())
-    return cleaned
-
-
-def effective_allowed_read_roots(settings: CoreSettings, session_state: dict[str, Any]) -> list[Path]:
-    scope_roots = _clean_string_list(_scope_from_state(session_state).get("allowed_read_roots"))
-    if scope_roots:
-        return [Path(root).resolve() for root in scope_roots]
-    return [root.resolve() for root in settings.allowed_read_roots]
-
-
-def effective_allowed_http_hosts(settings: CoreSettings, session_state: dict[str, Any]) -> list[str]:
-    scope_hosts = _clean_string_list(_scope_from_state(session_state).get("allowed_http_hosts"))
-    return scope_hosts or list(settings.allowed_http_hosts)
-
-
-def effective_allowed_http_methods(settings: CoreSettings, session_state: dict[str, Any]) -> list[str]:
-    scope_methods = _clean_string_list(_scope_from_state(session_state).get("allowed_http_methods"))
-    return [method.upper() for method in (scope_methods or settings.allowed_http_methods)]
+def effective_allowed_http_methods(settings: CoreSettings, scope: ExecutionScope) -> list[str]:
+    methods = scope.allowed_http_methods
+    selected = methods if methods is not None else tuple(settings.allowed_http_methods)
+    return [method.upper() for method in selected]
 
 
 @dataclass(slots=True)
 class ExecutionContext:
-    session_id: str
+    namespace_id: str
+    run_id: str
     settings: CoreSettings
-    session_state: dict[str, Any]
+    scope: ExecutionScope
+    correlation: dict[str, Any]
+    application_context: dict[str, Any]
+
+    @classmethod
+    def from_run_context(cls, *, context: RunContext, settings: CoreSettings) -> ExecutionContext:
+        if context.run_id is None:
+            raise ValueError("RunContext must have a run_id before tool execution")
+        return cls(
+            namespace_id=context.namespace_id,
+            run_id=context.run_id,
+            settings=settings,
+            scope=context.scope,
+            correlation=dict(context.correlation),
+            application_context=dict(context.application_context),
+        )
 
     def allowed_read_roots(self) -> list[Path]:
-        return effective_allowed_read_roots(self.settings, self.session_state)
+        return effective_allowed_read_roots(self.settings, self.scope)
 
     def allowed_http_hosts(self) -> list[str]:
-        return effective_allowed_http_hosts(self.settings, self.session_state)
+        return effective_allowed_http_hosts(self.settings, self.scope)
 
     def allowed_http_methods(self) -> list[str]:
-        return effective_allowed_http_methods(self.settings, self.session_state)
+        return effective_allowed_http_methods(self.settings, self.scope)
 
     def is_path_allowed(self, candidate: Path) -> bool:
         candidate = candidate.resolve()

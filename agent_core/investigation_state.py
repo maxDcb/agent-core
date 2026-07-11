@@ -79,7 +79,7 @@ class EvidenceItem:
         }
 
     @classmethod
-    def from_any(cls, payload: object) -> "EvidenceItem | None":
+    def from_any(cls, payload: object) -> EvidenceItem | None:
         if isinstance(payload, EvidenceItem):
             return payload
         if not isinstance(payload, dict):
@@ -121,7 +121,7 @@ class Hypothesis:
         }
 
     @classmethod
-    def from_any(cls, payload: object) -> "Hypothesis | None":
+    def from_any(cls, payload: object) -> Hypothesis | None:
         if isinstance(payload, Hypothesis):
             return payload
         if not isinstance(payload, dict):
@@ -173,7 +173,7 @@ class InvestigationState:
         }
 
     @classmethod
-    def from_any(cls, payload: object) -> "InvestigationState | None":
+    def from_any(cls, payload: object) -> InvestigationState | None:
         if isinstance(payload, InvestigationState):
             return payload
         if not isinstance(payload, dict):
@@ -211,10 +211,10 @@ class InvestigationState:
         )
 
     @classmethod
-    def create_template(cls, *, objective: str = "") -> "InvestigationState":
+    def create_template(cls, *, objective: str = "") -> InvestigationState:
         return cls(objective=objective, confidence=0.0)
 
-    def apply_reflection(self, reflection: StepReflection | dict[str, Any]) -> "InvestigationState":
+    def apply_reflection(self, reflection: StepReflection | dict[str, Any]) -> InvestigationState:
         parsed = StepReflection.from_any(reflection)
         if parsed is None:
             raise ValueError("Invalid step reflection")
@@ -248,7 +248,7 @@ class InvestigationState:
             self.stop_reason = parsed.stop_reason
         return self
 
-    def apply_critique(self, critique: FinalCritique | dict[str, Any]) -> "InvestigationState":
+    def apply_critique(self, critique: FinalCritique | dict[str, Any]) -> InvestigationState:
         parsed = FinalCritique.from_any(critique)
         if parsed is None:
             raise ValueError("Invalid final critique")

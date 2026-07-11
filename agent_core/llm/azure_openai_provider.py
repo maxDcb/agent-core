@@ -14,11 +14,11 @@ from openai import (
     RateLimitError,
 )
 
-from agent_core.logging_utils import get_logger
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
 from agent_core.llm.openai_compat import create_chat_completion_with_adaptive_retry
 from agent_core.llm.openai_request_policy import OpenAIChatRequestNormalizer, OpenAIModelCapabilityResolver
+from agent_core.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -138,7 +138,7 @@ class AzureOpenAIProvider:
         temperature: float,
         tools: list[LLMToolDefinition] | None,
         options: LLMCallOptions | None = None,
-    ):
+    ) -> Any:
         if not self.azure_endpoint_configured:
             raise LLMProviderError(
                 kind="configuration_error",

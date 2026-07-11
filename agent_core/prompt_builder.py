@@ -7,10 +7,11 @@ from agent_core.execution_context import (
     effective_allowed_http_methods,
     effective_allowed_read_roots,
 )
+from agent_core.llm.base import LLMMessage
 from agent_core.logging_utils import get_logger, safe_preview
+from agent_core.run_context import RunContext
 from agent_core.session_manager import SessionManager
 from agent_core.settings import CoreSettings
-from agent_core.llm.base import LLMMessage
 
 logger = get_logger(__name__)
 
@@ -43,10 +44,10 @@ class PromptBuilder:
             session_manager=session_manager,
         )
 
-    def build_messages(self, *, user_input: str) -> list[LLMMessage]:
+    def build_messages(self, *, user_input: str, context: RunContext) -> list[LLMMessage]:
         base_messages: list[LLMMessage] = [LLMMessage(role="system", content=self.settings.base_system_prompt)]
 
-        scope_block = self._build_scope_prompt_block()
+        scope_block = self._build_scope_prompt_block(context=context)
         if scope_block:
             base_messages.append(LLMMessage(role="system", content=scope_block))
 
@@ -76,17 +77,17 @@ class PromptBuilder:
         )
         return messages
 
-    def _build_scope_prompt_block(self) -> str:
-        session_state = self.session_manager.get_state()
-        allowed_roots = [str(path.resolve()) for path in effective_allowed_read_roots(self.settings, session_state)]
+    def _build_scope_prompt_block(self, *, context: RunContext) -> str:
+        allowed_roots = [str(path.resolve()) for path in effective_allowed_read_roots(self.settings, context.scope)]
         knowledge_root = str(self.settings.knowledge_base_dir.resolve())
-        allowed_hosts = effective_allowed_http_hosts(self.settings, session_state)
-        allowed_methods = effective_allowed_http_methods(self.settings, session_state)
-        session_id = self.session_manager.session_id or "default"
+        allowed_hosts = effective_allowed_http_hosts(self.settings, context.scope)
+        allowed_methods = effective_allowed_http_methods(self.settings, context.scope)
 
         lines = [
             "Execution scope:",
-            f"- Session ID: {session_id}",
+            f"- Namespace ID: {context.namespace_id}",
+            f"- Run ID: {context.run_id or '-'}",
+            f"- Thread ID: {context.thread_id or '-'}",
             "- Allowed local code roots:",
         ]
         if allowed_roots:

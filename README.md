@@ -18,7 +18,8 @@ public API may still evolve before `1.0.0`.
 - Run trace persistence with prompt snapshots, events and compact summaries
 - Generic structured task runner for bounded JSON-producing subtasks
 - Tool registry and small tool protocol
-- Session persistence and memory lifecycle helpers
+- Persisted, idempotent autonomous run lifecycle
+- Optional conversation threads and memory lifecycle helpers
 - Policy guardrail entry points for tool execution
 - Domain hooks for application-specific prompt and memory extensions
 - Provider adapters for OpenAI, Azure OpenAI and Azure Anthropic backends
@@ -91,13 +92,16 @@ resume example.
 
 ## Core Concepts
 
-- `AgentOrchestrator` coordinates one user turn from prompt build to provider
-  call, tool execution, memory persistence and optional trace persistence.
+- `RunContext` carries the namespace, run identity, execution scope,
+  correlation and caller-owned application context.
+- `AgentRunService` executes and persists autonomous headless runs without a
+  conversation or session manager.
+- `ConversationAgent` optionally adds thread memory and pending-tool resumes.
 - `ToolRegistry` stores application tools and exposes model-facing tool
   definitions.
 - `PolicyEngine` authorizes tool calls before execution.
-- `SessionManager` and `SessionRepository` persist conversation blocks, memory
-  state, metadata and run traces.
+- `RunStore` persists run state; `JsonFileRunStore` is the reference
+  single-process implementation.
 - `RunOptions` selects the execution mode and investigation budgets.
 - `DomainHooks` let applications add domain prompt blocks and memory payloads
   without adding domain logic to the core package.
@@ -117,10 +121,12 @@ investigation still runs normally, then a final no-tool turn renders the answer
 through the provider-enforced JSON Schema contract.
 
 ```python
-from agent_core import RunOptions
+from agent_core import RunContext, RunOptions
 
-result = orchestrator.run_turn_result(
-    "Investigate this issue using the available tools.",
+result = conversation_agent.execute_turn(
+    thread_id="incident-1",
+    context=RunContext(namespace_id="workspace-1", thread_id="incident-1"),
+    user_input="Investigate this issue using the available tools.",
     options=RunOptions.investigate(),
 )
 ```
@@ -157,7 +163,19 @@ spec = StructuredTaskSpec(
     ),
 )
 
-result = structured_task_runner.run(spec=spec, session_id="default")
+from agent_core import AgentRunService, JsonFileRunStore, RunContext
+
+service = AgentRunService(
+    settings=settings,
+    provider=provider,
+    tool_registry=tool_registry,
+    policy_engine=policy_engine,
+    run_store=JsonFileRunStore(".agent-core/runs"),
+)
+result = service.execute(
+    spec=spec,
+    context=RunContext(namespace_id="workspace-1", parent_id="job-1"),
+)
 ```
 
 ## Pending Tool Result Flow
@@ -177,8 +195,10 @@ The application stores the returned `pending_id`, then resumes the turn when the
 external result arrives:
 
 ```python
-completed = orchestrator.resume_turn(
-    pending_id=pending.pending_id,
+completed = conversation_agent.resume(
+    namespace_id="workspace-1",
+    run_id=pending.run_id,
+    pending_id=pending.metadata["pending_id"],
     tool_content="command output",
 )
 ```
@@ -189,24 +209,33 @@ completed = orchestrator.resume_turn(
 2. Create a `BaseLLMProvider` implementation or use a provider from
    `agent_core.llm`.
 3. Register tools in `ToolRegistry`.
-4. Instantiate `SessionRepository` and `SessionManager`.
-5. Instantiate `PolicyEngine`.
-6. Optionally implement `DomainHooks`.
-7. Build `AgentOrchestrator` and call `run_turn_result()`.
+4. Instantiate a `RunStore` and `PolicyEngine`.
+5. Build `AgentRunService` and execute a `StructuredTaskSpec` with an explicit
+   `RunContext`.
+6. Only if conversation is needed, add `SessionManager`, `AgentOrchestrator`
+   and `ConversationAgent`.
+
+See [docs/run_architecture.md](docs/run_architecture.md) for identifier,
+context, idempotence and pipeline ownership rules.
 
 ## Public API
 
 ```python
 from agent_core import (
     AgentOrchestrator,
+    AgentRunResult,
+    AgentRunService,
+    AgentRunState,
     AgentRunMode,
     AgentTurnResult,
     BaseTool,
     ContextBudget,
+    ConversationAgent,
     CoreSettings,
     DomainHooks,
     EvidenceItem,
     ExecutionContext,
+    ExecutionScope,
     FinalCritique,
     Hypothesis,
     InvestigationDecision,
@@ -217,6 +246,7 @@ from agent_core import (
     PromptBlock,
     PromptSnapshot,
     RunOptions,
+    RunStore,
     RunTrace,
     SessionManager,
     SessionRepository,
@@ -235,13 +265,22 @@ from agent_core import (
 ## Development Checks
 
 ```bash
-.venv/bin/python -m pytest
+.venv/bin/python -m ruff check agent_core tests examples
 .venv/bin/python -m mypy agent_core
+.venv/bin/python -m pytest
+.venv/bin/python -m pytest --cov=agent_core --cov-report=term
 .venv/bin/python -m build
 ```
+
+The coverage configuration measures branches and enforces a ratchetable global
+minimum. Deterministic fault-injection tests use the `chaos` marker and can be
+run separately with `python -m pytest -m chaos`. Property-based resilience
+tests are part of the normal suite; longer diagnostic runs are scheduled in CI.
 
 ## Repository Scope
 
 This repository should stay focused on the generic runtime. Domain packages
 should depend on it instead of adding their prompts, tools or reporting logic
 here.
+    JsonFileRunStore,
+    RunContext,

@@ -5,7 +5,6 @@ from typing import Any, Literal
 
 from openai import BadRequestError
 
-
 TemperatureMode = Literal["supported", "omit"]
 TokenLimitParameter = Literal["max_tokens", "max_completion_tokens"]
 

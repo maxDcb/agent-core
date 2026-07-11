@@ -47,11 +47,11 @@ class RunOptions:
             raise ValueError("final_output_contract requires final_output_mode json_schema")
 
     @classmethod
-    def direct(cls, **overrides: Any) -> "RunOptions":
+    def direct(cls, **overrides: Any) -> RunOptions:
         return cls(mode="direct", max_iterations=1, **overrides)
 
     @classmethod
-    def investigate(cls, **overrides: Any) -> "RunOptions":
+    def investigate(cls, **overrides: Any) -> RunOptions:
         defaults: dict[str, Any] = {
             "mode": "investigate",
             "max_iterations": 10,
@@ -64,7 +64,7 @@ class RunOptions:
         return cls(**defaults)
 
     @classmethod
-    def deep_investigate(cls, **overrides: Any) -> "RunOptions":
+    def deep_investigate(cls, **overrides: Any) -> RunOptions:
         defaults: dict[str, Any] = {
             "mode": "deep_investigate",
             "max_iterations": 20,

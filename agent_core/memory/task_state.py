@@ -59,7 +59,7 @@ class TaskState:
         }
 
     @classmethod
-    def from_dict(cls, payload: object) -> "TaskState | None":
+    def from_dict(cls, payload: object) -> TaskState | None:
         if not isinstance(payload, dict):
             return None
         objective = payload.get("objective")
@@ -83,7 +83,7 @@ class TaskState:
         )
 
     @classmethod
-    def from_any(cls, payload: object) -> "TaskState | None":
+    def from_any(cls, payload: object) -> TaskState | None:
         if payload is None:
             return None
         if isinstance(payload, TaskState):
@@ -98,7 +98,7 @@ class TaskState:
         objective: str = "",
         scope: list[str] | None = None,
         source_code_locations: list[str] | None = None,
-    ) -> "TaskState":
+    ) -> TaskState:
         return cls(
             run_id=run_id,
             objective=objective,
@@ -112,7 +112,7 @@ class TaskState:
         run_id: str,
         scope: list[str],
         source_code_locations: list[str],
-    ) -> "TaskState":
+    ) -> TaskState:
         # Runtime-provided scope and source locations are authoritative. The
         # synthesizer may add grounded detail, but it should never remove the
         # current application context from TaskState.

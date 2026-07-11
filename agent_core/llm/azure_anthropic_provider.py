@@ -1,27 +1,27 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from email.utils import parsedate_to_datetime
 import json
 import os
 import random
 import time
+from dataclasses import dataclass
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 from anthropic import (
+    AnthropicError,
+    AnthropicFoundry,
     APIConnectionError,
     APIStatusError,
     APITimeoutError,
-    AnthropicError,
-    AnthropicFoundry,
     AuthenticationError,
     BadRequestError,
     RateLimitError,
 )
 
-from agent_core.logging_utils import get_logger
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
+from agent_core.logging_utils import get_logger
 
 logger = get_logger(__name__)
 
@@ -79,7 +79,7 @@ class AzureAnthropicRetryPolicy:
     jitter_ratio: float = DEFAULT_RETRY_JITTER_RATIO
 
     @classmethod
-    def from_env(cls, prefix: str = "AGENT_CORE_LLM_RETRY_") -> "AzureAnthropicRetryPolicy":
+    def from_env(cls, prefix: str = "AGENT_CORE_LLM_RETRY_") -> AzureAnthropicRetryPolicy:
         return cls(
             max_attempts=_env_int(f"{prefix}MAX_ATTEMPTS", DEFAULT_RETRY_MAX_ATTEMPTS),
             initial_delay_seconds=_env_float(

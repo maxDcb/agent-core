@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 
-
 INITIAL_PLAN_PROMPT = """You are preparing a generic bounded investigation plan. Do not output chain-of-thought. Return JSON only. Store only concise auditable artifacts: plan steps, evidence gaps, next actions, risk/scope notes, and confidence. Do not add facts that are not supported by the provided payload."""
 
 STEP_REFLECTION_PROMPT = """You are updating a generic investigation state after one assistant/tool step. Do not output chain-of-thought. Return JSON only. Return concise auditable artifacts: confirmed facts, supported or rejected hypotheses, open evidence gaps, resolved evidence gaps, recommended next actions, risk/scope notes, confidence, and stop reason. Do not add facts not supported by the provided state or tool results. Do not repeat previous evidence gaps that are now resolved by the latest tool results; list them in resolved_gaps instead. Do not treat output-format or response-style instructions as evidence gaps."""
@@ -28,7 +27,7 @@ class InvestigationPromptSet:
     final_critique: str
     run_guidance: str
 
-    def append_domain_guidance(self, guidance: str) -> "InvestigationPromptSet":
+    def append_domain_guidance(self, guidance: str) -> InvestigationPromptSet:
         appendix = guidance.strip()
         if not appendix:
             return self

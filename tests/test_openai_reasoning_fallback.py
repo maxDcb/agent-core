@@ -8,8 +8,8 @@ from openai import APIStatusError, BadRequestError, RateLimitError
 from agent_core.llm.azure_openai_provider import AzureOpenAIProvider
 from agent_core.llm.base import LLMCallOptions, LLMMessage
 from agent_core.llm.openai_compat import OpenAIRateLimitRetryPolicy, create_chat_completion_with_adaptive_retry
-from agent_core.llm.openai_request_policy import OpenAIModelCapabilityResolver
 from agent_core.llm.openai_provider import OpenAIProvider
+from agent_core.llm.openai_request_policy import OpenAIModelCapabilityResolver
 
 
 class ScriptedCompletions:
