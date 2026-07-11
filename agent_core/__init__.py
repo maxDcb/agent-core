@@ -7,7 +7,13 @@ from agent_core.investigation_models import FinalCritique, InvestigationDecision
 from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.investigation_state import EvidenceItem, Hypothesis, InvestigationState
 from agent_core.orchestrator import AgentOrchestrator
-from agent_core.output_contracts import FinalOutputMode, StructuredOutputContract
+from agent_core.output_contracts import (
+    JSON_SCHEMA_DRAFT,
+    FinalOutputMode,
+    StructuredOutputContract,
+    StructuredOutputValidationError,
+    StructuredOutputValidationIssue,
+)
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_context import ExecutionScope, RunContext
 from agent_core.run_models import AgentRunError, AgentRunResult, AgentRunState, RunStatus, RunStrategy
@@ -49,6 +55,7 @@ __all__ = [
     "InvestigationDecision",
     "InvestigationPromptSet",
     "InvestigationState",
+    "JSON_SCHEMA_DRAFT",
     "JsonFileRunStore",
     "PolicyEngine",
     "ContextBudget",
@@ -67,6 +74,8 @@ __all__ = [
     "StructuredTaskRunner",
     "StructuredTaskSpec",
     "StructuredOutputContract",
+    "StructuredOutputValidationError",
+    "StructuredOutputValidationIssue",
     "JsonFileSessionStore",
     "StepReflection",
     "TraceEvent",

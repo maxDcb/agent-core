@@ -9,7 +9,11 @@ from agent_core.execution_context import ExecutionContext
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
-from agent_core.output_contracts import StructuredOutputContract, parse_json_object
+from agent_core.output_contracts import (
+    StructuredOutputContract,
+    StructuredOutputValidationError,
+    parse_json_object,
+)
 from agent_core.policy_engine import PolicyEngine
 from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
@@ -305,6 +309,7 @@ class StructuredTaskRunner:
                     )
                 return self._finalize_result(
                     task_id=spec.task_id,
+                    output_contract=spec.output_contract,
                     raw_content=llm_response.content,
                     tool_history=tool_history,
                     iterations=iterations,
@@ -627,6 +632,7 @@ class StructuredTaskRunner:
         self,
         *,
         task_id: str,
+        output_contract: StructuredOutputContract | None,
         raw_content: str,
         tool_history: list[dict[str, Any]],
         iterations: int,
@@ -657,7 +663,45 @@ class StructuredTaskRunner:
             )
 
         try:
-            payload = parse_json_object(raw_content, target_name=task_id)
+            payload = parse_json_object(
+                raw_content,
+                target_name=task_id,
+                contract=output_contract,
+            )
+        except StructuredOutputValidationError as exc:
+            issue_summary = [
+                f"{issue.validator}@{issue.instance_path or '/'}"
+                for issue in exc.issues
+            ]
+            logger.warning(
+                "Structured task final output failed local JSON Schema validation: %s",
+                ", ".join(issue_summary),
+                extra={
+                    "task_id": task_id,
+                    "contract_name": exc.contract_name,
+                    "validation_issue_count": len(exc.issues),
+                    "validation_issues": [
+                        {
+                            "validator": issue.validator,
+                            "instance_path": issue.instance_path,
+                            "schema_path": issue.schema_path,
+                        }
+                        for issue in exc.issues
+                    ],
+                    "iterations": iterations,
+                    "tool_calls_used": tool_calls_used,
+                },
+            )
+            return StructuredTaskResult(
+                ok=False,
+                task_id=task_id,
+                raw_content=raw_content,
+                failure_reason="Structured task output failed local JSON Schema validation.",
+                tool_history=tool_history,
+                iterations=iterations,
+                tool_calls_used=tool_calls_used,
+                metadata={**metadata, "validation_error": exc.to_dict()},
+            )
         except (json.JSONDecodeError, ValueError):
             logger.warning(
                 "Structured task final schema output was invalid JSON",
@@ -748,6 +792,7 @@ class StructuredTaskRunner:
 
         finalized = self._finalize_result(
             task_id=spec.task_id,
+            output_contract=spec.output_contract,
             raw_content=llm_response.content,
             tool_history=tool_history,
             iterations=iterations + 1,
@@ -808,6 +853,7 @@ class StructuredTaskRunner:
 
         return self._finalize_result(
             task_id=spec.task_id,
+            output_contract=spec.output_contract,
             raw_content=llm_response.content,
             tool_history=tool_history,
             iterations=iterations + 1,

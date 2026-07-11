@@ -642,3 +642,42 @@ def test_structured_task_budget_answers_every_tool_call_before_finalization() ->
         assert [message.tool_call_id for message in tool_messages] == ["call-1", "call-2"]
         assert "maximum tool-call budget" in tool_messages[1].content
         assert [item["status"] for item in result.tool_history] == ["ok", "budget_exhausted"]
+
+
+def test_structured_task_rejects_provider_json_that_violates_contract_locally() -> None:
+    with tempfile.TemporaryDirectory() as temp_dir:
+        root = Path(temp_dir)
+        sensitive_value = "jwt.super-sensitive-value.signature"
+        provider = FakeProvider(
+            [LLMCompletionResult(content=json.dumps({"status": "unexpected", "token": sensitive_value}))]
+        )
+        runner = StructuredTaskRunner(
+            settings=_settings(root),
+            provider=provider,
+            tool_registry=ToolRegistry(),
+            policy_engine=PolicyEngine(),
+        )
+
+        result = run_structured(
+            runner,
+            spec=StructuredTaskSpec(
+                task_id="local_contract_boundary",
+                system_prompt="Return the requested JSON.",
+                objective="Exercise local validation.",
+                output_contract=StructuredOutputContract(
+                    name="local_contract_boundary",
+                    schema={
+                        "type": "object",
+                        "required": ["status"],
+                        "additionalProperties": False,
+                        "properties": {"status": {"type": "string", "enum": ["accepted"]}},
+                    },
+                ),
+            ),
+        )
+
+        assert result.ok is False
+        assert result.failure_reason == "Structured task output failed local JSON Schema validation."
+        assert result.metadata["validation_error"]["phase"] == "payload"
+        assert sensitive_value not in json.dumps(result.metadata["validation_error"])
+        assert result.raw_content == json.dumps({"status": "unexpected", "token": sensitive_value})

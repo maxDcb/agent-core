@@ -3,10 +3,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from agent_core.domain_hooks import DomainHooks
 from agent_core.investigation_controller import INVESTIGATION_STATE_MESSAGE_PREFIX
 from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall
+from agent_core.llm.errors import LLMProviderError
 from agent_core.memory.thread_state import render_context_blocks_to_messages
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.output_contracts import StructuredOutputContract
@@ -363,6 +366,39 @@ def test_investigation_json_schema_final_output_uses_last_no_tool_turn(tmp_path)
     assert provider.tool_options[1].reasoning_effort == "high"
     assert provider.chat_messages[1][-1].role == "user"
     assert "candidate_final_answer" in provider.chat_messages[1][-1].content
+
+
+def test_investigation_json_schema_final_output_is_validated_locally(tmp_path) -> None:
+    sensitive_value = "jwt.sensitive-investigation-payload.signature"
+    provider = ScriptedProvider(
+        chat=[
+            LLMCompletionResult(content="plain final draft"),
+            LLMCompletionResult(content=json.dumps({"status": "unexpected", "token": sensitive_value})),
+        ]
+    )
+    orchestrator = build_orchestrator(tmp_path, provider)
+
+    with pytest.raises(LLMProviderError) as captured:
+        run_turn(orchestrator,
+            "answer as schema",
+            options=RunOptions.investigate(
+                max_iterations=1,
+                require_initial_plan=False,
+                final_output_mode="json_schema",
+                final_output_contract=StructuredOutputContract(
+                    name="investigation_final",
+                    schema={
+                        "type": "object",
+                        "required": ["status"],
+                        "additionalProperties": False,
+                        "properties": {"status": {"type": "string", "enum": ["accepted"]}},
+                    },
+                ),
+            ),
+        )
+
+    assert "violated the output contract" in captured.value.user_message
+    assert sensitive_value not in captured.value.detail
 
 
 def test_internal_synthesis_recovery_option_recovers_invalid_initial_plan_json(tmp_path) -> None:

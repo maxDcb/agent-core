@@ -14,7 +14,7 @@ from agent_core.investigation_state import InvestigationState
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
-from agent_core.output_contracts import parse_json_object, render_json_object
+from agent_core.output_contracts import StructuredOutputValidationError, parse_json_object, render_json_object
 from agent_core.run_options import RunOptions
 from agent_core.settings import CoreSettings
 from agent_core.structured_synthesizer import StructuredSynthesisRequest, StructuredSynthesizer
@@ -886,7 +886,17 @@ class InvestigationController:
                 detail=f"tool_call_count={len(llm_response.tool_calls)}",
             )
         try:
-            rendered_payload = parse_json_object(llm_response.content, target_name="final_output_json_schema")
+            rendered_payload = parse_json_object(
+                llm_response.content,
+                target_name="final_output_json_schema",
+                contract=contract,
+            )
+        except StructuredOutputValidationError as exc:
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The final JSON Schema renderer returned an object that violated the output contract.",
+                detail=json.dumps(exc.to_dict(), ensure_ascii=False, separators=(",", ":")),
+            ) from exc
         except (json.JSONDecodeError, ValueError) as exc:
             raise LLMProviderError(
                 kind="response_error",

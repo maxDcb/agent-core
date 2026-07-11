@@ -141,7 +141,17 @@ and metadata returned by completed investigation runs.
 `output_contract`, the provider JSON Schema contract is enforced only on the
 final no-tool output, after any tool investigation is complete. Providers that
 cannot enforce the contract fail the task instead of silently downgrading to
-loose JSON mode.
+loose JSON mode. Provider enforcement is not trusted as the application
+boundary: agent-core also validates the parsed object locally with JSON Schema
+Draft 2020-12 and format checking before returning success. The contract schema
+itself is checked when `StructuredOutputContract` is constructed.
+
+An invalid structured result fails explicitly. agent-core does not silently
+coerce values, remove extra fields, invent missing fields, or retry. Validation
+metadata contains the contract name, validation phase, validator, instance
+path, schema path, and a safe message; payload values are excluded so secrets
+are not copied into diagnostics. The original raw completion remains available
+on the failed task result for controlled recovery or audit by the caller.
 
 ```python
 from agent_core import StructuredOutputContract, StructuredTaskSpec

@@ -15,8 +15,11 @@ Internal planning, reflection, decision and critique phases synthesize JSON
 state, but this does not make JSON a public output mode. Use
 `final_output_mode="json_schema"` with a `StructuredOutputContract` when a
 caller needs a tool-backed investigation whose final phase is forced to one
-provider-enforced JSON Schema object. The schema rendering happens in a final
-no-tool model call and does not alter the configured reasoning options.
+provider-enforced JSON Schema object. Rendering happens in a final no-tool model
+call and does not alter the configured reasoning options. The parsed object is
+then validated locally against the same Draft 2020-12 contract before it is
+returned. Provider acceptance alone is not treated as proof that the output is
+valid.
 
 Set `RunOptions.recover_internal_synthesis_errors=True` for interactive
 conversation surfaces that should continue when internal JSON state synthesis is

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Added centralized local JSON Schema Draft 2020-12 validation for structured
+  task and investigation outputs, including format checks and schema validation
+  at contract construction.
+- Added structured, payload-safe validation diagnostics and explicit failure for
+  provider outputs that violate their declared contract.
+
 ## 0.3.0
 
 - Added provider-enforced JSON Schema contracts for structured task final outputs.
