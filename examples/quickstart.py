@@ -26,7 +26,6 @@ from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage, LLM
 from agent_core.llm.errors import LLMProviderError
 from agent_core.llm.provider_factory import build_memory_provider, build_provider, normalize_provider_name
 
-
 DEFAULT_PROMPT = "What time is it? Use get_current_time, then answer in one sentence."
 DEMO_STATE_DIR = Path(".agent-core-demo")
 

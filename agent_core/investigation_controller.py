@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
+from dataclasses import asdict
 from typing import Any, Protocol
 
 from agent_core.execution_context import ExecutionContext

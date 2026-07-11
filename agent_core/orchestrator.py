@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
+from dataclasses import asdict
 from inspect import Parameter, signature
 from typing import Any
 from uuid import uuid4
@@ -16,6 +16,8 @@ from agent_core.execution_context import (
 from agent_core.investigation_controller import InvestigationController, with_investigation_guidance
 from agent_core.investigation_prompts import DEFAULT_INVESTIGATION_PROMPTS, InvestigationPromptSet
 from agent_core.investigation_state import InvestigationState
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage
+from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.memory.context_block import ContextBlock, estimate_token_count
 from agent_core.memory.session_summary import SessionSummary
@@ -28,16 +30,14 @@ from agent_core.memory.thread_state import (
 )
 from agent_core.policy_engine import PolicyEngine
 from agent_core.prompt_builder import PromptBuilder
-from agent_core.run_trace import PromptSnapshot, RunTrace
 from agent_core.run_options import RunOptions
+from agent_core.run_trace import PromptSnapshot, RunTrace
 from agent_core.session_manager import SessionManager
 from agent_core.settings import CoreSettings
 from agent_core.structured_synthesizer import StructuredSynthesisRequest, StructuredSynthesizer
 from agent_core.tool_registry import ToolRegistry
 from agent_core.turn_steps import PendingResumeState, ToolExecutionStepResult
 from agent_core.types import AgentTurnResult, ToolExecutionStatus
-from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage
-from agent_core.llm.errors import LLMProviderError
 
 logger = get_logger("core.orchestrator")
 
@@ -1152,12 +1152,6 @@ class AgentOrchestrator:
         if not isinstance(turn_index, int) or not isinstance(exchange_index, int) or not isinstance(tool_calls_used, int):
             return AgentTurnResult(status="completed", content="Pending agent turn is corrupt: invalid turn counters.")
 
-        assistant_payload = pending.get("assistant_message")
-        assistant_message = (
-            LLMMessage.from_history_dict(assistant_payload)
-            if isinstance(assistant_payload, dict)
-            else LLMMessage(role="assistant", content="")
-        )
         raw_tool_messages = pending.get("tool_messages")
         previous_tool_messages = [
             LLMMessage.from_history_dict(item)

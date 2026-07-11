@@ -11,9 +11,9 @@ from agent_core.memory.context_block import ContextBlock
 from agent_core.memory.history_compactor import CompactionPolicy, HistoryCompactor
 from agent_core.memory.session_summary import SessionSummary
 from agent_core.memory.task_state import TaskState
+from agent_core.memory.thread_state import ThreadState
 from agent_core.run_trace import RunTrace
 from agent_core.session_repo import SessionRepository
-from agent_core.memory.thread_state import ThreadState
 from agent_core.types import SESSION_SCHEMA_VERSION, SessionState, build_empty_session_state, utc_now_iso
 
 logger = get_logger(__name__)

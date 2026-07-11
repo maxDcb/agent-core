@@ -57,7 +57,7 @@ class SessionSummary:
         }
 
     @classmethod
-    def from_dict(cls, payload: object) -> "SessionSummary | None":
+    def from_dict(cls, payload: object) -> SessionSummary | None:
         if not isinstance(payload, dict):
             return None
 
@@ -86,7 +86,7 @@ class SessionSummary:
         *,
         thread_id: str = "",
         covers_blocks_until: str = "",
-    ) -> "SessionSummary | None":
+    ) -> SessionSummary | None:
         if payload is None:
             return None
         if isinstance(payload, SessionSummary):
@@ -130,8 +130,8 @@ class SessionSummary:
         thread_id: str,
         covers_blocks_until: str,
         source_block_count: int,
-        previous_summary: "SessionSummary | None" = None,
-    ) -> "SessionSummary":
+        previous_summary: SessionSummary | None = None,
+    ) -> SessionSummary:
         return cls(
             summary_id=previous_summary.summary_id if previous_summary is not None else f"summary-{thread_id}",
             thread_id=thread_id,

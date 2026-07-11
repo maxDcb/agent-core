@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
+
 from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.policy_engine import PolicyEngine
@@ -135,6 +137,24 @@ def event_types(trace_payload: dict[str, object]) -> set[str]:
     events = trace_payload.get("events")
     assert isinstance(events, list)
     return {event["type"] for event in events if isinstance(event, dict)}
+
+
+@pytest.mark.chaos
+def test_trace_persistence_failure_does_not_fail_user_turn(tmp_path, monkeypatch) -> None:
+    orchestrator = build_orchestrator(
+        tmp_path,
+        ScriptedProvider(chat=[LLMCompletionResult(content="answer survives trace failure")]),
+    )
+
+    def fail_trace_save(trace: object) -> None:
+        raise OSError("simulated trace storage failure")
+
+    monkeypatch.setattr(orchestrator.session_manager, "save_run_trace", fail_trace_save)
+    result = orchestrator.run_turn_result("answer directly")
+
+    assert result.status == "completed"
+    assert result.content == "answer survives trace failure"
+    assert [block.kind for block in orchestrator.session_manager.get_context_blocks()] == ["conversation_turn"]
 
 
 def test_prompt_snapshot_tracks_messages_and_context_budget() -> None:

@@ -7,8 +7,8 @@ with the ToolRegistry. It has no external dependencies beyond agent_core types.
 from typing import Protocol
 
 from agent_core.execution_context import ExecutionContext
-from agent_core.types import ToolResult
 from agent_core.llm.base import LLMToolDefinition
+from agent_core.types import ToolResult
 
 
 class BaseTool(Protocol):

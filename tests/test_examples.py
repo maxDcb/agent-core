@@ -5,7 +5,6 @@ from pathlib import Path
 
 from agent_core.llm.base import LLMCompletionResult
 
-
 ROOT = Path(__file__).resolve().parents[1]
 
 

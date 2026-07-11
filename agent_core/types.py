@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, Literal, TypeAlias
+from typing import Any, Literal, NotRequired, TypeAlias, TypedDict
 
 ToolExecutionStatus: TypeAlias = Literal[
     "ok",
@@ -16,7 +16,19 @@ ToolExecutionStatus: TypeAlias = Literal[
 
 AgentTurnStatus: TypeAlias = Literal["completed", "pending_tool_result"]
 
-SessionState: TypeAlias = dict[str, Any]
+
+class SessionState(TypedDict):
+    context_blocks: list[dict[str, Any]]
+    active_block_ids: list[str]
+    overflow_block_ids: list[str]
+    summary: object | None
+    task_state: object | None
+    tool_history: list[dict[str, Any]]
+    domain_state: dict[str, Any]
+    meta: dict[str, Any]
+    execution_scope: NotRequired[dict[str, Any]]
+
+
 SESSION_SCHEMA_VERSION = 4
 
 
@@ -58,7 +70,7 @@ class ToolResult:
         *,
         pending_id: str | None = None,
         metadata: dict[str, Any] | None = None,
-    ) -> "ToolResult":
+    ) -> ToolResult:
         return cls(
             ok=True,
             content=content,

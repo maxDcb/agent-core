@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from collections import OrderedDict
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+from agent_core.llm.base import LLMMessage
 from agent_core.memory.context_block import ContextBlock, estimate_token_count
 from agent_core.memory.session_summary import SessionSummary
 from agent_core.memory.task_state import TaskState
-from agent_core.llm.base import LLMMessage
 
 
 def render_context_blocks_to_messages(blocks: list[ContextBlock]) -> list[LLMMessage]:
@@ -58,7 +59,7 @@ class ThreadState:
     overflow_blocks: list[ContextBlock] = field(default_factory=list)
 
     @classmethod
-    def from_session_state(cls, state: dict[str, Any], *, thread_id: str) -> "ThreadState":
+    def from_session_state(cls, state: Mapping[str, Any], *, thread_id: str) -> ThreadState:
         """Normalize persisted session payloads into runtime objects."""
 
         raw_context_blocks = state.get("context_blocks", [])
@@ -128,10 +129,10 @@ def _render_history_group(group_blocks: list[ContextBlock]) -> list[LLMMessage]:
     return rendered
 
 
-def _group_blocks_by_turn(blocks: list[ContextBlock]) -> "OrderedDict[tuple[str, str], list[ContextBlock]]":
+def _group_blocks_by_turn(blocks: list[ContextBlock]) -> OrderedDict[tuple[str, str], list[ContextBlock]]:
     """Group persisted blocks so a turn can be replayed atomically."""
 
-    groups: "OrderedDict[tuple[str, str], list[ContextBlock]]" = OrderedDict()
+    groups: OrderedDict[tuple[str, str], list[ContextBlock]] = OrderedDict()
     for block in blocks:
         if block.kind in {"summary", "task_state", "retrieved_memory"}:
             continue

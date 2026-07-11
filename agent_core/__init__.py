@@ -8,8 +8,8 @@ from agent_core.investigation_state import EvidenceItem, Hypothesis, Investigati
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.output_contracts import FinalOutputMode, StructuredOutputContract
 from agent_core.policy_engine import PolicyEngine
-from agent_core.run_trace import ContextBudget, PromptBlock, PromptSnapshot, RunTrace, TraceEvent
 from agent_core.run_options import AgentRunMode, RunOptions
+from agent_core.run_trace import ContextBudget, PromptBlock, PromptSnapshot, RunTrace, TraceEvent
 from agent_core.session_manager import SessionManager
 from agent_core.session_repo import JsonFileSessionStore, SessionRepository, SessionStore
 from agent_core.settings import CoreSettings

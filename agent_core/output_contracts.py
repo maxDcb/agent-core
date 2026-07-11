@@ -4,7 +4,6 @@ import json
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
-
 FinalOutputMode: TypeAlias = Literal["text", "json_schema"]
 
 
@@ -52,7 +51,7 @@ class StructuredOutputContract:
         self.instructions = _clean_string_list(self.instructions)
 
     @classmethod
-    def from_any(cls, value: object) -> "StructuredOutputContract | None":
+    def from_any(cls, value: object) -> StructuredOutputContract | None:
         if isinstance(value, cls):
             return value
         if not isinstance(value, dict):

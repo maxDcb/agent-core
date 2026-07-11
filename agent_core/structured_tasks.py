@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any
@@ -486,7 +487,7 @@ class StructuredTaskRunner:
         *,
         spec: StructuredTaskSpec,
         session_id: str,
-        session_state: dict[str, Any],
+        session_state: Mapping[str, Any],
     ) -> list[LLMMessage]:
         return [
             LLMMessage(role="system", content=self.settings.base_system_prompt),
@@ -528,7 +529,7 @@ class StructuredTaskRunner:
                 lines.extend(f"  - {instruction}" for instruction in spec.output_contract.instructions)
         return "\n".join(lines)
 
-    def _build_scope_prompt_block(self, *, session_id: str, session_state: dict[str, Any]) -> str:
+    def _build_scope_prompt_block(self, *, session_id: str, session_state: Mapping[str, Any]) -> str:
         allowed_roots = [str(path.resolve()) for path in effective_allowed_read_roots(self.settings, session_state)]
         knowledge_root = str(self.settings.knowledge_base_dir.resolve())
         allowed_hosts = effective_allowed_http_hosts(self.settings, session_state)

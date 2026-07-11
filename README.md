@@ -235,10 +235,17 @@ from agent_core import (
 ## Development Checks
 
 ```bash
-.venv/bin/python -m pytest
+.venv/bin/python -m ruff check agent_core tests examples
 .venv/bin/python -m mypy agent_core
+.venv/bin/python -m pytest
+.venv/bin/python -m pytest --cov=agent_core --cov-report=term
 .venv/bin/python -m build
 ```
+
+The coverage configuration measures branches and enforces a ratchetable global
+minimum. Deterministic fault-injection tests use the `chaos` marker and can be
+run separately with `python -m pytest -m chaos`. Property-based resilience
+tests are part of the normal suite; longer diagnostic runs are scheduled in CI.
 
 ## Repository Scope
 

@@ -304,13 +304,19 @@ class JsonFileSessionStore:
 
     def _atomic_write_json(self, path: Path, payload: object) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-            json.dump(payload, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-            temporary_path = Path(handle.name)
-        temporary_path.replace(path)
+        temporary_path: Path | None = None
+        try:
+            with NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+                temporary_path = Path(handle.name)
+                json.dump(payload, handle, indent=2, ensure_ascii=False)
+                handle.write("\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            temporary_path.replace(path)
+        except Exception:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
         self._fsync_directory(path.parent)
 
     def _fsync_directory(self, directory: Path) -> None:

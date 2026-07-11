@@ -1,0 +1,29 @@
+name: scheduled-resilience
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  deterministic-chaos:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install development dependencies
+        run: python -m pip install -e ".[dev]"
+      - name: Run deterministic fault-injection tests
+        run: python -m pytest -m chaos --hypothesis-show-statistics
+      - name: Run property-based resilience tests
+        run: python -m pytest tests/test_resilience.py --hypothesis-show-statistics
