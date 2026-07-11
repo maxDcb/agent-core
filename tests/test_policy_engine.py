@@ -6,8 +6,9 @@ import pytest
 
 from agent_core.execution_context import ExecutionContext
 from agent_core.policy_engine import PolicyEngine
+from agent_core.run_context import ExecutionScope, RunContext
 from agent_core.settings import CoreSettings
-from agent_core.types import AuthorizationResult, build_empty_session_state
+from agent_core.types import AuthorizationResult
 
 
 def _context(tmp_path: Path) -> ExecutionContext:
@@ -21,10 +22,9 @@ def _context(tmp_path: Path) -> ExecutionContext:
         allowed_http_hosts=["example.test"],
         allowed_http_methods=["GET", "POST"],
     )
-    return ExecutionContext(
-        session_id="policy-test",
+    return ExecutionContext.from_run_context(
+        context=RunContext(namespace_id="policy-test", run_id="policy-run"),
         settings=settings,
-        session_state=build_empty_session_state(session_id="policy-test"),
     )
 
 
@@ -112,17 +112,24 @@ def test_http_policy_allows_configured_request_and_proxy(tmp_path: Path) -> None
     assert PolicyEngine().authorize("http_request", arguments, _context(tmp_path)).allowed is True
 
 
-def test_session_execution_scope_overrides_global_scope(tmp_path: Path) -> None:
-    context = _context(tmp_path)
+def test_run_execution_scope_overrides_global_scope(tmp_path: Path) -> None:
+    base_context = _context(tmp_path)
     scoped_root = tmp_path / "scoped"
     scoped_root.mkdir()
     scoped_file = scoped_root / "allowed.txt"
     scoped_file.write_text("ok", encoding="utf-8")
-    context.session_state["execution_scope"] = {
-        "allowed_read_roots": [str(scoped_root)],
-        "allowed_http_hosts": ["scoped.test"],
-        "allowed_http_methods": ["PATCH"],
-    }
+    context = ExecutionContext.from_run_context(
+        context=RunContext(
+            namespace_id="policy-test",
+            run_id="scoped-run",
+            scope=ExecutionScope(
+                allowed_read_roots=(scoped_root,),
+                allowed_http_hosts=("scoped.test",),
+                allowed_http_methods=("PATCH",),
+            ),
+        ),
+        settings=base_context.settings,
+    )
 
     assert PolicyEngine().authorize("read_file_chunk", {"path": str(scoped_file)}, context).allowed is True
     assert PolicyEngine().authorize(

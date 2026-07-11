@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextvars import ContextVar
 from dataclasses import asdict
 from inspect import Parameter, signature
 from typing import Any
@@ -30,6 +31,7 @@ from agent_core.memory.thread_state import (
 )
 from agent_core.policy_engine import PolicyEngine
 from agent_core.prompt_builder import PromptBuilder
+from agent_core.run_context import RunContext
 from agent_core.run_options import RunOptions
 from agent_core.run_trace import PromptSnapshot, RunTrace
 from agent_core.session_manager import SessionManager
@@ -73,6 +75,7 @@ class AgentOrchestrator:
         self.session_manager = session_manager
         self.policy_engine = policy_engine
         self.domain_hooks = domain_hooks or DomainHooks()
+        self._run_context_var: ContextVar[RunContext | None] = ContextVar("agent_run_context", default=None)
         self.prompt_builder = PromptBuilder(
             settings=settings,
             session_manager=session_manager,
@@ -98,8 +101,8 @@ class AgentOrchestrator:
             "content_preview": tool_content[:500],
         }
 
-    def _build_messages(self, user_input: str) -> list[LLMMessage]:
-        messages = self.prompt_builder.build_messages(user_input=user_input)
+    def _build_messages(self, user_input: str, *, context: RunContext) -> list[LLMMessage]:
+        messages = self.prompt_builder.build_messages(user_input=user_input, context=context)
         logger.trace(
             "Built LLM message list",
             extra={
@@ -115,14 +118,15 @@ class AgentOrchestrator:
     def _start_run_trace(
         self,
         *,
-        session_id: str,
+        namespace_id: str,
+        run_id: str,
         run_options: RunOptions,
         messages: list[LLMMessage],
         turn_index: int,
     ) -> RunTrace:
         return RunTrace.start(
-            run_id=f"run-{turn_index:04d}-{uuid4().hex[:8]}",
-            session_id=session_id,
+            run_id=run_id,
+            session_id=namespace_id,
             mode=run_options.mode,
             turn_index=turn_index,
             options={
@@ -209,7 +213,11 @@ class AgentOrchestrator:
         # user-visible turn result.
         thread_state = self._compact_history_after_turn()
         try:
-            task_state = self._synthesize_task_state(thread_state=thread_state, turn_index=turn_index)
+            task_state = self._synthesize_task_state(
+                thread_state=thread_state,
+                turn_index=turn_index,
+                context=self._active_run_context(),
+            )
         except (LLMProviderError, ValueError) as exc:
             logger.warning(
                 "TaskState synthesis failed; keeping the previous task state",
@@ -239,6 +247,12 @@ class AgentOrchestrator:
 
         self._run_post_turn_hooks(turn_index=turn_index)
 
+    def _active_run_context(self) -> RunContext:
+        context = self._run_context_var.get()
+        if context is None:
+            raise RuntimeError("No active RunContext")
+        return context
+
     def _run_post_turn_hooks(self, *, turn_index: int) -> None:
         try:
             self.domain_hooks.after_turn(
@@ -257,23 +271,27 @@ class AgentOrchestrator:
             max_active_tokens=self.settings.max_active_context_tokens,
         )
 
-    def _application_context_payload(self) -> dict[str, Any]:
-        session_state = self.session_manager.get_state()
+    def _application_context_payload(self, *, context: RunContext) -> dict[str, Any]:
         return {
-            "session_id": self.session_manager.session_id or "default",
-            "scope": effective_allowed_http_hosts(self.settings, session_state),
+            "namespace_id": context.namespace_id,
+            "run_id": context.run_id,
+            "parent_id": context.parent_id,
+            "thread_id": context.thread_id,
+            "correlation": dict(context.correlation),
+            "application_context": dict(context.application_context),
+            "scope": effective_allowed_http_hosts(self.settings, context.scope),
             "source_code_locations": [
                 str(path.resolve())
-                for path in effective_allowed_read_roots(self.settings, session_state)
+                for path in effective_allowed_read_roots(self.settings, context.scope)
             ],
             "knowledge_base_dir": str(self.settings.knowledge_base_dir.resolve()),
-            "allowed_http_methods": effective_allowed_http_methods(self.settings, session_state),
+            "allowed_http_methods": effective_allowed_http_methods(self.settings, context.scope),
         }
 
-    def _synthesize_task_state(self, *, thread_state: ThreadState, turn_index: int) -> TaskState:
+    def _synthesize_task_state(self, *, thread_state: ThreadState, turn_index: int, context: RunContext) -> TaskState:
         # TaskState is synthesized from the active slice of the conversation.
         # It is meant to steer the next prompt, not to be a full audit log.
-        runtime_context = self._application_context_payload()
+        runtime_context = self._application_context_payload(context=context)
         template = TaskState.create_template(
             run_id=f"run-{turn_index:04d}",
             objective=thread_state.task_state.objective if thread_state.task_state is not None else "Investigate the current in-scope application",
@@ -558,37 +576,61 @@ class AgentOrchestrator:
             payload.update(pending_metadata_extra)
         self.session_manager.set_meta_value(self.PENDING_TURN_META_KEY, payload)
 
-    def run_turn(self, user_input: str, session_id: str = "default") -> str:
-        return self.run_turn_result(user_input=user_input, session_id=session_id).content
+    def run_turn(self, *, user_input: str, thread_id: str, context: RunContext) -> str:
+        return self.run_turn_result(user_input=user_input, thread_id=thread_id, context=context).content
 
     def run_turn_result(
         self,
+        *,
         user_input: str,
-        session_id: str = "default",
+        thread_id: str,
+        context: RunContext,
         options: RunOptions | None = None,
     ) -> AgentTurnResult:
-        with self.session_manager.session_scope(session_id):
-            return self._run_turn_result_active(user_input=user_input, session_id=session_id, options=options)
+        run_id = context.run_id or f"run-{uuid4().hex}"
+        bound_context = context.with_run_id(run_id)
+        if bound_context.thread_id != thread_id:
+            bound_context = RunContext(
+                namespace_id=bound_context.namespace_id,
+                run_id=bound_context.run_id,
+                parent_id=bound_context.parent_id,
+                thread_id=thread_id,
+                scope=bound_context.scope,
+                correlation=bound_context.correlation,
+                application_context=bound_context.application_context,
+            )
+        token = self._run_context_var.set(bound_context)
+        try:
+            with self.session_manager.session_scope(thread_id):
+                return self._run_turn_result_active(
+                    user_input=user_input,
+                    context=bound_context,
+                    options=options,
+                )
+        finally:
+            self._run_context_var.reset(token)
 
     def _run_turn_result_active(
         self,
         user_input: str,
-        session_id: str,
+        context: RunContext,
         options: RunOptions | None,
     ) -> AgentTurnResult:
         run_options = options or RunOptions.direct()
         logger.info(
             "Starting run_turn",
-            extra={"session_id": session_id, "user_input_length": len(user_input), "mode": run_options.mode},
+            extra={
+                "namespace_id": context.namespace_id,
+                "run_id": context.run_id,
+                "thread_id": context.thread_id,
+                "user_input_length": len(user_input),
+                "mode": run_options.mode,
+            },
         )
         state = self.session_manager.get_state()
-        context = ExecutionContext(
-            session_id=session_id,
-            settings=self.settings,
-            session_state=state,
-        )
+        execution_context = ExecutionContext.from_run_context(context=context, settings=self.settings)
 
-        messages = self._build_messages(user_input)
+        messages = self._build_messages(user_input, context=context)
         turn_index = self.session_manager.get_next_turn_index()
         investigation_prompt_set: InvestigationPromptSet | None = None
         if run_options.mode in {"investigate", "deep_investigate"}:
@@ -599,12 +641,13 @@ class AgentOrchestrator:
                 prompt_set=investigation_prompt_set,
             )
         trace = self._start_run_trace(
-            session_id=session_id,
+            namespace_id=context.namespace_id,
+            run_id=context.run_id or f"run-{uuid4().hex}",
             run_options=run_options,
             messages=messages,
             turn_index=turn_index,
         )
-        expose_trace_id = options is not None or run_options.mode in {"investigate", "deep_investigate"}
+        expose_trace_id = True
         try:
             if run_options.mode in {"investigate", "deep_investigate"}:
                 result = self._build_investigation_controller(
@@ -612,8 +655,8 @@ class AgentOrchestrator:
                     prompt_set=investigation_prompt_set,
                 ).run(
                     user_input=user_input,
-                    session_id=session_id,
-                    context=context,
+                    session_id=context.namespace_id,
+                    context=execution_context,
                     messages=messages,
                     turn_index=turn_index,
                     options=run_options,
@@ -627,8 +670,8 @@ class AgentOrchestrator:
             tool_history_start_count = len(state.get("tool_history", [])) if isinstance(state.get("tool_history"), list) else 0
             result = self._continue_turn(
                 user_input=user_input,
-                session_id=session_id,
-                context=context,
+                session_id=context.namespace_id,
+                context=execution_context,
                 messages=messages,
                 turn_index=turn_index,
                 tool_calls_used=0,
@@ -657,30 +700,40 @@ class AgentOrchestrator:
         *,
         pending_id: str,
         tool_content: str,
+        thread_id: str,
+        context: RunContext,
         ok: bool = True,
-        session_id: str = "default",
     ) -> AgentTurnResult:
-        with self.session_manager.session_scope(session_id):
-            cached_result = self._load_completed_pending_result(pending_id)
-            if cached_result is not None:
-                return cached_result
+        token = self._run_context_var.set(context)
+        try:
+            with self.session_manager.session_scope(thread_id):
+                cached_result = self._load_completed_pending_result(pending_id)
+                if cached_result is not None:
+                    return cached_result
 
-            state = self.session_manager.get_state()
-            pending = state.get("meta", {}).get(self.PENDING_TURN_META_KEY)
-            if not isinstance(pending, dict) or pending.get("pending_id") != pending_id:
-                return AgentTurnResult(
-                    status="completed",
-                    content=f"No pending agent turn found for pending_id={pending_id}",
+                state = self.session_manager.get_state()
+                pending = state.get("meta", {}).get(self.PENDING_TURN_META_KEY)
+                if not isinstance(pending, dict) or pending.get("pending_id") != pending_id:
+                    return AgentTurnResult(
+                        status="completed",
+                        content=f"No pending agent turn found for pending_id={pending_id}",
+                    )
+
+                pending_run_id = pending.get("run_trace_id")
+                bound_context = context.with_run_id(
+                    pending_run_id if isinstance(pending_run_id, str) else (context.run_id or f"run-{uuid4().hex}")
                 )
-
-            result = self._resume_turn_active(
-                pending_id=pending_id,
-                tool_content=tool_content,
-                ok=ok,
-                session_id=session_id,
-            )
-            self._store_completed_pending_result(pending_id=pending_id, result=result)
-            return result
+                self._run_context_var.set(bound_context)
+                result = self._resume_turn_active(
+                    pending_id=pending_id,
+                    tool_content=tool_content,
+                    ok=ok,
+                    context=bound_context,
+                )
+                self._store_completed_pending_result(pending_id=pending_id, result=result)
+                return result
+        finally:
+            self._run_context_var.reset(token)
 
     def _load_completed_pending_result(self, pending_id: str) -> AgentTurnResult | None:
         meta = self.session_manager.get_state().get("meta", {})
@@ -724,7 +777,7 @@ class AgentOrchestrator:
         pending_id: str,
         tool_content: str,
         ok: bool,
-        session_id: str,
+        context: RunContext,
     ) -> AgentTurnResult:
         state = self.session_manager.get_state()
         pending = state.get("meta", {}).get(self.PENDING_TURN_META_KEY)
@@ -746,15 +799,11 @@ class AgentOrchestrator:
                 else resumed
             )
 
-        context = ExecutionContext(
-            session_id=session_id,
-            settings=self.settings,
-            session_state=state,
-        )
+        execution_context = ExecutionContext.from_run_context(context=context, settings=self.settings)
         tool_step = self._continue_pending_tool_exchange(
             pending=resumed,
-            session_id=session_id,
-            context=context,
+            session_id=context.namespace_id,
+            context=execution_context,
             trace=trace,
         )
         if tool_step.pending_result is not None:
@@ -783,8 +832,8 @@ class AgentOrchestrator:
                 prompt_set=investigation_prompt_set,
             ).resume_after_pending(
                 pending=resumed,
-                session_id=session_id,
-                context=context,
+                session_id=context.namespace_id,
+                context=execution_context,
                 options=run_options,
                 state=investigation_state,
                 iterations_used=iterations_used if isinstance(iterations_used, int) else 1,
@@ -809,8 +858,8 @@ class AgentOrchestrator:
         else:
             result = self._continue_turn(
                 user_input=resumed.user_input,
-                session_id=session_id,
-                context=context,
+                session_id=context.namespace_id,
+                context=execution_context,
                 messages=tool_step.messages,
                 turn_index=resumed.turn_index,
                 tool_calls_used=tool_step.tool_calls_used,

@@ -16,6 +16,7 @@ from agent_core.structured_tasks import (
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
+from tests.run_helpers import run_structured
 
 
 class FakeProvider:
@@ -86,7 +87,7 @@ class SessionIdTool:
         )
 
     def execute(self, arguments: dict, context) -> ToolResult:
-        return ToolResult(ok=True, content=context.session_id)
+        return ToolResult(ok=True, content=context.namespace_id)
 
 
 def _settings(root: Path) -> CoreSettings:
@@ -141,14 +142,14 @@ def test_structured_task_runner_without_contract_returns_raw_text_after_tool_loo
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="pre_inventory",
                 system_prompt="Map the initial workspace state.",
                 objective="Build a first workspace summary.",
                 allowed_tools=["echo_tool"],
             ),
-            session_id="session-1",
+            namespace_id="session-1",
         )
 
         assert result.ok is True
@@ -195,7 +196,7 @@ def test_structured_task_runner_uses_structured_output_contract_when_requested()
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="analysis",
                 system_prompt="Analyze the input.",
@@ -207,7 +208,7 @@ def test_structured_task_runner_uses_structured_output_contract_when_requested()
                     instructions=["Use confidence between 0 and 1."],
                 ),
             ),
-            session_id="session-1",
+            namespace_id="session-1",
         )
 
         assert result.ok is True
@@ -264,7 +265,7 @@ def test_structured_task_runner_enforces_contract_only_on_final_no_tool_output()
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="analysis_with_tools",
                 system_prompt="Analyze the input with tools.",
@@ -276,7 +277,7 @@ def test_structured_task_runner_enforces_contract_only_on_final_no_tool_output()
                     strict=True,
                 ),
             ),
-            session_id="session-1",
+            namespace_id="session-1",
         )
 
         assert result.ok is True
@@ -322,7 +323,7 @@ def test_structured_task_runner_passes_configured_max_output_tokens_to_final_out
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="max_output_tokens",
                 system_prompt="Return JSON.",
@@ -371,7 +372,7 @@ def test_structured_task_runner_does_not_pass_configured_max_output_tokens_to_to
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="max_output_tokens_tool_loop",
                 system_prompt="Return JSON after checking the tool.",
@@ -401,7 +402,7 @@ def test_structured_task_runner_rejects_invalid_json_output() -> None:
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="text_output",
                 system_prompt="Return a concise answer.",
@@ -426,7 +427,7 @@ def test_structured_task_runner_rejects_invalid_json_schema_output() -> None:
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="json_schema_strict_parse",
                 system_prompt="Return JSON.",
@@ -458,7 +459,7 @@ def test_structured_task_prompt_forbids_appended_second_json_object_for_schema_c
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="json_prompt_guard",
                 system_prompt="Return JSON.",
@@ -508,14 +509,14 @@ def test_structured_task_runner_uses_parent_session_id_for_tool_context() -> Non
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="session_context",
                 system_prompt="Return JSON after checking session id.",
                 objective="Check session id.",
                 allowed_tools=["session_id_tool"],
             ),
-            session_id="workspace-session",
+            namespace_id="workspace-session",
         )
 
         assert result.ok is True
@@ -533,7 +534,7 @@ def test_structured_task_runner_fails_fast_on_unknown_allowed_tool() -> None:
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="unknown_tool",
                 system_prompt="Use scoped tools only.",
@@ -574,7 +575,7 @@ def test_structured_task_runner_forces_schema_finalization_after_iteration_budge
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="budgeted",
                 system_prompt="Return JSON after using the echo tool.",
@@ -625,7 +626,7 @@ def test_structured_task_budget_answers_every_tool_call_before_finalization() ->
             policy_engine=PolicyEngine(),
         )
 
-        result = runner.run(
+        result = run_structured(runner,
             spec=StructuredTaskSpec(
                 task_id="partial_tool_budget",
                 system_prompt="Use tools when useful.",

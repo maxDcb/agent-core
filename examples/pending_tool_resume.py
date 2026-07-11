@@ -8,6 +8,7 @@ from agent_core import (
     CoreSettings,
     ExecutionContext,
     PolicyEngine,
+    RunContext,
     SessionManager,
     SessionRepository,
     ToolResult,
@@ -108,12 +109,19 @@ def build_orchestrator(session_file: Path) -> AgentOrchestrator:
 
 def run_demo(session_file: Path) -> tuple[str, str]:
     orchestrator = build_orchestrator(session_file)
-    pending = orchestrator.run_turn_result("Run the external job.")
+    context = RunContext(namespace_id="demo", run_id="demo-run", thread_id="demo")
+    pending = orchestrator.run_turn_result(
+        user_input="Run the external job.",
+        thread_id="demo",
+        context=context,
+    )
     if not pending.pending_id:
         raise RuntimeError("Expected a pending tool result.")
     completed = orchestrator.resume_turn(
         pending_id=pending.pending_id,
         tool_content="demo-user",
+        thread_id="demo",
+        context=context,
     )
     return pending.status, completed.content
 

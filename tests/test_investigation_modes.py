@@ -18,6 +18,7 @@ from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import AuthorizationResult, ToolResult
+from tests.run_helpers import resume_turn, run_turn
 
 
 def task_state_payload() -> dict[str, Any]:
@@ -228,11 +229,11 @@ def test_direct_mode_without_options_preserves_tool_loop_shape(tmp_path) -> None
     provider = ScriptedProvider(chat=[tool_call(), LLMCompletionResult(content="final")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result("echo")
+    result = run_turn(orchestrator, "echo")
 
     assert result.status == "completed"
     assert result.content == "final"
-    assert result.metadata == {}
+    assert result.metadata["run_trace_id"].startswith("test-run-")
     blocks = orchestrator.session_manager.get_context_blocks()
     assert [block.kind for block in blocks] == ["tool_exchange", "conversation_turn"]
     assert len(blocks[0].content["tool_messages"]) == 1
@@ -253,7 +254,7 @@ def test_direct_mode_budget_exhaustion_persists_tool_responses_for_skipped_calls
     orchestrator = build_orchestrator(tmp_path, provider)
     orchestrator.settings.max_tool_calls_per_turn = 1
 
-    result = orchestrator.run_turn_result("echo twice")
+    result = run_turn(orchestrator, "echo twice")
     blocks = orchestrator.session_manager.get_context_blocks()
     tool_messages = blocks[0].content["tool_messages"]
     history = orchestrator.session_manager.get_state()["tool_history"]
@@ -300,7 +301,7 @@ def test_investigation_no_tool_no_critique_returns_final(tmp_path) -> None:
     provider = ScriptedProvider(chat=[LLMCompletionResult(content="plain final")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "answer",
         options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
     )
@@ -329,7 +330,7 @@ def test_investigation_json_schema_final_output_uses_last_no_tool_turn(tmp_path)
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "answer as schema",
         options=RunOptions.investigate(
             max_iterations=1,
@@ -376,7 +377,7 @@ def test_internal_synthesis_recovery_option_recovers_invalid_initial_plan_json(t
     provider = InvalidInitialPlanProvider(chat=[LLMCompletionResult(content="final after internal synthesis failure")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "recover from invalid initial plan",
         options=RunOptions.investigate(
             max_iterations=1,
@@ -411,7 +412,7 @@ def test_domain_hooks_customize_investigation_prompts_and_guidance(tmp_path) -> 
     hooks = CustomInvestigationHooks()
     orchestrator = build_orchestrator(tmp_path, provider, domain_hooks=hooks)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate with domain hooks",
         options=RunOptions.investigate(max_iterations=1),
     )
@@ -453,7 +454,7 @@ def test_investigation_internal_synthesis_can_use_dedicated_memory_provider(tmp_
     )
     orchestrator = build_orchestrator(tmp_path, primary_provider, memory_provider=memory_provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate with memory provider",
         options=RunOptions.investigate(max_iterations=1),
     )
@@ -480,7 +481,7 @@ def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_pa
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )
@@ -517,7 +518,7 @@ def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) ->
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate browser target",
         options=RunOptions(mode="investigate", max_iterations=3, require_initial_plan=False),
     )
@@ -552,7 +553,7 @@ def test_investigation_does_not_finalize_when_reflection_requires_continuation(t
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
     )
@@ -576,7 +577,7 @@ def test_investigation_stops_at_max_iterations_with_budget_answer(tmp_path) -> N
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
     )
@@ -594,7 +595,7 @@ def test_investigation_stops_after_no_progress(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(
             mode="investigate",
@@ -615,7 +616,7 @@ def test_investigation_stops_at_max_tool_calls(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=3, max_tool_calls=1, require_initial_plan=False),
     )
@@ -631,7 +632,7 @@ def test_investigation_returns_ask_user_question(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )
@@ -651,7 +652,7 @@ def test_investigation_policy_denial_can_block_safely(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider, policy_engine=PolicyEngine(validators={"echo": deny}))
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )
@@ -667,7 +668,7 @@ def test_final_critique_approved_returns_draft(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "answer",
         options=RunOptions(
             mode="investigate",
@@ -691,7 +692,7 @@ def test_final_critique_rejected_continues_when_budget_remains(tmp_path) -> None
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = orchestrator.run_turn_result(
+    result = run_turn(orchestrator,
         "answer",
         options=RunOptions(
             mode="investigate",
@@ -722,7 +723,7 @@ def test_investigation_pending_resume_continues_same_mode(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider, pending=True)
 
-    pending = orchestrator.run_turn_result(
+    pending = run_turn(orchestrator,
         "start pending",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )
@@ -731,7 +732,7 @@ def test_investigation_pending_resume_continues_same_mode(tmp_path) -> None:
     assert pending.metadata["job_id"] == "job-1"
     assert pending.metadata["mode"] == "investigate"
 
-    completed = orchestrator.resume_turn(pending_id=pending.pending_id or "", tool_content="done")
+    completed = resume_turn(orchestrator, pending_id=pending.pending_id or "", tool_content="done")
 
     assert completed.status == "completed"
     assert "external result arrived" in completed.content
