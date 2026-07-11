@@ -7,6 +7,7 @@ from inspect import Parameter, signature
 from typing import Any
 from uuid import uuid4
 
+from agent_core.conversation_state import build_conversation_state_view
 from agent_core.domain_hooks import DomainHooks
 from agent_core.execution_context import (
     ExecutionContext,
@@ -257,7 +258,7 @@ class AgentOrchestrator:
         try:
             self.domain_hooks.after_turn(
                 session_manager=self.session_manager,
-                thread_state=self.session_manager.get_thread_state(),
+                thread_state=build_conversation_state_view(self.session_manager.get_thread_state()),
                 turn_index=turn_index,
             )
         except Exception as exc:
@@ -299,7 +300,7 @@ class AgentOrchestrator:
             source_code_locations=runtime_context["source_code_locations"],
         )
         template.domain_extensions = self.domain_hooks.task_state_extensions_template(
-            thread_state=thread_state,
+            thread_state=build_conversation_state_view(thread_state),
             turn_index=turn_index,
         )
         payload = {
@@ -311,7 +312,7 @@ class AgentOrchestrator:
         }
         payload.update(
             self.domain_hooks.extend_task_state_payload(
-                thread_state=thread_state,
+                thread_state=build_conversation_state_view(thread_state),
                 turn_index=turn_index,
             )
         )
@@ -345,7 +346,7 @@ class AgentOrchestrator:
             previous_summary=None,
         )
         delta_template.domain_extensions = self.domain_hooks.session_summary_extensions_template(
-            thread_state=thread_state,
+            thread_state=build_conversation_state_view(thread_state),
         )
         delta_payload = {
             "thread_id": thread_state.thread_id,
@@ -356,8 +357,8 @@ class AgentOrchestrator:
         }
         delta_payload.update(
             self.domain_hooks.extend_session_summary_delta_payload(
-                thread_state=thread_state,
-                new_overflow_blocks=new_overflow_blocks,
+                thread_state=build_conversation_state_view(thread_state),
+                new_overflow_blocks=tuple(block.to_dict() for block in new_overflow_blocks),
             )
         )
         delta_summary = self.structured_synthesizer.synthesize(
@@ -376,7 +377,7 @@ class AgentOrchestrator:
             previous_summary=thread_state.summary,
         )
         merge_template.domain_extensions = self.domain_hooks.session_summary_extensions_template(
-            thread_state=thread_state,
+            thread_state=build_conversation_state_view(thread_state),
         )
         merge_payload = {
             "thread_id": thread_state.thread_id,

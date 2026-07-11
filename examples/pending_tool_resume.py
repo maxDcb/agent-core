@@ -4,18 +4,19 @@ import json
 from pathlib import Path
 
 from agent_core import (
-    AgentOrchestrator,
     CoreSettings,
     ExecutionContext,
-    PolicyEngine,
     RunContext,
-    SessionManager,
-    SessionRepository,
+)
+from agent_core.conversation import AgentOrchestrator, SessionManager, SessionRepository
+from agent_core.spi import (
+    LLMCompletionResult,
+    LLMToolCall,
+    PolicyEngine,
+    ToolRegistry,
     ToolResult,
     build_tool_definition,
 )
-from agent_core.llm.base import LLMCompletionResult, LLMToolCall
-from agent_core.tool_registry import ToolRegistry
 
 
 class FakeProvider:

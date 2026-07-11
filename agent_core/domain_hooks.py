@@ -1,11 +1,11 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from agent_core.conversation_state import ConversationStateView
     from agent_core.investigation_prompts import InvestigationPromptSet
-    from agent_core.memory.context_block import ContextBlock
-    from agent_core.memory.thread_state import ThreadState
     from agent_core.run_options import RunOptions
     from agent_core.session_manager import SessionManager
     from agent_core.settings import CoreSettings
@@ -25,7 +25,7 @@ class DomainHooks:
     def extend_task_state_payload(
         self,
         *,
-        thread_state: ThreadState,
+        thread_state: ConversationStateView,
         turn_index: int,
     ) -> dict[str, Any]:
         return {}
@@ -33,15 +33,15 @@ class DomainHooks:
     def extend_session_summary_delta_payload(
         self,
         *,
-        thread_state: ThreadState,
-        new_overflow_blocks: list[ContextBlock],
+        thread_state: ConversationStateView,
+        new_overflow_blocks: tuple[Mapping[str, Any], ...],
     ) -> dict[str, Any]:
         return {}
 
     def task_state_extensions_template(
         self,
         *,
-        thread_state: ThreadState,
+        thread_state: ConversationStateView,
         turn_index: int,
     ) -> dict[str, Any]:
         return {}
@@ -49,7 +49,7 @@ class DomainHooks:
     def session_summary_extensions_template(
         self,
         *,
-        thread_state: ThreadState,
+        thread_state: ConversationStateView,
     ) -> dict[str, Any]:
         return {}
 
@@ -66,7 +66,7 @@ class DomainHooks:
         self,
         *,
         session_manager: SessionManager,
-        thread_state: ThreadState,
+        thread_state: ConversationStateView,
         turn_index: int,
     ) -> None:
         return None

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Split and reduced the supported API into explicit run-engine, extension SPI,
+  optional conversation, and observability facades.
 - Added centralized local JSON Schema Draft 2020-12 validation for structured
   task and investigation outputs, including format checks and schema validation
   at contract construction.

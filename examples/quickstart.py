@@ -9,23 +9,28 @@ from pathlib import Path
 from typing import Any
 
 from agent_core import (
-    AgentOrchestrator,
     CoreSettings,
     ExecutionContext,
-    PolicyEngine,
     RunContext,
-    SessionManager,
-    SessionRepository,
     StructuredOutputContract,
     StructuredTaskRunner,
     StructuredTaskSpec,
+)
+from agent_core.conversation import AgentOrchestrator, SessionManager, SessionRepository
+from agent_core.spi import (
+    BaseLLMProvider,
+    LLMCallOptions,
+    LLMMessage,
+    LLMProviderError,
+    LLMToolDefinition,
+    PolicyEngine,
     ToolRegistry,
     ToolResult,
+    build_memory_provider,
+    build_provider,
     build_tool_definition,
+    normalize_provider_name,
 )
-from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage, LLMToolDefinition
-from agent_core.llm.errors import LLMProviderError
-from agent_core.llm.provider_factory import build_memory_provider, build_provider, normalize_provider_name
 
 DEFAULT_PROMPT = "What time is it? Use get_current_time, then answer in one sentence."
 DEMO_STATE_DIR = Path(".agent-core-demo")

@@ -230,47 +230,61 @@ context, idempotence and pipeline ownership rules.
 
 ## Public API
 
+The supported API is intentionally split by responsibility. The package root
+contains the autonomous run engine:
+
 ```python
 from agent_core import (
-    AgentOrchestrator,
     AgentRunResult,
     AgentRunService,
     AgentRunState,
     AgentRunMode,
-    AgentTurnResult,
-    BaseTool,
-    ContextBudget,
-    ConversationAgent,
     CoreSettings,
-    DomainHooks,
-    EvidenceItem,
     ExecutionContext,
     ExecutionScope,
-    FinalCritique,
-    Hypothesis,
-    InvestigationDecision,
-    InvestigationPromptSet,
-    InvestigationState,
-    JsonFileSessionStore,
-    PolicyEngine,
-    PromptBlock,
-    PromptSnapshot,
+    JsonFileRunStore,
+    RunContext,
     RunOptions,
     RunStore,
-    RunTrace,
-    SessionManager,
-    SessionRepository,
-    SessionStore,
-    StepReflection,
+    StructuredOutputContract,
     StructuredTaskResult,
     StructuredTaskRunner,
     StructuredTaskSpec,
+)
+```
+
+Provider, policy, domain and tool extension contracts live in `agent_core.spi`:
+
+```python
+from agent_core.spi import (
+    BaseLLMProvider,
+    DomainHooks,
+    LLMProviderError,
+    PolicyEngine,
     ToolRegistry,
     ToolResult,
-    TraceEvent,
     build_tool_definition,
 )
 ```
+
+Conversation and session support is optional and imported separately:
+
+```python
+from agent_core.conversation import (
+    AgentOrchestrator,
+    ConversationAgent,
+    SessionManager,
+    SessionRepository,
+)
+from agent_core.observability import RunTrace, configure_logging, get_logger
+```
+
+Only names exported by these four facades are covered by the public compatibility
+contract. Direct imports from other `agent_core.*` modules are implementation
+dependencies and may change without notice.
+
+See [docs/public_api.md](docs/public_api.md) for the ownership and compatibility
+rules of each facade.
 
 ## Development Checks
 
@@ -292,5 +306,3 @@ tests are part of the normal suite; longer diagnostic runs are scheduled in CI.
 This repository should stay focused on the generic runtime. Domain packages
 should depend on it instead of adding their prompts, tools or reporting logic
 here.
-    JsonFileRunStore,
-    RunContext,
