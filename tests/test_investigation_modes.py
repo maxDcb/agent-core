@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from agent_core.domain_hooks import DomainHooks
+from agent_core.investigation_controller import INVESTIGATION_STATE_MESSAGE_PREFIX
 from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.llm.base import LLMCompletionResult, LLMMessage, LLMToolCall
 from agent_core.memory.thread_state import render_context_blocks_to_messages
@@ -422,6 +423,8 @@ def test_domain_hooks_customize_investigation_prompts_and_guidance(tmp_path) -> 
         message.content for message in provider.chat_messages[0] if message.role == "system"
     ]
     assert any("Domain investigation guidance" in content for content in first_chat_system_messages)
+    assert sum(content.startswith("Run mode: investigate.") for content in first_chat_system_messages) == 1
+    assert sum(content.startswith(INVESTIGATION_STATE_MESSAGE_PREFIX) for content in first_chat_system_messages) == 1
 
 
 def test_investigation_internal_synthesis_can_use_dedicated_memory_provider(tmp_path) -> None:
@@ -522,6 +525,16 @@ def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) ->
     assert "browser_snapshot produced artifact browser-000005" in result.content
     assert "browser_snapshot not yet performed" not in result.content
     assert result.metadata["investigation_state"]["evidence_gaps"] == []
+    second_iteration_state_messages = [
+        message.content
+        for message in provider.chat_messages[1]
+        if message.role == "system" and message.content.startswith(INVESTIGATION_STATE_MESSAGE_PREFIX)
+    ]
+    assert len(second_iteration_state_messages) == 1
+    second_iteration_state = json.loads(second_iteration_state_messages[0].splitlines()[-1])
+    assert second_iteration_state["facts"][0]["summary"] == "navigation succeeded"
+    assert second_iteration_state["evidence_gaps"] == ["browser_snapshot not yet performed"]
+    assert second_iteration_state["next_actions"] == ["run browser_snapshot"]
 
 
 def test_investigation_does_not_finalize_when_reflection_requires_continuation(tmp_path) -> None:
@@ -690,6 +703,15 @@ def test_final_critique_rejected_continues_when_budget_remains(tmp_path) -> None
 
     assert result.content == "revised draft"
     assert result.metadata["iterations_used"] == 2
+    revised_iteration_state_messages = [
+        message.content
+        for message in provider.chat_messages[1]
+        if message.role == "system" and message.content.startswith(INVESTIGATION_STATE_MESSAGE_PREFIX)
+    ]
+    assert len(revised_iteration_state_messages) == 1
+    revised_iteration_state = json.loads(revised_iteration_state_messages[0].splitlines()[-1])
+    assert revised_iteration_state["evidence_gaps"] == ["unsupported claim"]
+    assert revised_iteration_state["next_actions"] == ["collect more evidence"]
 
 
 def test_investigation_pending_resume_continues_same_mode(tmp_path) -> None:

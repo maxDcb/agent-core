@@ -90,6 +90,9 @@ class TraceRecorder(Protocol):
         ...
 
 
+INVESTIGATION_STATE_MESSAGE_PREFIX = "Investigation controller state:"
+
+
 def with_investigation_guidance(
     messages: list[LLMMessage],
     *,
@@ -224,7 +227,7 @@ class InvestigationController:
             user_input=user_input,
             session_id=session_id,
             context=context,
-            messages=with_investigation_guidance(messages, options=options, prompt_set=self.prompt_set),
+            messages=messages,
             turn_index=turn_index,
             options=options,
             state=state,
@@ -309,8 +312,13 @@ class InvestigationController:
                 },
             )
             try:
-                llm_response = self.call_model_once(
+                assistant_messages = self._messages_with_iteration_state(
                     messages=messages,
+                    state=state,
+                    iteration=iterations_used,
+                )
+                llm_response = self.call_model_once(
+                    messages=assistant_messages,
                     options=self._call_options(options=options, target="assistant_step"),
                 )
             except LLMProviderError as exc:
@@ -1041,8 +1049,41 @@ class InvestigationController:
         lines.append(f"Confidence: {state.confidence:.2f}")
         return "\n".join(lines)
 
-    def _with_investigation_guidance(self, messages: list[LLMMessage], *, options: RunOptions) -> list[LLMMessage]:
-        return with_investigation_guidance(messages, options=options, prompt_set=self.prompt_set)
+    def _messages_with_iteration_state(
+        self,
+        *,
+        messages: list[LLMMessage],
+        state: InvestigationState,
+        iteration: int,
+    ) -> list[LLMMessage]:
+        state_payload = {
+            "iteration": iteration,
+            "objective": state.objective,
+            "plan": list(state.plan),
+            "facts": [fact.to_dict() for fact in state.facts],
+            "hypotheses": [hypothesis.to_dict() for hypothesis in state.hypotheses],
+            "evidence_gaps": list(state.evidence_gaps),
+            "completed_actions": list(state.completed_actions),
+            "next_actions": list(state.next_actions),
+            "risk_notes": list(state.risk_notes),
+            "confidence": state.confidence,
+            "stop_reason": state.stop_reason,
+        }
+        state_message = LLMMessage(
+            role="system",
+            content="\n".join(
+                [
+                    INVESTIGATION_STATE_MESSAGE_PREFIX,
+                    "This is the controller's current auditable state, not new user evidence.",
+                    "Use established facts, prioritize next actions, close evidence gaps, and respect risk notes.",
+                    "Do not repeat completed actions unless verification requires it.",
+                    json.dumps(state_payload, ensure_ascii=False, separators=(",", ":")),
+                ]
+            ),
+        )
+        if messages and messages[-1].role == "user":
+            return [*messages[:-1], state_message, messages[-1]]
+        return [*messages, state_message]
 
     def _call_options(self, *, options: RunOptions, target: str) -> LLMCallOptions:
         return LLMCallOptions(
