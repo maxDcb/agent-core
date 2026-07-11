@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+
 import agent_core
 import agent_core.conversation as conversation
 import agent_core.observability as observability
@@ -20,6 +22,7 @@ def test_run_engine_public_api_is_small_and_explicit() -> None:
     assert agent_core.__version__ == "0.3.0"
     assert set(agent_core.__all__) == {
         "AgentRunError",
+        "AgentRunAttempt",
         "AgentRunMode",
         "AgentRunResult",
         "AgentRunService",
@@ -31,6 +34,8 @@ def test_run_engine_public_api_is_small_and_explicit() -> None:
         "JSON_SCHEMA_DRAFT",
         "JsonFileRunStore",
         "RunContext",
+        "RunCheckpoint",
+        "RunExecutionBusyError",
         "RunOptions",
         "RunStatus",
         "RunStore",
@@ -137,6 +142,11 @@ def test_external_extensions_can_be_declared_using_only_public_facades() -> None
                 for (stored_namespace, _), state in self.states.items()
                 if stored_namespace == namespace_id and (parent_id is None or state.context.parent_id == parent_id)
             ]
+
+        @contextmanager
+        def acquire_execution(self, *, namespace_id: str, run_id: str):
+            _ = (namespace_id, run_id)
+            yield
 
     class ExternalDomain(spi.DomainHooks):
         pass

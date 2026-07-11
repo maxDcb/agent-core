@@ -6,9 +6,111 @@ from typing import Any, Literal, TypeAlias
 from agent_core.run_context import ExecutionScope, RunContext
 from agent_core.types import utc_now_iso
 
-RunStatus: TypeAlias = Literal["created", "running", "pending", "completed", "failed", "cancelled", "blocked"]
+RunStatus: TypeAlias = Literal[
+    "created",
+    "running",
+    "pending",
+    "interrupted",
+    "completed",
+    "failed",
+    "cancelled",
+    "blocked",
+]
 RunStrategy: TypeAlias = Literal["structured", "direct", "investigate", "deep_investigate"]
-RUN_SCHEMA_VERSION = 1
+RunAttemptStatus: TypeAlias = Literal[
+    "running",
+    "pending",
+    "interrupted",
+    "completed",
+    "failed",
+    "cancelled",
+    "blocked",
+]
+RUN_SCHEMA_VERSION = 2
+
+
+@dataclass(slots=True)
+class RunCheckpoint:
+    kind: str
+    sequence: int
+    payload: dict[str, Any]
+    updated_at: str = field(default_factory=utc_now_iso)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "sequence": self.sequence,
+            "payload": dict(self.payload),
+            "updated_at": self.updated_at,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> RunCheckpoint | None:
+        if not isinstance(payload, dict):
+            return None
+        kind = payload.get("kind")
+        sequence = payload.get("sequence")
+        checkpoint_payload = payload.get("payload")
+        if not isinstance(kind, str) or not isinstance(sequence, int) or not isinstance(checkpoint_payload, dict):
+            return None
+        updated_at = payload.get("updated_at")
+        return cls(
+            kind=kind,
+            sequence=max(0, sequence),
+            payload=dict(checkpoint_payload),
+            updated_at=updated_at if isinstance(updated_at, str) else utc_now_iso(),
+        )
+
+
+@dataclass(slots=True)
+class AgentRunAttempt:
+    attempt_id: str
+    status: RunAttemptStatus = "running"
+    started_at: str = field(default_factory=utc_now_iso)
+    completed_at: str | None = None
+    resumed_from_sequence: int | None = None
+    failure_reason: str = ""
+
+    def finish(self, status: RunAttemptStatus, *, failure_reason: str = "") -> None:
+        self.status = status
+        self.completed_at = utc_now_iso()
+        self.failure_reason = failure_reason
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "attempt_id": self.attempt_id,
+            "status": self.status,
+            "started_at": self.started_at,
+            "completed_at": self.completed_at,
+            "resumed_from_sequence": self.resumed_from_sequence,
+            "failure_reason": self.failure_reason,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> AgentRunAttempt | None:
+        if not isinstance(payload, dict):
+            return None
+        attempt_id = payload.get("attempt_id")
+        status = payload.get("status")
+        if not isinstance(attempt_id, str) or not attempt_id:
+            return None
+        normalized_status: RunAttemptStatus = (
+            status
+            if status in {"running", "pending", "interrupted", "completed", "failed", "cancelled", "blocked"}
+            else "interrupted"
+        )
+        started_at = payload.get("started_at")
+        completed_at = payload.get("completed_at")
+        resumed_from_sequence = payload.get("resumed_from_sequence")
+        failure_reason = payload.get("failure_reason")
+        return cls(
+            attempt_id=attempt_id,
+            status=normalized_status,
+            started_at=started_at if isinstance(started_at, str) else utc_now_iso(),
+            completed_at=completed_at if isinstance(completed_at, str) else None,
+            resumed_from_sequence=resumed_from_sequence if isinstance(resumed_from_sequence, int) else None,
+            failure_reason=failure_reason if isinstance(failure_reason, str) else "",
+        )
 
 
 @dataclass(slots=True)
@@ -83,7 +185,7 @@ class AgentRunResult:
         run_id = payload.get("run_id")
         status = payload.get("status")
         if not isinstance(run_id, str) or status not in {
-            "created", "running", "pending", "completed", "failed", "cancelled", "blocked"
+            "created", "running", "pending", "interrupted", "completed", "failed", "cancelled", "blocked"
         }:
             return None
         output = payload.get("output")
@@ -116,18 +218,20 @@ class AgentRunState:
     updated_at: str = field(default_factory=utc_now_iso)
     result: AgentRunResult | None = None
     error: AgentRunError | None = None
-    checkpoint: dict[str, Any] = field(default_factory=dict)
+    checkpoint: RunCheckpoint | None = None
+    attempts: list[AgentRunAttempt] = field(default_factory=list)
     schema_version: int = RUN_SCHEMA_VERSION
 
     def transition(self, status: RunStatus) -> None:
         allowed: dict[RunStatus, set[RunStatus]] = {
             "created": {"running", "cancelled"},
-            "running": {"pending", "completed", "failed", "cancelled", "blocked"},
-            "pending": {"running", "completed", "failed", "cancelled", "blocked"},
+            "running": {"pending", "interrupted", "completed", "failed", "cancelled", "blocked"},
+            "pending": {"running", "interrupted", "completed", "failed", "cancelled", "blocked"},
+            "interrupted": {"running", "cancelled", "blocked"},
             "completed": set(),
             "failed": set(),
             "cancelled": set(),
-            "blocked": set(),
+            "blocked": {"running", "cancelled"},
         }
         if status != self.status and status not in allowed[self.status]:
             raise ValueError(f"Invalid run transition: {self.status} -> {status}")
@@ -146,7 +250,8 @@ class AgentRunState:
             "updated_at": self.updated_at,
             "result": self.result.to_dict() if self.result is not None else None,
             "error": self.error.to_dict() if self.error is not None else None,
-            "checkpoint": dict(self.checkpoint),
+            "checkpoint": self.checkpoint.to_dict() if self.checkpoint is not None else None,
+            "attempts": [attempt.to_dict() for attempt in self.attempts],
         }
 
     @classmethod
@@ -180,10 +285,25 @@ class AgentRunState:
         )
         normalized_status: RunStatus = (
             status
-            if status in {"created", "running", "pending", "completed", "failed", "cancelled", "blocked"}
+            if status in {
+                "created",
+                "running",
+                "pending",
+                "interrupted",
+                "completed",
+                "failed",
+                "cancelled",
+                "blocked",
+            }
             else "failed"
         )
-        checkpoint = payload.get("checkpoint")
+        checkpoint = RunCheckpoint.from_dict(payload.get("checkpoint"))
+        raw_attempts = payload.get("attempts")
+        attempts = (
+            [attempt for item in raw_attempts if (attempt := AgentRunAttempt.from_dict(item)) is not None]
+            if isinstance(raw_attempts, list)
+            else []
+        )
         created_at = payload.get("created_at")
         updated_at = payload.get("updated_at")
         schema_version = payload.get("schema_version")
@@ -197,6 +317,7 @@ class AgentRunState:
             updated_at=updated_at if isinstance(updated_at, str) else utc_now_iso(),
             result=AgentRunResult.from_dict(payload.get("result")),
             error=AgentRunError.from_dict(payload.get("error")),
-            checkpoint=dict(checkpoint) if isinstance(checkpoint, dict) else {},
+            checkpoint=checkpoint,
+            attempts=attempts,
             schema_version=schema_version if isinstance(schema_version, int) else 0,
         )

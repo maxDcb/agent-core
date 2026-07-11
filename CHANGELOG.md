@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Added lossless structured-run checkpoints, explicit interrupted-run resume,
+  run-attempt audit history, local execution locks, and fail-closed ambiguous
+  tool reconciliation.
 - Split and reduced the supported API into explicit run-engine, extension SPI,
   optional conversation, and observability facades.
 - Added centralized local JSON Schema Draft 2020-12 validation for structured

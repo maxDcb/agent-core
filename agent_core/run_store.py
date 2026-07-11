@@ -3,11 +3,22 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections.abc import Iterator
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Protocol
+from threading import Lock
+from typing import BinaryIO, Protocol
 
 from agent_core.run_models import AgentRunState
+
+
+class RunExecutionBusyError(RuntimeError):
+    """Raised when another worker already owns a run execution lock."""
+
+
+_LOCK_REGISTRY_GUARD = Lock()
+_LOCK_REGISTRY: dict[str, Lock] = {}
 
 
 class RunStore(Protocol):
@@ -18,6 +29,8 @@ class RunStore(Protocol):
     def load(self, *, namespace_id: str, run_id: str) -> AgentRunState | None: ...
 
     def list(self, *, namespace_id: str, parent_id: str | None = None) -> list[AgentRunState]: ...
+
+    def acquire_execution(self, *, namespace_id: str, run_id: str) -> AbstractContextManager[None]: ...
 
 
 class JsonFileRunStore:
@@ -65,6 +78,31 @@ class JsonFileRunStore:
                 states.append(state)
         return sorted(states, key=lambda item: item.created_at)
 
+    @contextmanager
+    def acquire_execution(self, *, namespace_id: str, run_id: str) -> Iterator[None]:
+        lock_path = self._run_path(namespace_id=namespace_id, run_id=run_id).parent / ".execution.lock"
+        lock_key = str(lock_path)
+        thread_lock = _thread_lock(lock_key)
+        if not thread_lock.acquire(blocking=False):
+            raise RunExecutionBusyError(f"Agent run is already executing: {run_id}")
+        handle = None
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            handle = lock_path.open("a+b")
+            _ensure_lock_byte(handle)
+            try:
+                _lock_file_non_blocking(handle)
+            except OSError as exc:
+                raise RunExecutionBusyError(f"Agent run is already executing: {run_id}") from exc
+            try:
+                yield
+            finally:
+                _unlock_file(handle)
+        finally:
+            if handle is not None:
+                handle.close()
+            thread_lock.release()
+
     def _namespace_directory(self, namespace_id: str) -> Path:
         return self.root_directory / _storage_key(namespace_id)
 
@@ -90,3 +128,40 @@ class JsonFileRunStore:
 
 def _storage_key(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _thread_lock(lock_key: str) -> Lock:
+    with _LOCK_REGISTRY_GUARD:
+        return _LOCK_REGISTRY.setdefault(lock_key, Lock())
+
+
+def _ensure_lock_byte(handle: BinaryIO) -> None:
+    handle.seek(0, os.SEEK_END)
+    if handle.tell() == 0:
+        handle.write(b"\0")
+        handle.flush()
+        os.fsync(handle.fileno())
+    handle.seek(0)
+
+
+def _lock_file_non_blocking(handle: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)  # type: ignore[attr-defined]
+
+
+def _unlock_file(handle: BinaryIO) -> None:
+    handle.seek(0)
+    if os.name == "nt":
+        import msvcrt
+
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)  # type: ignore[attr-defined]

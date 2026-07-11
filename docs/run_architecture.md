@@ -35,8 +35,26 @@ after execution. Repeating a completed or failed `run_id` with the identical
 request returns the stored result and never replays tools. Rebinding a run id
 to another specification or context is rejected.
 
-`RunStore` is a protocol. `JsonFileRunStore` is the reference single-process
-implementation; applications can supply a transactional multi-worker store.
+During execution, the structured runner persists a lossless, versioned
+checkpoint before each provider request, before and after every tool call, and
+after receiving the final provider response. The checkpoint contains the exact
+transcript, counters, tool cursor, tool history and a fingerprint of the task
+specification. `AgentRunService.resume()` continues a non-terminal run from
+that checkpoint. A changed specification is rejected.
+
+A tool call persisted as completed is never replayed. A tool call left in
+`running` is considered ambiguous because its external effect may have happened
+before the process stopped. Recovery becomes `blocked` until the host reconciles
+the effect and calls `resolve_ambiguous_tool()` with the observed result.
+
+Each execution or recovery is recorded as an `AgentRunAttempt`. Interrupted,
+blocked and completed attempts remain in the run state for audit.
+
+`RunStore` is a protocol and includes an execution-ownership context manager.
+`JsonFileRunStore` uses an in-process lock plus an OS file lock, so two local
+threads or processes cannot execute or resume the same run concurrently.
+Applications can supply a transactional distributed store implementing the
+same ownership contract.
 
 ## Optional conversation
 

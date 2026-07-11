@@ -101,7 +101,11 @@ resume example.
   definitions.
 - `PolicyEngine` authorizes tool calls before execution.
 - `RunStore` persists run state; `JsonFileRunStore` is the reference
-  single-process implementation.
+  local filesystem implementation with thread and process execution locks.
+- Structured runs persist lossless checkpoints and can resume after process
+  interruption without replaying completed tools.
+- Ambiguous tool effects fail closed until the host supplies a reconciled
+  result.
 - `RunOptions` selects the execution mode and investigation budgets.
 - `DomainHooks` let applications add domain prompt blocks and memory payloads
   without adding domain logic to the core package.

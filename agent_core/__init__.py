@@ -14,10 +14,18 @@ from agent_core.output_contracts import (
     StructuredOutputValidationIssue,
 )
 from agent_core.run_context import ExecutionScope, RunContext
-from agent_core.run_models import AgentRunError, AgentRunResult, AgentRunState, RunStatus, RunStrategy
+from agent_core.run_models import (
+    AgentRunAttempt,
+    AgentRunError,
+    AgentRunResult,
+    AgentRunState,
+    RunCheckpoint,
+    RunStatus,
+    RunStrategy,
+)
 from agent_core.run_options import AgentRunMode, RunOptions
 from agent_core.run_service import AgentRunService
-from agent_core.run_store import JsonFileRunStore, RunStore
+from agent_core.run_store import JsonFileRunStore, RunExecutionBusyError, RunStore
 from agent_core.settings import CoreSettings
 from agent_core.structured_tasks import StructuredTaskResult, StructuredTaskRunner, StructuredTaskSpec
 
@@ -25,6 +33,7 @@ __version__ = "0.3.0"
 
 __all__ = [
     "AgentRunError",
+    "AgentRunAttempt",
     "AgentRunMode",
     "AgentRunResult",
     "AgentRunService",
@@ -36,6 +45,8 @@ __all__ = [
     "JSON_SCHEMA_DRAFT",
     "JsonFileRunStore",
     "RunContext",
+    "RunCheckpoint",
+    "RunExecutionBusyError",
     "RunOptions",
     "RunStatus",
     "RunStore",

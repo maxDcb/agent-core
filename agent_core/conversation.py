@@ -5,7 +5,14 @@ from uuid import uuid4
 from agent_core.conversation_state import ConversationStateView
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.run_context import RunContext
-from agent_core.run_models import AgentRunError, AgentRunResult, AgentRunState, RunStatus
+from agent_core.run_models import (
+    AgentRunAttempt,
+    AgentRunError,
+    AgentRunResult,
+    AgentRunState,
+    RunCheckpoint,
+    RunStatus,
+)
 from agent_core.run_options import RunOptions
 from agent_core.run_store import RunStore
 from agent_core.session_manager import SessionManager
@@ -51,58 +58,16 @@ class ConversationAgent:
             correlation=context.correlation,
             application_context=context.application_context,
         )
-        existing = self.run_store.load(namespace_id=bound_context.namespace_id, run_id=resolved_run_id)
-        if existing is not None:
-            if existing.spec_id != "conversation_turn" or existing.context != bound_context:
-                raise ValueError(f"Run id is already bound to a different request: {resolved_run_id}")
-            if existing.result is not None:
-                return existing.result
-            raise RuntimeError(f"Conversation run already exists without a result: {resolved_run_id}")
-        selected_options = options or RunOptions.direct()
-        state = AgentRunState(
+        with self.run_store.acquire_execution(
+            namespace_id=bound_context.namespace_id,
             run_id=resolved_run_id,
-            strategy=selected_options.mode,
-            spec_id="conversation_turn",
-            context=bound_context,
-        )
-        self.run_store.create(state)
-        state.transition("running")
-        self.run_store.save(state)
-        try:
-            turn = self.orchestrator.run_turn_result(
-                user_input=user_input,
+        ):
+            return self._execute_turn_locked(
                 thread_id=thread_id,
                 context=bound_context,
-                options=selected_options,
+                user_input=user_input,
+                options=options or RunOptions.direct(),
             )
-        except Exception as exc:
-            error = AgentRunError(kind="conversation_run_error", message="Conversation run failed.", detail=str(exc))
-            result = AgentRunResult(run_id=resolved_run_id, status="failed", error=error)
-            state.error = error
-            state.result = result
-            state.transition("failed")
-            self.run_store.save(state)
-            return result
-
-        status: RunStatus = "pending" if turn.is_pending else "completed"
-        result = AgentRunResult(
-            run_id=resolved_run_id,
-            status=status,
-            raw_content=turn.content,
-            tool_calls_used=int(turn.metadata.get("tool_calls_used", 0)),
-            iterations=int(turn.metadata.get("iterations_used", 0)),
-            metadata={
-                **turn.metadata,
-                "pending_id": turn.pending_id,
-                "tool_name": turn.tool_name,
-                "tool_arguments": dict(turn.tool_arguments),
-            },
-        )
-        state.result = result
-        state.checkpoint = {"pending_id": turn.pending_id} if turn.pending_id else {}
-        state.transition(status)
-        self.run_store.save(state)
-        return result
 
     def resume(
         self,
@@ -113,28 +78,91 @@ class ConversationAgent:
         tool_content: str,
         ok: bool = True,
     ) -> AgentRunResult:
-        state = self.run_store.load(namespace_id=namespace_id, run_id=run_id)
-        if state is None:
-            raise KeyError(f"Unknown run: {run_id}")
-        if state.status != "pending":
-            if state.result is not None:
-                return state.result
-            raise ValueError(f"Run is not pending: {run_id}")
-        if state.context.thread_id is None:
-            raise ValueError("Pending conversation run has no thread_id")
+        with self.run_store.acquire_execution(namespace_id=namespace_id, run_id=run_id):
+            state = self.run_store.load(namespace_id=namespace_id, run_id=run_id)
+            if state is None:
+                raise KeyError(f"Unknown run: {run_id}")
+            if state.status != "pending":
+                if state.result is not None:
+                    return state.result
+                raise ValueError(f"Run is not pending: {run_id}")
+            if state.context.thread_id is None:
+                raise ValueError("Pending conversation run has no thread_id")
+            expected_pending_id = (
+                state.checkpoint.payload.get("pending_id")
+                if state.checkpoint is not None and state.checkpoint.kind == "conversation"
+                else None
+            )
+            if expected_pending_id != pending_id:
+                raise ValueError(f"Pending id does not match the persisted conversation checkpoint: {pending_id}")
 
-        state.transition("running")
-        self.run_store.save(state)
-        turn = self.orchestrator.resume_turn(
-            pending_id=pending_id,
-            tool_content=tool_content,
-            thread_id=state.context.thread_id,
-            context=state.context,
-            ok=ok,
+            state.transition("running")
+            attempt = AgentRunAttempt(
+                attempt_id=f"attempt-{uuid4().hex}",
+                resumed_from_sequence=state.checkpoint.sequence if state.checkpoint is not None else None,
+            )
+            state.attempts.append(attempt)
+            self.run_store.save(state)
+            try:
+                turn = self.orchestrator.resume_turn(
+                    pending_id=pending_id,
+                    tool_content=tool_content,
+                    thread_id=state.context.thread_id,
+                    context=state.context,
+                    ok=ok,
+                )
+            except Exception as exc:
+                return self._commit_conversation_failure(state=state, attempt=attempt, exc=exc)
+            return self._commit_turn(state=state, attempt=attempt, turn=turn)
+
+    def _execute_turn_locked(
+        self,
+        *,
+        thread_id: str,
+        context: RunContext,
+        user_input: str,
+        options: RunOptions,
+    ) -> AgentRunResult:
+        existing = self.run_store.load(namespace_id=context.namespace_id, run_id=context.run_id or "")
+        if existing is not None:
+            if existing.spec_id != "conversation_turn" or existing.context != context:
+                raise ValueError(f"Run id is already bound to a different request: {context.run_id}")
+            if existing.result is not None:
+                return existing.result
+            raise RuntimeError(f"Conversation run already exists without a result: {context.run_id}")
+
+        state = AgentRunState(
+            run_id=context.run_id or "",
+            strategy=options.mode,
+            spec_id="conversation_turn",
+            context=context,
         )
+        self.run_store.create(state)
+        state.transition("running")
+        attempt = AgentRunAttempt(attempt_id=f"attempt-{uuid4().hex}")
+        state.attempts.append(attempt)
+        self.run_store.save(state)
+        try:
+            turn = self.orchestrator.run_turn_result(
+                user_input=user_input,
+                thread_id=thread_id,
+                context=context,
+                options=options,
+            )
+        except Exception as exc:
+            return self._commit_conversation_failure(state=state, attempt=attempt, exc=exc)
+        return self._commit_turn(state=state, attempt=attempt, turn=turn)
+
+    def _commit_turn(
+        self,
+        *,
+        state: AgentRunState,
+        attempt: AgentRunAttempt,
+        turn: AgentTurnResult,
+    ) -> AgentRunResult:
         status: RunStatus = "pending" if turn.is_pending else "completed"
         result = AgentRunResult(
-            run_id=run_id,
+            run_id=state.run_id,
             status=status,
             raw_content=turn.content,
             tool_calls_used=int(turn.metadata.get("tool_calls_used", 0)),
@@ -146,8 +174,38 @@ class ConversationAgent:
                 "tool_arguments": dict(turn.tool_arguments),
             },
         )
+        previous_sequence = state.checkpoint.sequence if state.checkpoint is not None else 0
         state.result = result
-        state.checkpoint = {"pending_id": turn.pending_id} if turn.pending_id else {}
+        state.checkpoint = (
+            RunCheckpoint(
+                kind="conversation",
+                sequence=previous_sequence + 1,
+                payload={"pending_id": turn.pending_id},
+            )
+            if turn.pending_id
+            else None
+        )
+        attempt.finish("pending" if turn.is_pending else "completed")
         state.transition(status)
+        self.run_store.save(state)
+        return result
+
+    def _commit_conversation_failure(
+        self,
+        *,
+        state: AgentRunState,
+        attempt: AgentRunAttempt,
+        exc: Exception,
+    ) -> AgentRunResult:
+        error = AgentRunError(
+            kind="conversation_run_error",
+            message="Conversation run failed.",
+            detail=str(exc),
+        )
+        result = AgentRunResult(run_id=state.run_id, status="failed", error=error)
+        state.error = error
+        state.result = result
+        attempt.finish("failed", failure_reason=error.message)
+        state.transition("failed")
         self.run_store.save(state)
         return result

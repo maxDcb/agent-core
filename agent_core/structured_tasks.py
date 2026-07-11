@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
-from typing import Any
+from typing import Any, Literal
 
 from agent_core.execution_context import ExecutionContext
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall
@@ -20,6 +22,11 @@ from agent_core.tool_registry import ToolRegistry
 from agent_core.types import ToolExecutionStatus
 
 logger = get_logger(__name__)
+
+StructuredTaskCheckpointPhase = Literal["model_request", "tools", "finalization", "result"]
+StructuredToolCallStatus = Literal["prepared", "running", "completed", "budget_exhausted"]
+StructuredFinalizationKind = Literal["contract", "budget"]
+StructuredResultKind = Literal["direct", "contract", "budget"]
 
 
 def _clean_string(value: object, *, default: str = "") -> str:
@@ -147,6 +154,10 @@ def _clean_optional_positive_int(value: object) -> int | None:
     return normalized if normalized > 0 else None
 
 
+def _fingerprint_fallback(value: object) -> str:
+    return f"{type(value).__module__}.{type(value).__qualname__}:{value}"
+
+
 @dataclass(slots=True)
 class StructuredTaskSpec:
     """Caller-owned specification for one bounded, tool-using structured task."""
@@ -190,6 +201,41 @@ class StructuredTaskSpec:
             "metadata": dict(self.metadata),
         }
 
+    def fingerprint(self) -> str:
+        contract = self.output_contract
+        payload = {
+            "task_id": self.task_id,
+            "system_prompt": self.system_prompt,
+            "objective": self.objective,
+            "context": self.context,
+            "constraints": list(self.constraints),
+            "target": self.target,
+            "allowed_tools": list(self.allowed_tools),
+            "output_contract": (
+                {
+                    "name": contract.name,
+                    "schema": contract.schema,
+                    "strict": contract.strict,
+                    "instructions": list(contract.instructions),
+                }
+                if contract is not None
+                else None
+            ),
+            "model": self.model,
+            "temperature": self.temperature,
+            "max_tool_calls": self.max_tool_calls,
+            "max_iterations": self.max_iterations,
+            "metadata": self.metadata,
+        }
+        serialized = json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            default=_fingerprint_fallback,
+        )
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
 def _response_format_for_spec(spec: StructuredTaskSpec, *, final_output: bool = True) -> dict[str, Any] | None:
     if spec.output_contract is None or not final_output:
         return None
@@ -222,6 +268,134 @@ class StructuredTaskResult:
         }
 
 
+@dataclass(slots=True)
+class StructuredToolCallCheckpoint:
+    tool_call_id: str
+    tool_name: str
+    arguments_json: str
+    status: StructuredToolCallStatus = "prepared"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "tool_call_id": self.tool_call_id,
+            "tool_name": self.tool_name,
+            "arguments_json": self.arguments_json,
+            "status": self.status,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> StructuredToolCallCheckpoint | None:
+        if not isinstance(payload, dict):
+            return None
+        tool_call_id = payload.get("tool_call_id")
+        tool_name = payload.get("tool_name")
+        arguments_json = payload.get("arguments_json")
+        status = payload.get("status")
+        if not isinstance(tool_call_id, str) or not isinstance(tool_name, str):
+            return None
+        if not isinstance(arguments_json, str):
+            arguments_json = "{}"
+        normalized_status: StructuredToolCallStatus = (
+            status if status in {"prepared", "running", "completed", "budget_exhausted"} else "prepared"
+        )
+        return cls(
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            arguments_json=arguments_json,
+            status=normalized_status,
+        )
+
+
+@dataclass(slots=True)
+class StructuredTaskCheckpoint:
+    spec_fingerprint: str
+    phase: StructuredTaskCheckpointPhase
+    messages: list[LLMMessage]
+    tool_history: list[dict[str, Any]] = field(default_factory=list)
+    iterations: int = 0
+    tool_calls_used: int = 0
+    pending_tool_calls: list[StructuredToolCallCheckpoint] = field(default_factory=list)
+    next_tool_call_index: int = 0
+    finalization_kind: StructuredFinalizationKind | None = None
+    finalization_reason: str = ""
+    raw_failure_content: str = ""
+    result_kind: StructuredResultKind | None = None
+    sequence: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "spec_fingerprint": self.spec_fingerprint,
+            "phase": self.phase,
+            "messages": [message.to_history_dict() for message in self.messages],
+            "tool_history": [dict(item) for item in self.tool_history],
+            "iterations": self.iterations,
+            "tool_calls_used": self.tool_calls_used,
+            "pending_tool_calls": [item.to_dict() for item in self.pending_tool_calls],
+            "next_tool_call_index": self.next_tool_call_index,
+            "finalization_kind": self.finalization_kind,
+            "finalization_reason": self.finalization_reason,
+            "raw_failure_content": self.raw_failure_content,
+            "result_kind": self.result_kind,
+            "sequence": self.sequence,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: object) -> StructuredTaskCheckpoint | None:
+        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+            return None
+        spec_fingerprint = payload.get("spec_fingerprint")
+        phase = payload.get("phase")
+        if not isinstance(spec_fingerprint, str) or phase not in {
+            "model_request",
+            "tools",
+            "finalization",
+            "result",
+        }:
+            return None
+        raw_messages = payload.get("messages")
+        if not isinstance(raw_messages, list):
+            return None
+        messages = [LLMMessage.from_history_dict(item) for item in raw_messages if isinstance(item, dict)]
+        raw_history = payload.get("tool_history")
+        raw_pending = payload.get("pending_tool_calls")
+        pending = (
+            [item for value in raw_pending if (item := StructuredToolCallCheckpoint.from_dict(value)) is not None]
+            if isinstance(raw_pending, list)
+            else []
+        )
+        finalization_kind = payload.get("finalization_kind")
+        normalized_kind: StructuredFinalizationKind | None = (
+            finalization_kind if finalization_kind in {"contract", "budget"} else None
+        )
+        result_kind = payload.get("result_kind")
+        normalized_result_kind: StructuredResultKind | None = (
+            result_kind if result_kind in {"direct", "contract", "budget"} else None
+        )
+        return cls(
+            spec_fingerprint=spec_fingerprint,
+            phase=phase,
+            messages=messages,
+            tool_history=[dict(item) for item in raw_history if isinstance(item, dict)] if isinstance(raw_history, list) else [],
+            iterations=_clean_positive_int(payload.get("iterations"), default=0),
+            tool_calls_used=_clean_positive_int(payload.get("tool_calls_used"), default=0),
+            pending_tool_calls=pending,
+            next_tool_call_index=_clean_positive_int(payload.get("next_tool_call_index"), default=0),
+            finalization_kind=normalized_kind,
+            finalization_reason=_clean_string(payload.get("finalization_reason")),
+            raw_failure_content=str(payload.get("raw_failure_content") or ""),
+            result_kind=normalized_result_kind,
+            sequence=_clean_positive_int(payload.get("sequence"), default=0),
+        )
+
+
+class StructuredTaskRecoveryError(RuntimeError):
+    def __init__(self, *, kind: str, message: str, tool_call_id: str | None = None) -> None:
+        self.kind = kind
+        self.tool_call_id = tool_call_id
+        super().__init__(message)
+
+
 class StructuredTaskRunner:
     """Run one bounded structured task with a caller-selected tool subset."""
 
@@ -243,6 +417,75 @@ class StructuredTaskRunner:
         *,
         spec: StructuredTaskSpec,
         context: ExecutionContext,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None = None,
+    ) -> StructuredTaskResult:
+        checkpoint = StructuredTaskCheckpoint(
+            spec_fingerprint=spec.fingerprint(),
+            phase="model_request",
+            messages=self._build_messages(spec=spec, context=context),
+            iterations=1,
+        )
+        self._emit_checkpoint(checkpoint, on_checkpoint)
+        return self._continue_from_checkpoint(
+            spec=spec,
+            context=context,
+            checkpoint=checkpoint,
+            on_checkpoint=on_checkpoint,
+        )
+
+    def resume(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        context: ExecutionContext,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None = None,
+    ) -> StructuredTaskResult:
+        if checkpoint.spec_fingerprint != spec.fingerprint():
+            raise StructuredTaskRecoveryError(
+                kind="spec_mismatch",
+                message="The structured task specification does not match the persisted run checkpoint.",
+            )
+        self._validate_checkpoint_shape(checkpoint)
+        return self._continue_from_checkpoint(
+            spec=spec,
+            context=context,
+            checkpoint=checkpoint,
+            on_checkpoint=on_checkpoint,
+        )
+
+    @staticmethod
+    def _validate_checkpoint_shape(checkpoint: StructuredTaskCheckpoint) -> None:
+        if not checkpoint.messages or checkpoint.iterations < 1 or checkpoint.tool_calls_used < 0:
+            raise StructuredTaskRecoveryError(
+                kind="invalid_checkpoint",
+                message="Structured task checkpoint is missing required execution state.",
+            )
+        if checkpoint.next_tool_call_index < 0 or checkpoint.next_tool_call_index > len(
+            checkpoint.pending_tool_calls
+        ):
+            raise StructuredTaskRecoveryError(
+                kind="invalid_checkpoint",
+                message="Structured task checkpoint has an invalid tool-call cursor.",
+            )
+        if checkpoint.phase == "finalization" and checkpoint.finalization_kind is None:
+            raise StructuredTaskRecoveryError(
+                kind="invalid_checkpoint",
+                message="Structured task finalization checkpoint has no finalization kind.",
+            )
+        if checkpoint.phase == "result" and checkpoint.result_kind is None:
+            raise StructuredTaskRecoveryError(
+                kind="invalid_checkpoint",
+                message="Structured task result checkpoint has no result kind.",
+            )
+
+    def _continue_from_checkpoint(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        context: ExecutionContext,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
     ) -> StructuredTaskResult:
         try:
             registry = self.tool_registry.build_subset(spec.allowed_tools)
@@ -253,25 +496,57 @@ class StructuredTaskRunner:
                 failure_reason=str(exc),
             )
 
-        messages = self._build_messages(spec=spec, context=context)
-        tool_history: list[dict[str, Any]] = []
-        iterations = 0
-        tool_calls_used = 0
+        while True:
+            if checkpoint.phase == "result":
+                return self._continue_persisted_result(spec=spec, checkpoint=checkpoint)
 
-        while iterations < spec.max_iterations:
-            iterations += 1
+            if checkpoint.phase == "finalization":
+                finalized = self._continue_finalization(
+                    spec=spec,
+                    checkpoint=checkpoint,
+                    on_checkpoint=on_checkpoint,
+                )
+                if finalized is not None:
+                    return finalized
+                continue
+
+            if checkpoint.phase == "tools":
+                blocked = next(
+                    (item for item in checkpoint.pending_tool_calls if item.status == "running"),
+                    None,
+                )
+                if blocked is not None:
+                    raise StructuredTaskRecoveryError(
+                        kind="ambiguous_tool_execution",
+                        message=(
+                            "A tool call was running when execution stopped; automatic replay is blocked "
+                            f"because its external effect is unknown: {blocked.tool_name} ({blocked.tool_call_id})."
+                        ),
+                        tool_call_id=blocked.tool_call_id,
+                    )
+                finalized = self._continue_tool_batch(
+                    spec=spec,
+                    context=context,
+                    registry=registry,
+                    checkpoint=checkpoint,
+                    on_checkpoint=on_checkpoint,
+                )
+                if finalized is not None:
+                    return finalized
+                continue
+
             logger.debug(
                 "Calling structured task LLM",
                 extra={
                     "task_id": spec.task_id,
-                    "iteration": iterations,
+                    "iteration": checkpoint.iterations,
                     "tool_count": len(registry.list_tool_names()),
                 },
             )
             try:
                 llm_response = self._call_model_once(
                     spec=spec,
-                    messages=messages,
+                    messages=checkpoint.messages,
                     registry=registry,
                     final_output=not registry.list_tool_names(),
                 )
@@ -285,9 +560,9 @@ class StructuredTaskRunner:
                     task_id=spec.task_id,
                     failure_reason=exc.user_message,
                     raw_content=exc.detail or exc.user_message,
-                    tool_history=tool_history,
-                    iterations=iterations,
-                    tool_calls_used=tool_calls_used,
+                    tool_history=checkpoint.tool_history,
+                    iterations=checkpoint.iterations,
+                    tool_calls_used=checkpoint.tool_calls_used,
                 )
 
             assistant_message = LLMMessage(
@@ -295,68 +570,231 @@ class StructuredTaskRunner:
                 content=llm_response.content,
                 tool_calls=list(llm_response.tool_calls),
             )
-            messages.append(assistant_message)
+            checkpoint.messages.append(assistant_message)
 
             if not llm_response.tool_calls:
                 if spec.output_contract is not None and registry.list_tool_names():
-                    return self._finalize_after_investigation(
-                        spec=spec,
-                        messages=messages,
-                        raw_draft_content=llm_response.content,
-                        tool_history=tool_history,
-                        iterations=iterations,
-                        tool_calls_used=tool_calls_used,
-                    )
-                return self._finalize_result(
-                    task_id=spec.task_id,
-                    output_contract=spec.output_contract,
-                    raw_content=llm_response.content,
-                    tool_history=tool_history,
-                    iterations=iterations,
-                    tool_calls_used=tool_calls_used,
-                    metadata={
-                        "model": spec.model or self.settings.model,
-                        "contract_name": spec.output_contract.name if spec.output_contract is not None else None,
-                    },
-                )
+                    checkpoint.phase = "finalization"
+                    checkpoint.finalization_kind = "contract"
+                    checkpoint.finalization_reason = "Investigation is complete."
+                    checkpoint.raw_failure_content = llm_response.content
+                    self._emit_checkpoint(checkpoint, on_checkpoint)
+                    continue
+                checkpoint.phase = "result"
+                checkpoint.result_kind = "direct"
+                self._emit_checkpoint(checkpoint, on_checkpoint)
+                continue
 
-            for tool_call_offset, tool_call in enumerate(llm_response.tool_calls):
-                if tool_calls_used >= spec.max_tool_calls:
-                    self._append_budget_exhausted_tool_responses(
-                        messages=messages,
-                        tool_calls=llm_response.tool_calls[tool_call_offset:],
-                        tool_history=tool_history,
-                    )
-                    return self._finalize_after_budget(
-                        spec=spec,
-                        messages=messages,
-                        raw_failure_content=llm_response.content,
-                        failure_reason="Maximum number of structured task tool calls reached.",
-                        tool_history=tool_history,
-                        iterations=iterations,
-                        tool_calls_used=tool_calls_used,
-                    )
-
-                tool_calls_used += 1
-                tool_message, history_item = self._execute_tool_call(
-                    registry=registry,
+            checkpoint.phase = "tools"
+            checkpoint.pending_tool_calls = [
+                StructuredToolCallCheckpoint(
+                    tool_call_id=tool_call.id,
                     tool_name=tool_call.name,
                     arguments_json=tool_call.arguments_json,
-                    tool_call_id=tool_call.id,
-                    context=context,
                 )
-                messages.append(tool_message)
-                tool_history.append(history_item)
+                for tool_call in llm_response.tool_calls
+            ]
+            checkpoint.next_tool_call_index = 0
+            self._emit_checkpoint(checkpoint, on_checkpoint)
 
-        return self._finalize_after_budget(
-            spec=spec,
-            messages=messages,
-            raw_failure_content="",
-            failure_reason="Maximum number of structured task iterations reached.",
-            tool_history=tool_history,
-            iterations=iterations,
-            tool_calls_used=tool_calls_used,
+    def _continue_tool_batch(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        context: ExecutionContext,
+        registry: ToolRegistry,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskResult | None:
+        while checkpoint.next_tool_call_index < len(checkpoint.pending_tool_calls):
+            if checkpoint.tool_calls_used >= spec.max_tool_calls:
+                remaining = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index :]
+                self._append_budget_exhausted_tool_responses(
+                    messages=checkpoint.messages,
+                    tool_calls=[
+                        LLMToolCall(
+                            id=item.tool_call_id,
+                            name=item.tool_name,
+                            arguments_json=item.arguments_json,
+                        )
+                        for item in remaining
+                    ],
+                    tool_history=checkpoint.tool_history,
+                )
+                for item in remaining:
+                    item.status = "budget_exhausted"
+                checkpoint.next_tool_call_index = len(checkpoint.pending_tool_calls)
+                checkpoint.phase = "finalization"
+                checkpoint.finalization_kind = "budget"
+                checkpoint.finalization_reason = "Maximum number of structured task tool calls reached."
+                checkpoint.raw_failure_content = checkpoint.messages[-1].content if checkpoint.messages else ""
+                self._emit_checkpoint(checkpoint, on_checkpoint)
+                return None
+
+            tool_call = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index]
+            tool_call.status = "running"
+            checkpoint.tool_calls_used += 1
+            self._emit_checkpoint(checkpoint, on_checkpoint)
+            tool_message, history_item = self._execute_tool_call(
+                registry=registry,
+                tool_name=tool_call.tool_name,
+                arguments_json=tool_call.arguments_json,
+                tool_call_id=tool_call.tool_call_id,
+                context=context,
+            )
+            checkpoint.messages.append(tool_message)
+            checkpoint.tool_history.append(history_item)
+            tool_call.status = "completed"
+            checkpoint.next_tool_call_index += 1
+            self._emit_checkpoint(checkpoint, on_checkpoint)
+
+        checkpoint.pending_tool_calls = []
+        checkpoint.next_tool_call_index = 0
+        if checkpoint.iterations >= spec.max_iterations:
+            checkpoint.phase = "finalization"
+            checkpoint.finalization_kind = "budget"
+            checkpoint.finalization_reason = "Maximum number of structured task iterations reached."
+            checkpoint.raw_failure_content = ""
+        else:
+            checkpoint.iterations += 1
+            checkpoint.phase = "model_request"
+        self._emit_checkpoint(checkpoint, on_checkpoint)
+        return None
+
+    def _continue_finalization(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskResult | None:
+        try:
+            llm_response = self._call_model_for_final_output(
+                spec=spec,
+                messages=checkpoint.messages,
+                failure_reason=checkpoint.finalization_reason or "Structured task execution was interrupted.",
+            )
+        except LLMProviderError as exc:
+            if checkpoint.finalization_kind == "contract":
+                return StructuredTaskResult(
+                    ok=False,
+                    task_id=spec.task_id,
+                    raw_content=exc.detail or checkpoint.raw_failure_content,
+                    failure_reason=f"Structured output contract finalization failed: {exc.user_message}",
+                    tool_history=checkpoint.tool_history,
+                    iterations=checkpoint.iterations,
+                    tool_calls_used=checkpoint.tool_calls_used,
+                    metadata={"contract_finalization": True},
+                )
+            return StructuredTaskResult(
+                ok=False,
+                task_id=spec.task_id,
+                raw_content=exc.detail or checkpoint.raw_failure_content,
+                failure_reason=(
+                    f"{checkpoint.finalization_reason}; finalization failed: {exc.user_message}"
+                ),
+                tool_history=checkpoint.tool_history,
+                iterations=checkpoint.iterations,
+                tool_calls_used=checkpoint.tool_calls_used,
+                metadata={"forced_finalization": True},
+            )
+
+        checkpoint.messages.append(
+            LLMMessage(
+                role="assistant",
+                content=llm_response.content,
+                tool_calls=list(llm_response.tool_calls),
+            )
         )
+        checkpoint.phase = "result"
+        checkpoint.result_kind = checkpoint.finalization_kind
+        self._emit_checkpoint(checkpoint, on_checkpoint)
+        return None
+
+    def _continue_persisted_result(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        checkpoint: StructuredTaskCheckpoint,
+    ) -> StructuredTaskResult:
+        if not checkpoint.messages or checkpoint.messages[-1].role != "assistant":
+            raise StructuredTaskRecoveryError(
+                kind="invalid_result_checkpoint",
+                message="Persisted result checkpoint has no final assistant response.",
+            )
+        response = checkpoint.messages[-1]
+        if checkpoint.result_kind == "direct":
+            return self._finalize_result(
+                task_id=spec.task_id,
+                output_contract=spec.output_contract,
+                raw_content=response.content,
+                tool_history=checkpoint.tool_history,
+                iterations=checkpoint.iterations,
+                tool_calls_used=checkpoint.tool_calls_used,
+                metadata={
+                    "model": spec.model or self.settings.model,
+                    "contract_name": spec.output_contract.name if spec.output_contract is not None else None,
+                },
+            )
+
+        failure_reason = checkpoint.finalization_reason or "Structured task execution was interrupted."
+        if response.tool_calls:
+            if checkpoint.result_kind == "contract":
+                return StructuredTaskResult(
+                    ok=False,
+                    task_id=spec.task_id,
+                    raw_content=response.content or checkpoint.raw_failure_content,
+                    failure_reason="Structured output contract finalization still requested tools.",
+                    tool_history=checkpoint.tool_history,
+                    iterations=checkpoint.iterations + 1,
+                    tool_calls_used=checkpoint.tool_calls_used,
+                    metadata={"contract_finalization": True},
+                )
+            return StructuredTaskResult(
+                ok=False,
+                task_id=spec.task_id,
+                raw_content=response.content or checkpoint.raw_failure_content,
+                failure_reason=f"{failure_reason}; finalization still requested tools.",
+                tool_history=checkpoint.tool_history,
+                iterations=checkpoint.iterations + 1,
+                tool_calls_used=checkpoint.tool_calls_used,
+                metadata={"forced_finalization": True},
+            )
+
+        metadata: dict[str, Any] = {
+            "model": spec.model or self.settings.model,
+            "contract_name": spec.output_contract.name if spec.output_contract is not None else None,
+        }
+        if checkpoint.result_kind == "contract":
+            metadata["contract_finalization"] = True
+        else:
+            metadata.update(
+                {
+                    "forced_finalization": True,
+                    "budget_failure_reason": failure_reason,
+                }
+            )
+        finalized = self._finalize_result(
+            task_id=spec.task_id,
+            output_contract=spec.output_contract,
+            raw_content=response.content,
+            tool_history=checkpoint.tool_history,
+            iterations=checkpoint.iterations + 1,
+            tool_calls_used=checkpoint.tool_calls_used,
+            metadata=metadata,
+        )
+        if checkpoint.result_kind == "budget" and not finalized.ok:
+            finalized.failure_reason = f"{failure_reason}; {finalized.failure_reason}"
+        return finalized
+
+    @staticmethod
+    def _emit_checkpoint(
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> None:
+        checkpoint.sequence += 1
+        if on_checkpoint is not None:
+            on_checkpoint(checkpoint)
 
     def _append_budget_exhausted_tool_responses(
         self,
@@ -747,122 +1185,6 @@ class StructuredTaskRunner:
             iterations=iterations,
             tool_calls_used=tool_calls_used,
             metadata={**metadata, "final_output_mode": "json_schema"},
-        )
-
-    def _finalize_after_budget(
-        self,
-        *,
-        spec: StructuredTaskSpec,
-        messages: list[LLMMessage],
-        raw_failure_content: str,
-        failure_reason: str,
-        tool_history: list[dict[str, Any]],
-        iterations: int,
-        tool_calls_used: int,
-    ) -> StructuredTaskResult:
-        try:
-            llm_response = self._call_model_for_final_output(
-                spec=spec,
-                messages=messages,
-                failure_reason=failure_reason,
-            )
-        except LLMProviderError as exc:
-            return StructuredTaskResult(
-                ok=False,
-                task_id=spec.task_id,
-                raw_content=exc.detail or raw_failure_content,
-                failure_reason=f"{failure_reason}; finalization failed: {exc.user_message}",
-                tool_history=tool_history,
-                iterations=iterations,
-                tool_calls_used=tool_calls_used,
-                metadata={"forced_finalization": True},
-            )
-
-        if llm_response.tool_calls:
-            return StructuredTaskResult(
-                ok=False,
-                task_id=spec.task_id,
-                raw_content=llm_response.content or raw_failure_content,
-                failure_reason=f"{failure_reason}; finalization still requested tools.",
-                tool_history=tool_history,
-                iterations=iterations + 1,
-                tool_calls_used=tool_calls_used,
-                metadata={"forced_finalization": True},
-            )
-
-        finalized = self._finalize_result(
-            task_id=spec.task_id,
-            output_contract=spec.output_contract,
-            raw_content=llm_response.content,
-            tool_history=tool_history,
-            iterations=iterations + 1,
-            tool_calls_used=tool_calls_used,
-            metadata={
-                "model": spec.model or self.settings.model,
-                "forced_finalization": True,
-                "budget_failure_reason": failure_reason,
-                "contract_name": spec.output_contract.name if spec.output_contract is not None else None,
-            },
-        )
-        if finalized.ok:
-            return finalized
-        finalized.failure_reason = f"{failure_reason}; {finalized.failure_reason}"
-        return finalized
-
-    def _finalize_after_investigation(
-        self,
-        *,
-        spec: StructuredTaskSpec,
-        messages: list[LLMMessage],
-        raw_draft_content: str,
-        tool_history: list[dict[str, Any]],
-        iterations: int,
-        tool_calls_used: int,
-    ) -> StructuredTaskResult:
-        if spec.output_contract is None:
-            raise ValueError("Contract finalization requires an output contract")
-        try:
-            llm_response = self._call_model_for_final_output(
-                spec=spec,
-                messages=messages,
-                failure_reason="Investigation is complete.",
-            )
-        except LLMProviderError as exc:
-            return StructuredTaskResult(
-                ok=False,
-                task_id=spec.task_id,
-                raw_content=exc.detail or raw_draft_content,
-                failure_reason=f"Structured output contract finalization failed: {exc.user_message}",
-                tool_history=tool_history,
-                iterations=iterations,
-                tool_calls_used=tool_calls_used,
-                metadata={"contract_finalization": True},
-            )
-
-        if llm_response.tool_calls:
-            return StructuredTaskResult(
-                ok=False,
-                task_id=spec.task_id,
-                raw_content=llm_response.content or raw_draft_content,
-                failure_reason="Structured output contract finalization still requested tools.",
-                tool_history=tool_history,
-                iterations=iterations + 1,
-                tool_calls_used=tool_calls_used,
-                metadata={"contract_finalization": True},
-            )
-
-        return self._finalize_result(
-            task_id=spec.task_id,
-            output_contract=spec.output_contract,
-            raw_content=llm_response.content,
-            tool_history=tool_history,
-            iterations=iterations + 1,
-            tool_calls_used=tool_calls_used,
-            metadata={
-                "model": spec.model or self.settings.model,
-                "contract_finalization": True,
-                "contract_name": spec.output_contract.name,
-            },
         )
 
     def _provider_accepts_options(self, method_name: str) -> bool:
