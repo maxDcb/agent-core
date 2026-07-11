@@ -56,6 +56,23 @@ threads or processes cannot execute or resume the same run concurrently.
 Applications can supply a transactional distributed store implementing the
 same ownership contract.
 
+## Lifecycle test matrix
+
+The lifecycle suite treats persistence boundaries as public behavior:
+
+- declared transitions are accepted and illegal terminal transitions are rejected;
+- checkpoints, attempts and terminal results survive serialization round trips;
+- missing, foreign or unsupported checkpoints block recovery without calling the provider;
+- completed and blocked runs remain idempotent across repeated resume requests;
+- completed tools are not replayed, while ambiguous effects require explicit reconciliation;
+- invalid reconciliation and context rebinding leave the persisted run unchanged;
+- multi-tool recovery executes only the remaining calls;
+- locks reject duplicate ownership while allowing unrelated runs and namespaces;
+- the conversation adapter preserves pending, resumed and terminal attempts.
+
+Deterministic crash injection scenarios use the `chaos` marker and can be run
+independently with `python -m pytest -m chaos`.
+
 ## Optional conversation
 
 `ConversationAgent` adds thread memory and pending-tool resume semantics over

@@ -8,6 +8,7 @@ from agent_core import StructuredOutputContract
 from agent_core.llm.base import LLMCompletionResult, LLMToolCall
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_context import RunContext
+from agent_core.run_models import AgentRunState, RunCheckpoint
 from agent_core.run_service import AgentRunService
 from agent_core.run_store import JsonFileRunStore, RunExecutionBusyError
 from agent_core.settings import CoreSettings
@@ -397,3 +398,153 @@ def test_resume_reuses_persisted_contract_finalization_response(tmp_path) -> Non
     assert completed.ok is True
     assert completed.output == {"summary": "validated final"}
     assert provider.calls == 2
+
+
+@pytest.mark.parametrize(
+    ("checkpoint", "expected_kind"),
+    [
+        (None, "missing_checkpoint"),
+        (RunCheckpoint(kind="conversation", sequence=1, payload={}), "invalid_checkpoint_kind"),
+        (RunCheckpoint(kind="structured_task", sequence=1, payload={"schema_version": 999}), "invalid_checkpoint"),
+    ],
+)
+def test_resume_fails_closed_for_missing_or_invalid_checkpoint(tmp_path, checkpoint, expected_kind) -> None:
+    store = JsonFileRunStore(tmp_path / "runs")
+    state = AgentRunState(
+        run_id="run-invalid-checkpoint",
+        strategy="structured",
+        spec_id=_spec().task_id,
+        context=RunContext(namespace_id="assessment", run_id="run-invalid-checkpoint"),
+        status="interrupted",
+        checkpoint=checkpoint,
+    )
+    store.create(state)
+    service = AgentRunService(
+        settings=CoreSettings(session_file=tmp_path / "session.json"),
+        provider=NeverCallProvider(),
+        tool_registry=ToolRegistry(),
+        policy_engine=PolicyEngine(),
+        run_store=store,
+    )
+
+    result = service.resume(
+        spec=_spec(),
+        context=RunContext(namespace_id="assessment"),
+        run_id=state.run_id,
+    )
+
+    assert result.status == "blocked"
+    assert result.error is not None
+    assert result.error.kind == expected_kind
+    persisted = store.load(namespace_id="assessment", run_id=state.run_id)
+    assert persisted is not None
+    assert persisted.status == "blocked"
+    assert persisted.result is not None
+    assert persisted.result.to_dict() == result.to_dict()
+
+
+def test_repeated_resume_of_terminal_run_is_side_effect_free(tmp_path) -> None:
+    provider = ImmediateFinalProvider()
+    service = _service(tmp_path, provider=provider, tool=CountingTool())
+    context = RunContext(namespace_id="assessment")
+    completed = service.execute(spec=_spec(), context=context, run_id="run-terminal")
+    before = service.get(namespace_id="assessment", run_id="run-terminal")
+    assert before is not None
+
+    first_resume = service.resume(spec=_spec(), context=context, run_id="run-terminal")
+    second_resume = service.resume(spec=_spec(), context=context, run_id="run-terminal")
+    after = service.get(namespace_id="assessment", run_id="run-terminal")
+
+    assert first_resume.to_dict() == completed.to_dict()
+    assert second_resume.to_dict() == completed.to_dict()
+    assert after is not None
+    assert after.to_dict() == before.to_dict()
+    assert provider.calls == 1
+
+
+def test_repeated_resume_of_blocked_run_does_not_create_attempts(tmp_path) -> None:
+    service = _service(tmp_path, provider=ImmediateCrashProvider(), tool=CountingTool())
+    context = RunContext(namespace_id="assessment")
+    try:
+        service.execute(spec=_spec(), context=context, run_id="run-blocked-repeat")
+    except SystemExit:
+        pass
+
+    first = _service(tmp_path, provider=FinalProvider(), tool=CountingTool()).resume(
+        spec=_spec(objective="changed"),
+        context=context,
+        run_id="run-blocked-repeat",
+    )
+    state_after_first = service.get(namespace_id="assessment", run_id="run-blocked-repeat")
+    assert state_after_first is not None
+
+    second = _service(tmp_path, provider=NeverCallProvider(), tool=CountingTool()).resume(
+        spec=_spec(objective="changed"),
+        context=context,
+        run_id="run-blocked-repeat",
+    )
+    state_after_second = service.get(namespace_id="assessment", run_id="run-blocked-repeat")
+
+    assert first.status == second.status == "blocked"
+    assert state_after_second is not None
+    assert len(state_after_second.attempts) == len(state_after_first.attempts)
+    assert state_after_second.result is not None
+    assert state_after_second.result.to_dict() == first.to_dict()
+
+
+def test_invalid_ambiguous_tool_reconciliation_preserves_blocked_state(tmp_path) -> None:
+    tool = CountingTool(crash=True)
+    service = _service(tmp_path, provider=ToolThenCrashProvider(), tool=tool)
+    context = RunContext(namespace_id="assessment")
+    try:
+        service.execute(spec=_spec(), context=context, run_id="run-invalid-reconcile")
+    except SystemExit:
+        pass
+    service.resume(spec=_spec(), context=context, run_id="run-invalid-reconcile")
+    before = service.get(namespace_id="assessment", run_id="run-invalid-reconcile")
+    assert before is not None
+
+    with pytest.raises(ValueError, match="not the ambiguous execution"):
+        service.resolve_ambiguous_tool(
+            spec=_spec(),
+            context=context,
+            run_id="run-invalid-reconcile",
+            tool_call_id="wrong-call",
+            result=ToolResult(ok=True, content="invented"),
+        )
+
+    after = service.get(namespace_id="assessment", run_id="run-invalid-reconcile")
+    assert after is not None
+    assert after.to_dict() == before.to_dict()
+    assert tool.calls == 1
+
+
+def test_execution_locks_are_scoped_by_namespace_and_run(tmp_path) -> None:
+    store = JsonFileRunStore(tmp_path / "runs")
+
+    with store.acquire_execution(namespace_id="one", run_id="same"):
+        with store.acquire_execution(namespace_id="two", run_id="same"):
+            with store.acquire_execution(namespace_id="one", run_id="different"):
+                pass
+
+
+def test_resume_rejects_context_rebinding_without_mutating_run(tmp_path) -> None:
+    service = _service(tmp_path, provider=ImmediateCrashProvider())
+    original_context = RunContext(namespace_id="assessment", parent_id="job-one")
+    try:
+        service.execute(spec=_spec(), context=original_context, run_id="run-context")
+    except SystemExit:
+        pass
+    before = service.get(namespace_id="assessment", run_id="run-context")
+    assert before is not None
+
+    with pytest.raises(ValueError, match="different request"):
+        service.resume(
+            spec=_spec(),
+            context=RunContext(namespace_id="assessment", parent_id="job-two"),
+            run_id="run-context",
+        )
+
+    after = service.get(namespace_id="assessment", run_id="run-context")
+    assert after is not None
+    assert after.to_dict() == before.to_dict()
