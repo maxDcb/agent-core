@@ -29,7 +29,7 @@ from agent_core.run_store import JsonFileRunStore, RunExecutionBusyError, RunSto
 from agent_core.settings import CoreSettings
 from agent_core.structured_tasks import StructuredTaskResult, StructuredTaskRunner, StructuredTaskSpec
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "AgentRunError",

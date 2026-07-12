@@ -7,7 +7,7 @@ their own prompts, tools, policy rules, storage and domain memory. It is meant
 to be the generic runtime under an agent application, not a domain-specific
 agent package.
 
-Version `0.3.0` is an alpha release. The runtime is usable and tested, but the
+Version `0.4.0` is an alpha release. The runtime is usable and tested, but the
 public API may still evolve before `1.0.0`.
 
 ## What It Provides
@@ -23,6 +23,7 @@ public API may still evolve before `1.0.0`.
 - Policy guardrail entry points for tool execution
 - Domain hooks for application-specific prompt and memory extensions
 - Provider adapters for OpenAI, Azure OpenAI and Azure Anthropic backends
+- Exact provider token usage, per-call telemetry and run-level usage summaries
 - Provider-enforced JSON Schema contracts for structured task final outputs
 - OpenAI/Azure request normalization and adaptive retry handling
 - Typed Python package marker (`py.typed`)
@@ -47,7 +48,7 @@ specializing it for one workflow.
 From a tagged Git repository:
 
 ```bash
-python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.3.0"
+python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.4.0"
 ```
 
 For local development:
@@ -89,6 +90,10 @@ Or run a small REPL:
 
 See [examples/README.md](examples/README.md) for the pending tool result and
 resume example.
+
+For a complete application built on the supported public API, see the official
+[maxDcb/agent-core-exemple](https://github.com/maxDcb/agent-core-exemple)
+repository.
 
 ## Core Concepts
 
@@ -197,7 +202,7 @@ result = service.execute(
 Tools that need an external asynchronous result can return:
 
 ```python
-from agent_core.types import ToolResult
+from agent_core.spi import ToolResult
 
 return ToolResult.pending_result(
     "Waiting for command output.",
@@ -220,8 +225,8 @@ completed = conversation_agent.resume(
 ## Minimal Integration Pattern
 
 1. Build `CoreSettings` from your application config.
-2. Create a `BaseLLMProvider` implementation or use a provider from
-   `agent_core.llm`.
+2. Create a `BaseLLMProvider` implementation or configure a bundled provider
+   through the factories exported by `agent_core.spi`.
 3. Register tools in `ToolRegistry`.
 4. Instantiate a `RunStore` and `PolicyEngine`.
 5. Build `AgentRunService` and execute a `StructuredTaskSpec` with an explicit

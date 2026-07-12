@@ -15,10 +15,10 @@
   - `permissive`: preserve the current compatibility behavior and allow tools without a registered policy;
   - `audit`: allow tools without a registered policy but emit structured warnings and trace events;
   - `strict`: deny tools without an explicit validator or explicit allow policy.
-- Keep `permissive` as the `agent-core` compatibility default until a future major version. Let security-sensitive applications such as PentestAssistant opt into `audit`, then `strict`.
+- Keep `permissive` as the `agent-core` compatibility default until a future major version. Let security-sensitive applications opt into `audit`, then `strict`.
 - Add startup registry validation, for example `policy_engine.validate_registry(registry)`, so strict-mode configuration errors list every unclassified tool before a run starts.
 - Support an explicit allow policy for low-risk tools. Fail-closed should mean that every tool received a deliberate policy decision, not that every tool requires a complex validator.
-- Suggested rollout for PentestAssistant:
+- Suggested rollout for security-sensitive applications:
   1. enable audit mode;
   2. inventory every unclassified tool;
   3. add validators or explicit allow policies in the application/tool project;

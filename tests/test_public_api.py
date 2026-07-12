@@ -19,7 +19,7 @@ from agent_core import (
 
 
 def test_run_engine_public_api_is_small_and_explicit() -> None:
-    assert agent_core.__version__ == "0.3.0"
+    assert agent_core.__version__ == "0.4.0"
     assert set(agent_core.__all__) == {
         "AgentRunError",
         "AgentRunAttempt",

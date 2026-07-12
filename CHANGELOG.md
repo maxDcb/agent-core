@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.4.0
 
 - Added exact provider token usage, per-call LLM telemetry, retry counts, cache
   details, checkpoint persistence, run-level summaries, and conversation capture.
@@ -14,6 +14,10 @@
   at contract construction.
 - Added structured, payload-safe validation diagnostics and explicit failure for
   provider outputs that violate their declared contract.
+- Added separate provider configuration for the main agent and memory synthesis.
+- Made investigation answers conversational by default, with explicit strict or
+  recoverable handling for malformed internal synthesis.
+- Hardened multi-tool execution and pending-result resume behavior.
 
 ## 0.3.0
 

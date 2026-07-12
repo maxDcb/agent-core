@@ -43,8 +43,9 @@ Only names listed in `__all__` by these four modules are public. Other
 and tests, but external projects must not depend on them. They may be reorganized
 without a compatibility layer.
 
-PentestAssistant is the reference integration. Its architecture test scans all
-production Python modules and fails if they import any agent-core module outside
-these four facades. agent-core also tests the exact root export set and verifies
-that external domain, policy, provider, and tool integrations can be declared
-through the public SPI.
+The official
+[maxDcb/agent-core-exemple](https://github.com/maxDcb/agent-core-exemple)
+repository demonstrates an application built against these supported facades.
+agent-core also tests the exact root export set and verifies that external
+domain, policy, provider, and tool integrations can be declared through the
+public SPI.
