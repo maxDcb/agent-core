@@ -148,7 +148,7 @@ def _lock_file_non_blocking(handle: BinaryIO) -> None:
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)  # type: ignore[attr-defined]
         return
     import fcntl
 
@@ -160,7 +160,7 @@ def _unlock_file(handle: BinaryIO) -> None:
     if os.name == "nt":
         import msvcrt
 
-        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[attr-defined]
         return
     import fcntl
 
