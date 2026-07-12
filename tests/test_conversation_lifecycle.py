@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent_core.conversation import ConversationAgent
+from agent_core.llm.base import LLMCompletionResult, LLMTokenUsage, publish_llm_completion
 from agent_core.run_context import RunContext
 from agent_core.run_store import JsonFileRunStore
 from agent_core.types import AgentTurnResult
@@ -16,6 +17,15 @@ class ScriptedConversationOrchestrator:
     def run_turn_result(self, **kwargs) -> AgentTurnResult:
         _ = kwargs
         self.run_calls += 1
+        publish_llm_completion(
+            LLMCompletionResult(
+                content="pending",
+                usage=LLMTokenUsage(input_tokens=20, output_tokens=4, total_tokens=24),
+                provider="openai",
+                model="gpt-test",
+            ),
+            purpose="conversation_tool_loop",
+        )
         return AgentTurnResult(
             status="pending_tool_result",
             content="waiting",
@@ -29,6 +39,15 @@ class ScriptedConversationOrchestrator:
         self.resume_calls += 1
         assert kwargs["pending_id"] == "pending-1"
         assert kwargs["tool_content"] == "tool result"
+        publish_llm_completion(
+            LLMCompletionResult(
+                content="finished",
+                usage=LLMTokenUsage(input_tokens=30, output_tokens=6, total_tokens=36),
+                provider="openai",
+                model="gpt-test",
+            ),
+            purpose="conversation_finalization",
+        )
         return AgentTurnResult(
             status="completed",
             content="finished",
@@ -69,6 +88,10 @@ def test_conversation_pending_resume_records_complete_attempt_lifecycle(tmp_path
     assert state.checkpoint is None
     assert [attempt.status for attempt in state.attempts] == ["pending", "completed"]
     assert state.attempts[1].resumed_from_sequence == 1
+    assert state.result is not None
+    assert len(state.result.llm_calls) == 2
+    assert [call.call_id for call in state.result.llm_calls] == ["llm-0001", "llm-0002"]
+    assert state.result.to_dict()["usage"]["total_tokens"] == 60
     assert orchestrator.run_calls == 1
     assert orchestrator.resume_calls == 1
 

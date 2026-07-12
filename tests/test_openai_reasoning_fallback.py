@@ -43,6 +43,33 @@ def _text_response(content: str):
     )
 
 
+def test_openai_provider_preserves_exact_usage_and_request_id() -> None:
+    response = _text_response("ok")
+    response.id = "chatcmpl-usage"
+    response.usage = SimpleNamespace(
+        prompt_tokens=42,
+        completion_tokens=8,
+        total_tokens=50,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=10),
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=3),
+    )
+    completions = ScriptedCompletions(response)
+    provider = OpenAIProvider(api_key="test-key")
+    provider.client = FakeClient(completions)  # type: ignore[assignment]
+
+    result = provider.complete_text(
+        messages=[LLMMessage(role="user", content="hello")],
+        model="gpt-4.1-mini",
+        temperature=0.0,
+    )
+
+    assert result.provider_request_id == "chatcmpl-usage"
+    assert result.usage is not None
+    assert result.usage.total_tokens == 50
+    assert result.usage.cached_input_tokens == 10
+    assert result.usage.reasoning_output_tokens == 3
+
+
 def _unsupported_reasoning_effort_error() -> BadRequestError:
     return BadRequestError(
         "Unrecognized request argument supplied: reasoning_effort",
@@ -129,7 +156,7 @@ def test_openai_provider_omits_reasoning_effort_for_known_non_reasoning_model() 
         options=LLMCallOptions(reasoning_effort="high"),
     )
 
-    assert result == "ok"
+    assert result.content == "ok"
     assert len(completions.requests) == 1
     assert completions.requests[0]["temperature"] == 0.0
     assert "reasoning_effort" not in completions.requests[0]
@@ -155,7 +182,8 @@ def test_azure_openai_provider_learns_unknown_deployment_reasoning_rejection() -
         options=LLMCallOptions(reasoning_effort="high"),
     )
 
-    assert result == "ok"
+    assert result.content == "ok"
+    assert result.provider_attempts == 2
     assert completions.requests[0]["reasoning_effort"] == "high"
     assert "reasoning_effort" not in completions.requests[1]
 
@@ -166,7 +194,7 @@ def test_azure_openai_provider_learns_unknown_deployment_reasoning_rejection() -
         options=LLMCallOptions(reasoning_effort="high"),
     )
 
-    assert result == "ok-again"
+    assert result.content == "ok-again"
     assert "reasoning_effort" not in completions.requests[2]
 
 
@@ -186,7 +214,7 @@ def test_azure_openai_provider_omits_temperature_and_maps_tokens_for_known_reaso
         options=LLMCallOptions(reasoning_effort="high", max_output_tokens=250),
     )
 
-    assert result == "ok"
+    assert result.content == "ok"
     assert len(completions.requests) == 1
     assert "temperature" not in completions.requests[0]
     assert completions.requests[0]["reasoning_effort"] == "high"
@@ -214,7 +242,7 @@ def test_azure_openai_provider_can_retry_without_reasoning_then_temperature_for_
         options=LLMCallOptions(reasoning_effort="high"),
     )
 
-    assert result == "ok"
+    assert result.content == "ok"
     assert "reasoning_effort" not in completions.requests[1]
     assert "temperature" not in completions.requests[2]
 
@@ -239,7 +267,7 @@ def test_azure_openai_provider_retries_with_max_completion_tokens_and_caches_rej
         options=LLMCallOptions(max_output_tokens=120),
     )
 
-    assert result == "ok"
+    assert result.content == "ok"
     assert completions.requests[0]["max_tokens"] == 120
     assert "max_tokens" not in completions.requests[1]
     assert completions.requests[1]["max_completion_tokens"] == 120
@@ -251,7 +279,7 @@ def test_azure_openai_provider_retries_with_max_completion_tokens_and_caches_rej
         options=LLMCallOptions(max_output_tokens=80),
     )
 
-    assert result == "ok-again"
+    assert result.content == "ok-again"
     assert "max_tokens" not in completions.requests[2]
     assert completions.requests[2]["max_completion_tokens"] == 80
 

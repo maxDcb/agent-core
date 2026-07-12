@@ -65,6 +65,7 @@ def create_chat_completion_with_adaptive_retry(
     response_format_fallback: dict[str, Any] | None = None,
     sleeper: Any = time.sleep,
     random_fn: Any = random.random,
+    on_attempt: Any = None,
 ) -> Any:
     fallback_request = dict(request)
     retried_without: set[str] = set()
@@ -72,6 +73,8 @@ def create_chat_completion_with_adaptive_retry(
     attempt = 1
 
     while True:
+        if on_attempt is not None:
+            on_attempt()
         attempt_started_at = time.monotonic()
         try:
             return completions.create(**fallback_request)

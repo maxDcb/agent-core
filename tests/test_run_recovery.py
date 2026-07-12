@@ -5,7 +5,7 @@ import json
 import pytest
 
 from agent_core import StructuredOutputContract
-from agent_core.llm.base import LLMCompletionResult, LLMToolCall
+from agent_core.llm.base import LLMCompletionResult, LLMTokenUsage, LLMToolCall
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_context import RunContext
 from agent_core.run_models import AgentRunState, RunCheckpoint
@@ -98,7 +98,13 @@ class ImmediateFinalProvider:
     def complete_with_tools(self, **kwargs):
         _ = kwargs
         self.calls += 1
-        return LLMCompletionResult(content="persisted final answer")
+        return LLMCompletionResult(
+            content="persisted final answer",
+            usage=LLMTokenUsage(input_tokens=100, output_tokens=5, total_tokens=105),
+            provider="openai",
+            model="test-model",
+            provider_request_id="response-final",
+        )
 
 
 class NeverCallProvider:
@@ -296,6 +302,9 @@ def test_resume_reuses_persisted_final_provider_response(tmp_path) -> None:
 
     assert completed.ok is True
     assert completed.raw_content == "persisted final answer"
+    assert len(completed.llm_calls) == 1
+    assert completed.llm_calls[0].provider_request_id == "response-final"
+    assert completed.to_dict()["usage"]["total_tokens"] == 105
     assert provider.calls == 1
 
 

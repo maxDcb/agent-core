@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Added exact provider token usage, per-call LLM telemetry, retry counts, cache
+  details, checkpoint persistence, run-level summaries, and conversation capture.
 - Added lossless structured-run checkpoints, explicit interrupted-run resume,
   run-attempt audit history, local execution locks, and fail-closed ambiguous
   tool reconciliation.

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from inspect import Parameter, signature
 from typing import Any, Generic, TypeVar
 
-from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage, completion_content
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.settings import CoreSettings
 
@@ -92,17 +92,17 @@ class StructuredSynthesizer:
 
     def _complete_text(self, *, messages: list[LLMMessage], options: LLMCallOptions | None) -> str:
         if options is not None and self._provider_accepts_options("complete_text"):
-            return self.provider.complete_text(
+            return completion_content(self.provider.complete_text(
                 messages=messages,
                 model=self.settings.memory_model,
                 temperature=self.settings.memory_temperature,
                 options=options,
-            )
-        return self.provider.complete_text(
+            ))
+        return completion_content(self.provider.complete_text(
             messages=messages,
             model=self.settings.memory_model,
             temperature=self.settings.memory_temperature,
-        )
+        ))
 
     def _provider_accepts_options(self, method_name: str) -> bool:
         method = getattr(self.provider, method_name)

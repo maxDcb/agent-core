@@ -17,6 +17,12 @@ application: LLM providers, domain hooks, policies, tools, provider factories,
 and prompt loading. Changes to these contracts are part of the public semantic
 versioning policy.
 
+Text-only and tool-enabled provider calls both return `LLMCompletionResult`.
+`LLMTokenUsage`, `LLMCallRecord`, and `LLMUsageSummary` carry exact provider
+usage through checkpoints and run results. Custom providers leave `usage`
+unset when the upstream service does not report it; local estimates must not be
+presented as provider usage.
+
 ## Optional conversation API: `agent_core.conversation`
 
 Conversation support is an adapter over runs. It contains the orchestrator,

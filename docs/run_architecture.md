@@ -42,6 +42,14 @@ transcript, counters, tool cursor, tool history and a fingerprint of the task
 specification. `AgentRunService.resume()` continues a non-terminal run from
 that checkpoint. A changed specification is rejected.
 
+Every successful provider response also contributes a typed `LLMCallRecord`.
+OpenAI, Azure OpenAI and Azure Anthropic usage fields are normalized without
+estimating missing values. Calls and token usage are persisted at the same
+checkpoint boundary as the response, then exposed on `AgentRunResult` with an
+aggregate usage summary. Exact totals are `null` whenever any call lacks
+provider usage; partial reported totals remain available separately. Cached
+input and reasoning-token details are retained when the provider exposes them.
+
 A tool call persisted as completed is never replayed. A tool call left in
 `running` is considered ambiguous because its external effect may have happened
 before the process stopped. Recovery becomes `blocked` until the host reconciles
@@ -79,6 +87,10 @@ independently with `python -m pytest -m chaos`.
 the same persisted lifecycle. `AgentOrchestrator`, `SessionManager` and the
 session repository are implementation components of this adapter, not a
 requirement for headless pipeline runs.
+
+Conversation execution captures all built-in provider calls made in the turn,
+including internal synthesis calls. Pending resumes append stable call records
+instead of replacing or duplicating previous usage.
 
 ## Application pipelines
 

@@ -15,13 +15,27 @@ from openai import (
     RateLimitError,
 )
 
-from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
+from agent_core.llm.base import (
+    LLMCallOptions,
+    LLMCompletionResult,
+    LLMMessage,
+    LLMToolCall,
+    LLMToolDefinition,
+    provider_request_id,
+    publish_llm_completion,
+    token_usage_from_openai_response,
+)
 from agent_core.llm.errors import LLMProviderError
 from agent_core.llm.openai_compat import create_chat_completion_with_adaptive_retry
 from agent_core.llm.openai_request_policy import OpenAIChatRequestNormalizer, OpenAIModelCapabilityResolver
 from agent_core.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _call_purpose(options: LLMCallOptions | None, *, default: str) -> str:
+    value = options.metadata.get("llm_call_purpose") if options is not None else None
+    return value.strip() if isinstance(value, str) and value.strip() else default
 
 
 def _jsonish_char_count(value: Any) -> int:
@@ -93,10 +107,11 @@ class OpenAIProvider:
         model: str,
         temperature: float,
         options: LLMCallOptions | None = None,
-    ) -> str:
+    ) -> LLMCompletionResult:
         # This method is meant for internal, non-agentic completions such as prompt summarization,
         # working-memory synthesis, or report condensation. It does not expose any tools.
-        response = self._create_chat_completion(
+        started_at = time.monotonic()
+        response, provider_attempts = self._create_chat_completion(
             messages=messages,
             model=model,
             temperature=temperature,
@@ -108,7 +123,18 @@ class OpenAIProvider:
             "Received text-only completion response",
             extra={"content_length": len(message.content or "")},
         )
-        return message.content or ""
+        return publish_llm_completion(
+            LLMCompletionResult(
+                content=message.content or "",
+                usage=token_usage_from_openai_response(response),
+                provider="openai",
+                model=model,
+                provider_request_id=provider_request_id(response),
+                duration_seconds=round(time.monotonic() - started_at, 3),
+                provider_attempts=provider_attempts,
+            ),
+            purpose=_call_purpose(options, default="text"),
+        )
 
     def complete_with_tools(
         self,
@@ -121,7 +147,8 @@ class OpenAIProvider:
     ) -> LLMCompletionResult:
         # This method is the main assistant path. It allows the model to request tools and is used
         # by the interactive runtime loop in the orchestrator.
-        response = self._create_chat_completion(
+        started_at = time.monotonic()
+        response, provider_attempts = self._create_chat_completion(
             messages=messages,
             model=model,
             temperature=temperature,
@@ -145,7 +172,19 @@ class OpenAIProvider:
             "Received chat completion response",
             extra={"content_length": len(message.content or ""), "tool_call_count": len(tool_calls)},
         )
-        return LLMCompletionResult(content=message.content or "", tool_calls=tool_calls)
+        return publish_llm_completion(
+            LLMCompletionResult(
+                content=message.content or "",
+                tool_calls=tool_calls,
+                usage=token_usage_from_openai_response(response),
+                provider="openai",
+                model=model,
+                provider_request_id=provider_request_id(response),
+                duration_seconds=round(time.monotonic() - started_at, 3),
+                provider_attempts=provider_attempts,
+            ),
+            purpose=_call_purpose(options, default="tool_loop"),
+        )
 
     def _create_chat_completion(
         self,
@@ -155,7 +194,7 @@ class OpenAIProvider:
         temperature: float,
         tools: list[LLMToolDefinition] | None,
         options: LLMCallOptions | None = None,
-    ) -> Any:
+    ) -> tuple[Any, int]:
         if not self.api_key_configured:
             raise LLMProviderError(
                 kind="configuration_error",
@@ -213,6 +252,12 @@ class OpenAIProvider:
             )
 
             request_started_at = time.monotonic()
+            provider_attempts = 0
+
+            def count_attempt() -> None:
+                nonlocal provider_attempts
+                provider_attempts += 1
+
             response = create_chat_completion_with_adaptive_retry(
                 completions=client.chat.completions,
                 request=request,
@@ -220,6 +265,7 @@ class OpenAIProvider:
                 logger=logger,
                 capability_resolver=self.capability_resolver,
                 response_format_fallback=options.response_format_fallback if options is not None else None,
+                on_attempt=count_attempt,
             )
             choices = getattr(response, "choices", None) or []
             message = choices[0].message if choices else None
@@ -305,7 +351,7 @@ class OpenAIProvider:
                 user_message="The LLM provider returned an unusable response.",
                 detail="Response contained no choices",
             )
-        return response
+        return response, provider_attempts
 
     def _get_client(self) -> OpenAI:
         if self.client is None:

@@ -8,7 +8,15 @@ from inspect import Parameter, signature
 from typing import Any, Literal
 
 from agent_core.execution_context import ExecutionContext
-from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall
+from agent_core.llm.base import (
+    BaseLLMProvider,
+    LLMCallOptions,
+    LLMCallRecord,
+    LLMCompletionResult,
+    LLMMessage,
+    LLMToolCall,
+    LLMUsageSummary,
+)
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.output_contracts import (
@@ -252,6 +260,7 @@ class StructuredTaskResult:
     tool_history: list[dict[str, Any]] = field(default_factory=list)
     iterations: int = 0
     tool_calls_used: int = 0
+    llm_calls: list[LLMCallRecord] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -264,6 +273,8 @@ class StructuredTaskResult:
             "tool_history": list(self.tool_history),
             "iterations": self.iterations,
             "tool_calls_used": self.tool_calls_used,
+            "llm_calls": [call.to_dict() for call in self.llm_calls],
+            "usage": LLMUsageSummary.from_calls(self.llm_calls).to_dict(),
             "metadata": dict(self.metadata),
         }
 
@@ -314,6 +325,7 @@ class StructuredTaskCheckpoint:
     tool_history: list[dict[str, Any]] = field(default_factory=list)
     iterations: int = 0
     tool_calls_used: int = 0
+    llm_calls: list[LLMCallRecord] = field(default_factory=list)
     pending_tool_calls: list[StructuredToolCallCheckpoint] = field(default_factory=list)
     next_tool_call_index: int = 0
     finalization_kind: StructuredFinalizationKind | None = None
@@ -324,13 +336,14 @@ class StructuredTaskCheckpoint:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "spec_fingerprint": self.spec_fingerprint,
             "phase": self.phase,
             "messages": [message.to_history_dict() for message in self.messages],
             "tool_history": [dict(item) for item in self.tool_history],
             "iterations": self.iterations,
             "tool_calls_used": self.tool_calls_used,
+            "llm_calls": [call.to_dict() for call in self.llm_calls],
             "pending_tool_calls": [item.to_dict() for item in self.pending_tool_calls],
             "next_tool_call_index": self.next_tool_call_index,
             "finalization_kind": self.finalization_kind,
@@ -342,7 +355,7 @@ class StructuredTaskCheckpoint:
 
     @classmethod
     def from_dict(cls, payload: object) -> StructuredTaskCheckpoint | None:
-        if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2}:
             return None
         spec_fingerprint = payload.get("spec_fingerprint")
         phase = payload.get("phase")
@@ -358,6 +371,7 @@ class StructuredTaskCheckpoint:
             return None
         messages = [LLMMessage.from_history_dict(item) for item in raw_messages if isinstance(item, dict)]
         raw_history = payload.get("tool_history")
+        raw_llm_calls = payload.get("llm_calls")
         raw_pending = payload.get("pending_tool_calls")
         pending = (
             [item for value in raw_pending if (item := StructuredToolCallCheckpoint.from_dict(value)) is not None]
@@ -379,6 +393,11 @@ class StructuredTaskCheckpoint:
             tool_history=[dict(item) for item in raw_history if isinstance(item, dict)] if isinstance(raw_history, list) else [],
             iterations=_clean_positive_int(payload.get("iterations"), default=0),
             tool_calls_used=_clean_positive_int(payload.get("tool_calls_used"), default=0),
+            llm_calls=(
+                [call for item in raw_llm_calls if (call := LLMCallRecord.from_dict(item)) is not None]
+                if isinstance(raw_llm_calls, list)
+                else []
+            ),
             pending_tool_calls=pending,
             next_tool_call_index=_clean_positive_int(payload.get("next_tool_call_index"), default=0),
             finalization_kind=normalized_kind,
@@ -563,8 +582,14 @@ class StructuredTaskRunner:
                     tool_history=checkpoint.tool_history,
                     iterations=checkpoint.iterations,
                     tool_calls_used=checkpoint.tool_calls_used,
+                    llm_calls=list(checkpoint.llm_calls),
                 )
 
+            self._record_llm_call(
+                checkpoint=checkpoint,
+                completion=llm_response,
+                purpose="structured_direct" if not registry.list_tool_names() else "structured_tool_loop",
+            )
             assistant_message = LLMMessage(
                 role="assistant",
                 content=llm_response.content,
@@ -685,6 +710,7 @@ class StructuredTaskRunner:
                     iterations=checkpoint.iterations,
                     tool_calls_used=checkpoint.tool_calls_used,
                     metadata={"contract_finalization": True},
+                    llm_calls=list(checkpoint.llm_calls),
                 )
             return StructuredTaskResult(
                 ok=False,
@@ -697,8 +723,14 @@ class StructuredTaskRunner:
                 iterations=checkpoint.iterations,
                 tool_calls_used=checkpoint.tool_calls_used,
                 metadata={"forced_finalization": True},
+                llm_calls=list(checkpoint.llm_calls),
             )
 
+        self._record_llm_call(
+            checkpoint=checkpoint,
+            completion=llm_response,
+            purpose="structured_finalization",
+        )
         checkpoint.messages.append(
             LLMMessage(
                 role="assistant",
@@ -735,6 +767,7 @@ class StructuredTaskRunner:
                     "model": spec.model or self.settings.model,
                     "contract_name": spec.output_contract.name if spec.output_contract is not None else None,
                 },
+                llm_calls=checkpoint.llm_calls,
             )
 
         failure_reason = checkpoint.finalization_reason or "Structured task execution was interrupted."
@@ -749,6 +782,7 @@ class StructuredTaskRunner:
                     iterations=checkpoint.iterations + 1,
                     tool_calls_used=checkpoint.tool_calls_used,
                     metadata={"contract_finalization": True},
+                    llm_calls=list(checkpoint.llm_calls),
                 )
             return StructuredTaskResult(
                 ok=False,
@@ -759,6 +793,7 @@ class StructuredTaskRunner:
                 iterations=checkpoint.iterations + 1,
                 tool_calls_used=checkpoint.tool_calls_used,
                 metadata={"forced_finalization": True},
+                llm_calls=list(checkpoint.llm_calls),
             )
 
         metadata: dict[str, Any] = {
@@ -782,6 +817,7 @@ class StructuredTaskRunner:
             iterations=checkpoint.iterations + 1,
             tool_calls_used=checkpoint.tool_calls_used,
             metadata=metadata,
+            llm_calls=checkpoint.llm_calls,
         )
         if checkpoint.result_kind == "budget" and not finalized.ok:
             finalized.failure_reason = f"{failure_reason}; {finalized.failure_reason}"
@@ -795,6 +831,21 @@ class StructuredTaskRunner:
         checkpoint.sequence += 1
         if on_checkpoint is not None:
             on_checkpoint(checkpoint)
+
+    @staticmethod
+    def _record_llm_call(
+        *,
+        checkpoint: StructuredTaskCheckpoint,
+        completion: LLMCompletionResult,
+        purpose: str,
+    ) -> None:
+        checkpoint.llm_calls.append(
+            LLMCallRecord.from_completion(
+                completion,
+                call_index=len(checkpoint.llm_calls) + 1,
+                purpose=purpose,
+            )
+        )
 
     def _append_budget_exhausted_tool_responses(
         self,
@@ -827,7 +878,11 @@ class StructuredTaskRunner:
             response_format=_response_format_for_spec(spec, final_output=final_output),
             response_format_fallback=None,
             max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens) if final_output else None,
-            metadata={"structured_task_id": spec.task_id, **spec.metadata},
+            metadata={
+                "structured_task_id": spec.task_id,
+                "llm_call_purpose": "structured_direct" if final_output else "structured_tool_loop",
+                **spec.metadata,
+            },
         )
         kwargs: dict[str, Any] = {
             "messages": messages,
@@ -867,6 +922,7 @@ class StructuredTaskRunner:
             metadata={
                 "structured_task_id": spec.task_id,
                 "structured_task_finalization": True,
+                "llm_call_purpose": "structured_finalization",
                 **spec.metadata,
             },
         )
@@ -1076,6 +1132,7 @@ class StructuredTaskRunner:
         iterations: int,
         tool_calls_used: int,
         metadata: dict[str, Any],
+        llm_calls: list[LLMCallRecord],
     ) -> StructuredTaskResult:
         raw_content_chars = len(raw_content or "")
         if metadata.get("contract_name") is None:
@@ -1098,6 +1155,7 @@ class StructuredTaskRunner:
                 iterations=iterations,
                 tool_calls_used=tool_calls_used,
                 metadata={**metadata, "final_output_mode": "text"},
+                llm_calls=list(llm_calls),
             )
 
         try:
@@ -1139,6 +1197,7 @@ class StructuredTaskRunner:
                 iterations=iterations,
                 tool_calls_used=tool_calls_used,
                 metadata={**metadata, "validation_error": exc.to_dict()},
+                llm_calls=list(llm_calls),
             )
         except (json.JSONDecodeError, ValueError):
             logger.warning(
@@ -1160,6 +1219,7 @@ class StructuredTaskRunner:
                 iterations=iterations,
                 tool_calls_used=tool_calls_used,
                 metadata=metadata,
+                llm_calls=list(llm_calls),
             )
 
         output_compact_chars = _jsonish_char_count(payload)
@@ -1185,6 +1245,7 @@ class StructuredTaskRunner:
             iterations=iterations,
             tool_calls_used=tool_calls_used,
             metadata={**metadata, "final_output_mode": "json_schema"},
+            llm_calls=list(llm_calls),
         )
 
     def _provider_accepts_options(self, method_name: str) -> bool:

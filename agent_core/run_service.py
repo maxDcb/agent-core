@@ -302,6 +302,7 @@ class AgentRunService:
                 tool_history=list(task_result.tool_history),
                 iterations=task_result.iterations,
                 tool_calls_used=task_result.tool_calls_used,
+                llm_calls=list(task_result.llm_calls),
                 metadata={**task_result.metadata, "spec_id": spec.task_id},
             )
             state.result = result
@@ -322,6 +323,7 @@ class AgentRunService:
                 tool_history=list(task_result.tool_history),
                 iterations=task_result.iterations,
                 tool_calls_used=task_result.tool_calls_used,
+                llm_calls=list(task_result.llm_calls),
                 metadata={**task_result.metadata, "spec_id": spec.task_id},
             )
             state.error = error

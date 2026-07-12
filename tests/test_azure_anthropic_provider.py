@@ -45,6 +45,31 @@ def _text_response(content: str) -> SimpleNamespace:
     return SimpleNamespace(content=[SimpleNamespace(type="text", text=content)])
 
 
+def test_azure_anthropic_provider_preserves_exact_usage_and_request_id() -> None:
+    response = _text_response("OK")
+    response.id = "msg-usage"
+    response.usage = SimpleNamespace(
+        input_tokens=31,
+        output_tokens=9,
+        cache_read_input_tokens=12,
+        cache_creation_input_tokens=4,
+    )
+    provider = _provider_with_scripted_messages(ScriptedMessages(response))
+
+    result = provider.complete_text(
+        messages=[LLMMessage(role="user", content="Return OK")],
+        model="claude-test",
+        temperature=0.0,
+    )
+
+    assert result.provider_request_id == "msg-usage"
+    assert result.usage is not None
+    assert result.usage.input_tokens == 47
+    assert result.usage.total_tokens == 56
+    assert result.usage.cached_input_tokens == 12
+    assert result.usage.cache_creation_input_tokens == 4
+
+
 def _tool_response(*, tool_id: str, name: str, arguments: dict[str, Any]) -> SimpleNamespace:
     return SimpleNamespace(
         content=[
@@ -99,7 +124,7 @@ def test_azure_anthropic_provider_builds_anthropic_foundry_client(monkeypatch) -
         temperature=0.0,
     )
 
-    assert result == "OK"
+    assert result.content == "OK"
     assert created == {
         "api_key": "test-key",
         "base_url": "https://example.services.ai.azure.com/anthropic",
@@ -151,7 +176,7 @@ def test_azure_anthropic_provider_plain_chat_matches_quickstart_shape() -> None:
     )
 
     request = scripted_messages.requests[0]
-    assert result == "OK"
+    assert result.content == "OK"
     assert request["model"] == "claude-opus-4-6"
     assert request["temperature"] == 0.0
     assert request["max_tokens"] == 4096
@@ -231,7 +256,7 @@ def test_azure_anthropic_provider_ignores_json_object_response_format() -> None:
     )
 
     request = scripted_messages.requests[0]
-    assert result == '{"ok": true, "mode": "json_object"}'
+    assert result.content == '{"ok": true, "mode": "json_object"}'
     assert "raw JSON object" in request["system"]
     assert "output_config" not in request
     assert "response_format" not in request
@@ -273,7 +298,7 @@ def test_azure_anthropic_provider_maps_json_schema_response_format_to_output_con
     )
 
     request = scripted_messages.requests[0]
-    assert result == '{"ok": true, "mode": "json_schema"}'
+    assert result.content == '{"ok": true, "mode": "json_schema"}'
     assert request["max_tokens"] == 1024
     assert request["output_config"] == {"format": {"type": "json_schema", "schema": schema}}
     assert "response_format" not in request
@@ -388,7 +413,8 @@ def test_azure_anthropic_provider_retries_overloaded_status(monkeypatch) -> None
         temperature=0.0,
     )
 
-    assert result == "OK"
+    assert result.content == "OK"
+    assert result.provider_attempts == 2
     assert len(scripted_messages.requests) == 2
 
 

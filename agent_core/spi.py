@@ -5,10 +5,13 @@ from agent_core.investigation_prompts import InvestigationPromptSet
 from agent_core.llm.base import (
     BaseLLMProvider,
     LLMCallOptions,
+    LLMCallRecord,
     LLMCompletionResult,
     LLMMessage,
+    LLMTokenUsage,
     LLMToolCall,
     LLMToolDefinition,
+    LLMUsageSummary,
 )
 from agent_core.llm.errors import LLMProviderError
 from agent_core.llm.provider_factory import (
@@ -31,12 +34,15 @@ __all__ = [
     "DomainHooks",
     "InvestigationPromptSet",
     "LLMCallOptions",
+    "LLMCallRecord",
     "LLMCompletionResult",
     "LLMMessage",
     "LLMProviderConfig",
     "LLMProviderError",
     "LLMToolCall",
     "LLMToolDefinition",
+    "LLMTokenUsage",
+    "LLMUsageSummary",
     "PolicyEngine",
     "ToolExecutionStatus",
     "ToolRegistry",

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from uuid import uuid4
 
 from agent_core.conversation_state import ConversationStateView
+from agent_core.llm.base import LLMCallRecord, capture_llm_calls
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.run_context import RunContext
 from agent_core.run_models import (
@@ -103,17 +105,30 @@ class ConversationAgent:
             )
             state.attempts.append(attempt)
             self.run_store.save(state)
+            previous_calls = list(state.result.llm_calls) if state.result is not None else []
+            captured_calls: list[LLMCallRecord] = []
             try:
-                turn = self.orchestrator.resume_turn(
-                    pending_id=pending_id,
-                    tool_content=tool_content,
-                    thread_id=state.context.thread_id,
-                    context=state.context,
-                    ok=ok,
-                )
+                with capture_llm_calls() as captured_calls:
+                    turn = self.orchestrator.resume_turn(
+                        pending_id=pending_id,
+                        tool_content=tool_content,
+                        thread_id=state.context.thread_id,
+                        context=state.context,
+                        ok=ok,
+                    )
             except Exception as exc:
-                return self._commit_conversation_failure(state=state, attempt=attempt, exc=exc)
-            return self._commit_turn(state=state, attempt=attempt, turn=turn)
+                return self._commit_conversation_failure(
+                    state=state,
+                    attempt=attempt,
+                    exc=exc,
+                    llm_calls=self._merge_llm_calls(previous_calls, captured_calls),
+                )
+            return self._commit_turn(
+                state=state,
+                attempt=attempt,
+                turn=turn,
+                llm_calls=self._merge_llm_calls(previous_calls, captured_calls),
+            )
 
     def _execute_turn_locked(
         self,
@@ -142,16 +157,23 @@ class ConversationAgent:
         attempt = AgentRunAttempt(attempt_id=f"attempt-{uuid4().hex}")
         state.attempts.append(attempt)
         self.run_store.save(state)
+        captured_calls: list[LLMCallRecord] = []
         try:
-            turn = self.orchestrator.run_turn_result(
-                user_input=user_input,
-                thread_id=thread_id,
-                context=context,
-                options=options,
-            )
+            with capture_llm_calls() as captured_calls:
+                turn = self.orchestrator.run_turn_result(
+                    user_input=user_input,
+                    thread_id=thread_id,
+                    context=context,
+                    options=options,
+                )
         except Exception as exc:
-            return self._commit_conversation_failure(state=state, attempt=attempt, exc=exc)
-        return self._commit_turn(state=state, attempt=attempt, turn=turn)
+            return self._commit_conversation_failure(
+                state=state,
+                attempt=attempt,
+                exc=exc,
+                llm_calls=captured_calls,
+            )
+        return self._commit_turn(state=state, attempt=attempt, turn=turn, llm_calls=captured_calls)
 
     def _commit_turn(
         self,
@@ -159,6 +181,7 @@ class ConversationAgent:
         state: AgentRunState,
         attempt: AgentRunAttempt,
         turn: AgentTurnResult,
+        llm_calls: list[LLMCallRecord],
     ) -> AgentRunResult:
         status: RunStatus = "pending" if turn.is_pending else "completed"
         result = AgentRunResult(
@@ -167,6 +190,7 @@ class ConversationAgent:
             raw_content=turn.content,
             tool_calls_used=int(turn.metadata.get("tool_calls_used", 0)),
             iterations=int(turn.metadata.get("iterations_used", 0)),
+            llm_calls=list(llm_calls),
             metadata={
                 **turn.metadata,
                 "pending_id": turn.pending_id,
@@ -196,16 +220,28 @@ class ConversationAgent:
         state: AgentRunState,
         attempt: AgentRunAttempt,
         exc: Exception,
+        llm_calls: list[LLMCallRecord],
     ) -> AgentRunResult:
         error = AgentRunError(
             kind="conversation_run_error",
             message="Conversation run failed.",
             detail=str(exc),
         )
-        result = AgentRunResult(run_id=state.run_id, status="failed", error=error)
+        result = AgentRunResult(run_id=state.run_id, status="failed", error=error, llm_calls=list(llm_calls))
         state.error = error
         state.result = result
         attempt.finish("failed", failure_reason=error.message)
         state.transition("failed")
         self.run_store.save(state)
         return result
+
+    @staticmethod
+    def _merge_llm_calls(
+        previous_calls: list[LLMCallRecord],
+        new_calls: list[LLMCallRecord],
+    ) -> list[LLMCallRecord]:
+        merged = list(previous_calls)
+        for call in new_calls:
+            call_index = len(merged) + 1
+            merged.append(replace(call, call_id=f"llm-{call_index:04d}", call_index=call_index))
+        return merged

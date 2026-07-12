@@ -19,11 +19,25 @@ from anthropic import (
     RateLimitError,
 )
 
-from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMToolCall, LLMToolDefinition
+from agent_core.llm.base import (
+    LLMCallOptions,
+    LLMCompletionResult,
+    LLMMessage,
+    LLMToolCall,
+    LLMToolDefinition,
+    provider_request_id,
+    publish_llm_completion,
+    token_usage_from_anthropic_response,
+)
 from agent_core.llm.errors import LLMProviderError
 from agent_core.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+def _call_purpose(options: LLMCallOptions | None, *, default: str) -> str:
+    value = options.metadata.get("llm_call_purpose") if options is not None else None
+    return value.strip() if isinstance(value, str) and value.strip() else default
 
 DEFAULT_ANTHROPIC_VERSION = "2023-06-01"
 DEFAULT_MAX_TOKENS = 4096
@@ -152,8 +166,9 @@ class AzureAnthropicProvider:
         model: str,
         temperature: float,
         options: LLMCallOptions | None = None,
-    ) -> str:
-        response = self._create_message(
+    ) -> LLMCompletionResult:
+        started_at = time.monotonic()
+        response, provider_attempts = self._create_message(
             messages=messages,
             tools=None,
             model=model,
@@ -166,7 +181,18 @@ class AzureAnthropicProvider:
                 "Azure Anthropic text-only completion returned unexpected tool calls",
                 extra={"tool_call_count": len(tool_calls)},
             )
-        return content
+        return publish_llm_completion(
+            LLMCompletionResult(
+                content=content,
+                usage=token_usage_from_anthropic_response(response),
+                provider="azure_anthropic",
+                model=model,
+                provider_request_id=provider_request_id(response),
+                duration_seconds=round(time.monotonic() - started_at, 3),
+                provider_attempts=provider_attempts,
+            ),
+            purpose=_call_purpose(options, default="text"),
+        )
 
     def complete_with_tools(
         self,
@@ -177,7 +203,8 @@ class AzureAnthropicProvider:
         temperature: float,
         options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
-        response = self._create_message(
+        started_at = time.monotonic()
+        response, provider_attempts = self._create_message(
             messages=messages,
             tools=tools,
             model=model,
@@ -185,7 +212,19 @@ class AzureAnthropicProvider:
             options=options,
         )
         content, tool_calls = self._parse_response(response)
-        return LLMCompletionResult(content=content, tool_calls=tool_calls)
+        return publish_llm_completion(
+            LLMCompletionResult(
+                content=content,
+                tool_calls=tool_calls,
+                usage=token_usage_from_anthropic_response(response),
+                provider="azure_anthropic",
+                model=model,
+                provider_request_id=provider_request_id(response),
+                duration_seconds=round(time.monotonic() - started_at, 3),
+                provider_attempts=provider_attempts,
+            ),
+            purpose=_call_purpose(options, default="tool_loop"),
+        )
 
     def _create_message(
         self,
@@ -195,7 +234,7 @@ class AzureAnthropicProvider:
         model: str,
         temperature: float,
         options: LLMCallOptions | None = None,
-    ) -> Any:
+    ) -> tuple[Any, int]:
         self._ensure_configured()
 
         system_prompt, anthropic_messages = self._to_anthropic_messages(messages)
@@ -240,7 +279,7 @@ class AzureAnthropicProvider:
         try:
             client = self._get_client()
             request_started_at = time.monotonic()
-            response = self._create_message_with_retry(
+            response, provider_attempts = self._create_message_with_retry(
                 messages_api=client.messages,
                 request=request,
             )
@@ -252,7 +291,6 @@ class AzureAnthropicProvider:
                     "response_block_count": len(_get_value(response, "content", []) or []),
                 },
             )
-            return response
         except AuthenticationError as exc:
             logger.exception(
                 "Azure Anthropic authentication failed",
@@ -356,6 +394,7 @@ class AzureAnthropicProvider:
                 user_message="The assistant encountered an unexpected Azure Anthropic provider failure.",
                 detail=str(exc),
             ) from exc
+        return response, provider_attempts
 
     def _ensure_configured(self) -> None:
         if not self.endpoint_configured:
@@ -371,14 +410,14 @@ class AzureAnthropicProvider:
                 detail="Missing AZURE_ANTHROPIC_API_KEY for AzureAnthropicProvider",
             )
 
-    def _create_message_with_retry(self, *, messages_api: Any, request: dict[str, Any]) -> Any:
+    def _create_message_with_retry(self, *, messages_api: Any, request: dict[str, Any]) -> tuple[Any, int]:
         policy = AzureAnthropicRetryPolicy.from_env()
         attempt = 1
 
         while True:
             attempt_started_at = time.monotonic()
             try:
-                return messages_api.create(**request)
+                return messages_api.create(**request), attempt
             except RateLimitError as exc:
                 attempt = self._retry_after_transient_error(
                     exc=exc,

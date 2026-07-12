@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
+from agent_core.llm.base import LLMCallRecord, LLMUsageSummary
 from agent_core.run_context import ExecutionScope, RunContext
 from agent_core.types import utc_now_iso
 
@@ -26,7 +27,7 @@ RunAttemptStatus: TypeAlias = Literal[
     "cancelled",
     "blocked",
 ]
-RUN_SCHEMA_VERSION = 2
+RUN_SCHEMA_VERSION = 3
 
 
 @dataclass(slots=True)
@@ -155,6 +156,7 @@ class AgentRunResult:
     tool_history: list[dict[str, Any]] = field(default_factory=list)
     iterations: int = 0
     tool_calls_used: int = 0
+    llm_calls: list[LLMCallRecord] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     @property
@@ -175,6 +177,8 @@ class AgentRunResult:
             "tool_history": list(self.tool_history),
             "iterations": self.iterations,
             "tool_calls_used": self.tool_calls_used,
+            "llm_calls": [call.to_dict() for call in self.llm_calls],
+            "usage": LLMUsageSummary.from_calls(self.llm_calls).to_dict(),
             "metadata": dict(self.metadata),
         }
 
@@ -194,6 +198,7 @@ class AgentRunResult:
         raw_content = payload.get("raw_content")
         iterations = payload.get("iterations")
         tool_calls_used = payload.get("tool_calls_used")
+        raw_llm_calls = payload.get("llm_calls")
         return cls(
             run_id=run_id,
             status=status,
@@ -203,6 +208,11 @@ class AgentRunResult:
             tool_history=[dict(item) for item in history if isinstance(item, dict)] if isinstance(history, list) else [],
             iterations=iterations if isinstance(iterations, int) else 0,
             tool_calls_used=tool_calls_used if isinstance(tool_calls_used, int) else 0,
+            llm_calls=(
+                [call for item in raw_llm_calls if (call := LLMCallRecord.from_dict(item)) is not None]
+                if isinstance(raw_llm_calls, list)
+                else []
+            ),
             metadata=dict(metadata) if isinstance(metadata, dict) else {},
         )
 
