@@ -14,6 +14,11 @@ applications should start here.
 surface. They configure run-wide model limits and expose their enforcement
 state without making the internal controller a public extension point.
 
+`LLMContextPolicy`, `LLMContextPlan`, `LLMContextUsage`, and
+`LLMContextOverflowError` are also public. They configure the provider-window
+planner and expose content-free planning telemetry; the stateful planner itself
+remains an implementation detail.
+
 ## Extension SPI: `agent_core.spi`
 
 The SPI contains contracts intended to be implemented or assembled by a host

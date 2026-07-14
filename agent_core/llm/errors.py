@@ -6,6 +6,7 @@ from typing import Literal
 ProviderErrorKind = Literal[
     "budget_exhausted",
     "configuration_error",
+    "context_overflow",
     "request_error",
     "response_error",
     "rate_limit_error",

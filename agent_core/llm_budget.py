@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -8,6 +7,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypeVar
 
+from agent_core.context_planner import active_llm_context_planner, estimate_llm_input_tokens
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMTokenUsage
 from agent_core.llm.errors import LLMProviderError
 
@@ -387,14 +387,6 @@ def active_llm_budget_controller() -> LLMBudgetController | None:
     return _ACTIVE_LLM_BUDGET.get()
 
 
-def estimate_llm_input_tokens(*, messages: list[LLMMessage], tools: object = None) -> int:
-    payload: dict[str, Any] = {"messages": [message.to_history_dict() for message in messages]}
-    if tools:
-        payload["tools"] = tools
-    raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"), default=str)
-    return max(1, (len(raw) + 3) // 4)
-
-
 T = TypeVar("T")
 
 
@@ -407,14 +399,31 @@ def run_budgeted_llm_call(
     invoke: Callable[[LLMCallOptions | None], T],
     on_reserved: Callable[[], None] | None = None,
 ) -> T:
+    context_planner = active_llm_context_planner()
+    effective_options = options
+    if context_planner is not None:
+        planned_messages, effective_options, _ = context_planner.plan_call(
+            messages=messages,
+            tools=tools,
+            purpose=purpose,
+            options=options,
+        )
+        messages[:] = planned_messages
+
     controller = active_llm_budget_controller()
     if controller is None:
-        return invoke(options)
+        if context_planner is not None and on_reserved is not None:
+            on_reserved()
+        return invoke(effective_options)
 
     reservation, effective_options = controller.prepare_call(
         purpose=purpose,
-        estimated_input_tokens=estimate_llm_input_tokens(messages=messages, tools=tools),
-        options=options,
+        estimated_input_tokens=estimate_llm_input_tokens(
+            messages=messages,
+            tools=tools,
+            options=effective_options,
+        ),
+        options=effective_options,
     )
     try:
         if on_reserved is not None:

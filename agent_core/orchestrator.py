@@ -7,6 +7,13 @@ from inspect import Parameter, signature
 from typing import Any
 from uuid import uuid4
 
+from agent_core.context_planner import (
+    LLMContextPlanner,
+    LLMContextPolicy,
+    LLMContextUsage,
+    active_llm_context_planner,
+    llm_context_scope,
+)
 from agent_core.conversation_state import build_conversation_state_view
 from agent_core.domain_hooks import DomainHooks
 from agent_core.execution_context import (
@@ -189,6 +196,9 @@ class AgentOrchestrator:
         budget_controller = active_llm_budget_controller()
         if budget_controller is not None:
             result.metadata = {**result.metadata, **budget_controller.to_metadata()}
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            result.metadata = {**result.metadata, **context_planner.to_metadata()}
         if expose_trace_id:
             result.metadata = {**result.metadata, "run_trace_id": trace.run_id}
         event_type = "run_completed" if result.status == "completed" else "run_pending"
@@ -535,7 +545,11 @@ class AgentOrchestrator:
             assistant_content=error.user_message,
         )
         self._refresh_memory_after_turn(turn_index=turn_index)
-        stop_reason = "llm_budget_exhausted" if error.kind == "budget_exhausted" else "provider_failure"
+        stop_reasons = {
+            "budget_exhausted": "llm_budget_exhausted",
+            "context_overflow": "llm_context_overflow",
+        }
+        stop_reason = stop_reasons.get(error.kind, "provider_failure")
         return AgentTurnResult(
             status="completed",
             content=error.user_message,
@@ -594,6 +608,9 @@ class AgentOrchestrator:
         budget_controller = active_llm_budget_controller()
         if budget_controller is not None:
             payload.update(budget_controller.to_metadata())
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            payload.update(context_planner.to_metadata())
         self.session_manager.set_meta_value(self.PENDING_TURN_META_KEY, payload)
 
     def run_turn(self, *, user_input: str, thread_id: str, context: RunContext) -> str:
@@ -622,15 +639,18 @@ class AgentOrchestrator:
         run_options = options or RunOptions.direct()
         budget = run_options.llm_budget or self.settings.llm_budget
         budget_controller = LLMBudgetController(budget) if budget is not None else None
+        context_policy = run_options.llm_context_policy or self.settings.llm_context_policy
+        context_planner = LLMContextPlanner(context_policy) if context_policy is not None else None
         token = self._run_context_var.set(bound_context)
         try:
-            with llm_budget_scope(budget_controller):
-                with self.session_manager.session_scope(thread_id):
-                    return self._run_turn_result_active(
-                        user_input=user_input,
-                        context=bound_context,
-                        options=options,
-                    )
+            with llm_context_scope(context_planner):
+                with llm_budget_scope(budget_controller):
+                    with self.session_manager.session_scope(thread_id):
+                        return self._run_turn_result_active(
+                            user_input=user_input,
+                            context=bound_context,
+                            options=options,
+                        )
         finally:
             self._run_context_var.reset(token)
 
@@ -757,18 +777,34 @@ class AgentOrchestrator:
                     if budget is not None
                     else None
                 )
-                with llm_budget_scope(budget_controller):
-                    result = self._resume_turn_active(
-                        pending_id=pending_id,
-                        tool_content=tool_content,
-                        ok=ok,
-                        context=bound_context,
+                context_policy = (
+                    LLMContextPolicy.from_any(pending.get("llm_context_policy"))
+                    or self.settings.llm_context_policy
+                )
+                context_planner = (
+                    LLMContextPlanner(
+                        context_policy,
+                        usage=LLMContextUsage.from_any(pending.get("llm_context_usage")),
                     )
-                    active_controller = active_llm_budget_controller()
-                    if active_controller is not None:
-                        result.metadata = {**result.metadata, **active_controller.to_metadata()}
-                    self._store_completed_pending_result(pending_id=pending_id, result=result)
-                    return result
+                    if context_policy is not None
+                    else None
+                )
+                with llm_context_scope(context_planner):
+                    with llm_budget_scope(budget_controller):
+                        result = self._resume_turn_active(
+                            pending_id=pending_id,
+                            tool_content=tool_content,
+                            ok=ok,
+                            context=bound_context,
+                        )
+                        active_controller = active_llm_budget_controller()
+                        if active_controller is not None:
+                            result.metadata = {**result.metadata, **active_controller.to_metadata()}
+                        active_planner = active_llm_context_planner()
+                        if active_planner is not None:
+                            result.metadata = {**result.metadata, **active_planner.to_metadata()}
+                        self._store_completed_pending_result(pending_id=pending_id, result=result)
+                        return result
         finally:
             self._run_context_var.reset(token)
 

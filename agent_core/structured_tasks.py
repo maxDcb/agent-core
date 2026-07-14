@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any, Literal
 
+from agent_core.context_planner import (
+    LLMContextPlanner,
+    LLMContextPolicy,
+    LLMContextUsage,
+    active_llm_context_planner,
+    llm_context_scope,
+)
 from agent_core.execution_context import ExecutionContext
 from agent_core.llm.base import (
     BaseLLMProvider,
@@ -191,6 +198,7 @@ class StructuredTaskSpec:
     max_tool_calls: int = 8
     max_iterations: int = 6
     llm_budget: LLMBudget | None = None
+    llm_context_policy: LLMContextPolicy | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -203,6 +211,7 @@ class StructuredTaskSpec:
         self.allowed_tools = _clean_string_list(self.allowed_tools)
         self.output_contract = StructuredOutputContract.from_any(self.output_contract)
         self.llm_budget = LLMBudget.from_any(self.llm_budget)
+        self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
         if not isinstance(self.metadata, dict):
             self.metadata = {}
         self.model = _clean_string(self.model) or None
@@ -247,6 +256,8 @@ class StructuredTaskSpec:
         }
         if self.llm_budget is not None:
             payload["llm_budget"] = self.llm_budget.to_dict()
+        if self.llm_context_policy is not None:
+            payload["llm_context_policy"] = self.llm_context_policy.to_dict()
         serialized = json.dumps(
             payload,
             ensure_ascii=False,
@@ -347,10 +358,12 @@ class StructuredTaskCheckpoint:
     sequence: int = 0
     llm_budget: LLMBudget | None = None
     llm_budget_usage: LLMBudgetUsage = field(default_factory=LLMBudgetUsage)
+    llm_context_policy: LLMContextPolicy | None = None
+    llm_context_usage: LLMContextUsage = field(default_factory=LLMContextUsage)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 3,
+            "schema_version": 4,
             "spec_fingerprint": self.spec_fingerprint,
             "phase": self.phase,
             "messages": [message.to_history_dict() for message in self.messages],
@@ -367,11 +380,15 @@ class StructuredTaskCheckpoint:
             "sequence": self.sequence,
             "llm_budget": self.llm_budget.to_dict() if self.llm_budget is not None else None,
             "llm_budget_usage": self.llm_budget_usage.to_dict(),
+            "llm_context_policy": (
+                self.llm_context_policy.to_dict() if self.llm_context_policy is not None else None
+            ),
+            "llm_context_usage": self.llm_context_usage.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: object) -> StructuredTaskCheckpoint | None:
-        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2, 3}:
+        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2, 3, 4}:
             return None
         spec_fingerprint = payload.get("spec_fingerprint")
         phase = payload.get("phase")
@@ -423,6 +440,8 @@ class StructuredTaskCheckpoint:
             sequence=_clean_positive_int(payload.get("sequence"), default=0),
             llm_budget=LLMBudget.from_any(payload.get("llm_budget")),
             llm_budget_usage=LLMBudgetUsage.from_any(payload.get("llm_budget_usage")),
+            llm_context_policy=LLMContextPolicy.from_any(payload.get("llm_context_policy")),
+            llm_context_usage=LLMContextUsage.from_any(payload.get("llm_context_usage")),
         )
 
 
@@ -457,23 +476,27 @@ class StructuredTaskRunner:
         on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None = None,
     ) -> StructuredTaskResult:
         budget = spec.llm_budget or self.settings.llm_budget
+        context_policy = spec.llm_context_policy or self.settings.llm_context_policy
         checkpoint = StructuredTaskCheckpoint(
             spec_fingerprint=spec.fingerprint(),
             phase="model_request",
             messages=self._build_messages(spec=spec, context=context),
             iterations=1,
             llm_budget=budget,
+            llm_context_policy=context_policy,
         )
         controller = LLMBudgetController(budget) if budget is not None else None
-        with llm_budget_scope(controller):
-            self._emit_checkpoint(checkpoint, on_checkpoint)
-            result = self._continue_from_checkpoint(
-                spec=spec,
-                context=context,
-                checkpoint=checkpoint,
-                on_checkpoint=on_checkpoint,
-            )
-            return self._attach_budget_metadata(result)
+        context_planner = LLMContextPlanner(context_policy) if context_policy is not None else None
+        with llm_context_scope(context_planner):
+            with llm_budget_scope(controller):
+                self._emit_checkpoint(checkpoint, on_checkpoint)
+                result = self._continue_from_checkpoint(
+                    spec=spec,
+                    context=context,
+                    checkpoint=checkpoint,
+                    on_checkpoint=on_checkpoint,
+                )
+                return self._attach_runtime_metadata(result)
 
     def resume(
         self,
@@ -490,19 +513,30 @@ class StructuredTaskRunner:
             )
         self._validate_checkpoint_shape(checkpoint)
         budget = checkpoint.llm_budget or spec.llm_budget or self.settings.llm_budget
+        context_policy = (
+            checkpoint.llm_context_policy
+            or spec.llm_context_policy
+            or self.settings.llm_context_policy
+        )
         controller = (
             LLMBudgetController(budget, usage=checkpoint.llm_budget_usage)
             if budget is not None
             else None
         )
-        with llm_budget_scope(controller):
-            result = self._continue_from_checkpoint(
-                spec=spec,
-                context=context,
-                checkpoint=checkpoint,
-                on_checkpoint=on_checkpoint,
-            )
-            return self._attach_budget_metadata(result)
+        context_planner = (
+            LLMContextPlanner(context_policy, usage=checkpoint.llm_context_usage)
+            if context_policy is not None
+            else None
+        )
+        with llm_context_scope(context_planner):
+            with llm_budget_scope(controller):
+                result = self._continue_from_checkpoint(
+                    spec=spec,
+                    context=context,
+                    checkpoint=checkpoint,
+                    on_checkpoint=on_checkpoint,
+                )
+                return self._attach_runtime_metadata(result)
 
     @staticmethod
     def _validate_checkpoint_shape(checkpoint: StructuredTaskCheckpoint) -> None:
@@ -857,10 +891,13 @@ class StructuredTaskRunner:
         return finalized
 
     @staticmethod
-    def _attach_budget_metadata(result: StructuredTaskResult) -> StructuredTaskResult:
+    def _attach_runtime_metadata(result: StructuredTaskResult) -> StructuredTaskResult:
         controller = active_llm_budget_controller()
         if controller is not None:
             result.metadata = {**result.metadata, **controller.to_metadata()}
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            result.metadata = {**result.metadata, **context_planner.to_metadata()}
         return result
 
     @staticmethod
@@ -872,6 +909,10 @@ class StructuredTaskRunner:
         if controller is not None:
             checkpoint.llm_budget = controller.budget
             checkpoint.llm_budget_usage = LLMBudgetUsage.from_any(controller.usage)
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            checkpoint.llm_context_policy = context_planner.policy
+            checkpoint.llm_context_usage = LLMContextUsage.from_any(context_planner.usage)
         checkpoint.sequence += 1
         if on_checkpoint is not None:
             on_checkpoint(checkpoint)

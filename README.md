@@ -25,6 +25,7 @@ public API may still evolve before `1.0.0`.
 - Provider adapters for OpenAI, Azure OpenAI and Azure Anthropic backends
 - Exact provider token usage, per-call telemetry and run-level usage summaries
 - Optional run-level LLM budgets covering main, reflection, finalization and memory calls
+- Optional provider-window context planning with atomic history compaction
 - Provider-enforced JSON Schema contracts for structured task final outputs
 - OpenAI/Azure request normalization and adaptive retry handling
 - Typed Python package marker (`py.typed`)
@@ -238,6 +239,42 @@ persist the same usage so resume cannot reset a budget. Exact provider token
 usage replaces pre-call estimates when available; otherwise the controller
 retains its conservative estimate.
 
+## Provider-Window Context Planning
+
+`LLMContextPolicy` plans the complete provider input immediately before every
+LLM call. Unlike history-only compaction, it counts system prompts, conversation
+messages, tool definitions and structured response schemas, then reserves room
+for the model output and a safety margin.
+
+Set a default on `CoreSettings`, or override it through
+`RunOptions.llm_context_policy` or `StructuredTaskSpec.llm_context_policy`:
+
+```python
+from agent_core import LLMContextPolicy, RunOptions
+
+context_policy = LLMContextPolicy(
+    max_context_tokens=128_000,
+    reserved_output_tokens=8_192,
+    safety_margin_tokens=512,
+    mode="enforce",
+)
+
+options = RunOptions.investigate(llm_context_policy=context_policy)
+```
+
+Enforcement preserves all system messages and the complete current turn,
+including each assistant tool call with all matching tool responses. If the
+request is too large, it removes only complete older history groups, newest
+first. If the mandatory context still cannot fit, the call is rejected before
+provider invocation with `LLMContextOverflowError`. `mode="observe"` records
+the overflow without changing the request.
+
+Results expose `llm_context_policy` and `llm_context_usage`; pending turns and
+structured checkpoints persist the same planner usage across resume. Token
+planning uses a deterministic character heuristic, so the safety margin should
+cover tokenizer variance. Output reservation is provider-enforced only when
+the provider supports `LLMCallOptions.max_output_tokens`.
+
 ## Pending Tool Result Flow
 
 Tools that need an external asynchronous result can return:
@@ -296,6 +333,10 @@ from agent_core import (
     LLMBudget,
     LLMBudgetExceededError,
     LLMBudgetUsage,
+    LLMContextOverflowError,
+    LLMContextPlan,
+    LLMContextPolicy,
+    LLMContextUsage,
     RunContext,
     RunOptions,
     RunStore,

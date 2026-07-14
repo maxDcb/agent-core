@@ -24,6 +24,14 @@ from agent_core.types import AgentTurnResult
 logger = get_logger(__name__)
 
 
+def _llm_failure_stop_reason(error: LLMProviderError) -> str:
+    if error.kind == "budget_exhausted":
+        return "llm_budget_exhausted"
+    if error.kind == "context_overflow":
+        return "llm_context_overflow"
+    return "provider_failure"
+
+
 class ModelCaller(Protocol):
     def __call__(
         self,
@@ -197,7 +205,7 @@ class InvestigationController:
                     options=options,
                     iterations_used=0,
                     tool_calls_used=0,
-                    stop_reason="llm_budget_exhausted" if exc.kind == "budget_exhausted" else "provider_failure",
+                    stop_reason=_llm_failure_stop_reason(exc),
                     state=state,
                 )
             except ValueError as exc:
@@ -334,7 +342,7 @@ class InvestigationController:
                     options=options,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_calls_used,
-                    stop_reason="llm_budget_exhausted" if exc.kind == "budget_exhausted" else "provider_failure",
+                    stop_reason=_llm_failure_stop_reason(exc),
                     state=state,
                 )
 
@@ -488,6 +496,23 @@ class InvestigationController:
         try:
             reflection = self._synthesize_reflection(state=state, tool_step=tool_step, options=options)
         except LLMProviderError as exc:
+            if exc.kind == "context_overflow":
+                failure_result = self.handle_provider_failure(
+                    error=exc,
+                    user_input=user_input,
+                    turn_index=turn_index,
+                )
+                return (
+                    self._attach_metadata(
+                        failure_result,
+                        options=options,
+                        iterations_used=iterations_used,
+                        tool_calls_used=tool_step.tool_calls_used,
+                        stop_reason="llm_context_overflow",
+                        state=state,
+                    ),
+                    no_progress_iterations,
+                )
             if exc.kind != "budget_exhausted":
                 raise
             state.risk_notes.append("The latest tool results could not be synthesized because the LLM budget was exhausted.")
@@ -546,6 +571,23 @@ class InvestigationController:
                 tool_calls_used=tool_step.tool_calls_used,
             )
         except LLMProviderError as exc:
+            if exc.kind == "context_overflow":
+                failure_result = self.handle_provider_failure(
+                    error=exc,
+                    user_input=user_input,
+                    turn_index=turn_index,
+                )
+                return (
+                    self._attach_metadata(
+                        failure_result,
+                        options=options,
+                        iterations_used=iterations_used,
+                        tool_calls_used=tool_step.tool_calls_used,
+                        stop_reason="llm_context_overflow",
+                        state=state,
+                    ),
+                    no_progress_iterations,
+                )
             if exc.kind != "budget_exhausted":
                 raise
             return (
@@ -731,7 +773,7 @@ class InvestigationController:
         try:
             critique = self._synthesize_final_critique(state=state, final_draft=final_draft, options=options)
         except LLMProviderError as exc:
-            if exc.kind != "budget_exhausted":
+            if exc.kind not in {"budget_exhausted", "context_overflow"}:
                 raise
             return self._complete_turn(
                 user_input=user_input,
@@ -742,7 +784,7 @@ class InvestigationController:
                 messages=messages,
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
-                stop_reason="llm_budget_exhausted",
+                stop_reason=_llm_failure_stop_reason(exc),
             )
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
