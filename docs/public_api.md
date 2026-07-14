@@ -19,12 +19,17 @@ state without making the internal controller a public extension point.
 planner and expose content-free planning telemetry; the stateful planner itself
 remains an implementation detail.
 
+`ToolArtifactPolicy`, `ToolArtifactDescriptor`, `ToolArtifactUsage`,
+`ArtifactChunk`, and `JsonFileArtifactStore` configure and describe lossless
+tool-result externalization. `ArtifactStore` is also exported through the SPI
+for hosts that provide remote or transactional artifact persistence.
+
 ## Extension SPI: `agent_core.spi`
 
 The SPI contains contracts intended to be implemented or assembled by a host
 application: LLM providers, domain hooks, policies, tools, provider factories,
-and prompt loading. Changes to these contracts are part of the public semantic
-versioning policy.
+artifact stores, and prompt loading. Changes to these contracts are part of the
+public semantic versioning policy.
 
 Text-only and tool-enabled provider calls both return `LLMCompletionResult`.
 `LLMTokenUsage`, `LLMCallRecord`, and `LLMUsageSummary` carry exact provider

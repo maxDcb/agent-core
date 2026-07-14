@@ -41,6 +41,18 @@ from agent_core.output_contracts import (
 )
 from agent_core.policy_engine import PolicyEngine
 from agent_core.settings import CoreSettings
+from agent_core.tool_artifacts import (
+    READ_ARTIFACT_TOOL_NAME,
+    ArtifactStore,
+    JsonFileArtifactStore,
+    ToolArtifactPolicy,
+    ToolArtifactRuntime,
+    ToolArtifactUsage,
+    active_tool_artifact_runtime,
+    artifact_descriptor_from_message,
+    message_to_persistence_dict,
+    tool_artifact_scope,
+)
 from agent_core.tool_registry import ToolRegistry
 from agent_core.types import ToolExecutionStatus
 
@@ -199,6 +211,7 @@ class StructuredTaskSpec:
     max_iterations: int = 6
     llm_budget: LLMBudget | None = None
     llm_context_policy: LLMContextPolicy | None = None
+    tool_artifact_policy: ToolArtifactPolicy | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -212,6 +225,7 @@ class StructuredTaskSpec:
         self.output_contract = StructuredOutputContract.from_any(self.output_contract)
         self.llm_budget = LLMBudget.from_any(self.llm_budget)
         self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
+        self.tool_artifact_policy = ToolArtifactPolicy.from_any(self.tool_artifact_policy)
         if not isinstance(self.metadata, dict):
             self.metadata = {}
         self.model = _clean_string(self.model) or None
@@ -258,6 +272,8 @@ class StructuredTaskSpec:
             payload["llm_budget"] = self.llm_budget.to_dict()
         if self.llm_context_policy is not None:
             payload["llm_context_policy"] = self.llm_context_policy.to_dict()
+        if self.tool_artifact_policy is not None:
+            payload["tool_artifact_policy"] = self.tool_artifact_policy.to_dict()
         serialized = json.dumps(
             payload,
             ensure_ascii=False,
@@ -360,13 +376,15 @@ class StructuredTaskCheckpoint:
     llm_budget_usage: LLMBudgetUsage = field(default_factory=LLMBudgetUsage)
     llm_context_policy: LLMContextPolicy | None = None
     llm_context_usage: LLMContextUsage = field(default_factory=LLMContextUsage)
+    tool_artifact_policy: ToolArtifactPolicy | None = None
+    tool_artifact_usage: ToolArtifactUsage = field(default_factory=ToolArtifactUsage)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 4,
+            "schema_version": 5,
             "spec_fingerprint": self.spec_fingerprint,
             "phase": self.phase,
-            "messages": [message.to_history_dict() for message in self.messages],
+            "messages": [message_to_persistence_dict(message) for message in self.messages],
             "tool_history": [dict(item) for item in self.tool_history],
             "iterations": self.iterations,
             "tool_calls_used": self.tool_calls_used,
@@ -384,11 +402,15 @@ class StructuredTaskCheckpoint:
                 self.llm_context_policy.to_dict() if self.llm_context_policy is not None else None
             ),
             "llm_context_usage": self.llm_context_usage.to_dict(),
+            "tool_artifact_policy": (
+                self.tool_artifact_policy.to_dict() if self.tool_artifact_policy is not None else None
+            ),
+            "tool_artifact_usage": self.tool_artifact_usage.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: object) -> StructuredTaskCheckpoint | None:
-        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2, 3, 4}:
+        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2, 3, 4, 5}:
             return None
         spec_fingerprint = payload.get("spec_fingerprint")
         phase = payload.get("phase")
@@ -442,6 +464,8 @@ class StructuredTaskCheckpoint:
             llm_budget_usage=LLMBudgetUsage.from_any(payload.get("llm_budget_usage")),
             llm_context_policy=LLMContextPolicy.from_any(payload.get("llm_context_policy")),
             llm_context_usage=LLMContextUsage.from_any(payload.get("llm_context_usage")),
+            tool_artifact_policy=ToolArtifactPolicy.from_any(payload.get("tool_artifact_policy")),
+            tool_artifact_usage=ToolArtifactUsage.from_any(payload.get("tool_artifact_usage")),
         )
 
 
@@ -462,11 +486,13 @@ class StructuredTaskRunner:
         provider: BaseLLMProvider,
         tool_registry: ToolRegistry,
         policy_engine: PolicyEngine,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
         self.tool_registry = tool_registry
         self.policy_engine = policy_engine
+        self.artifact_store = artifact_store or JsonFileArtifactStore(settings.artifacts_directory)
 
     def run(
         self,
@@ -477,6 +503,7 @@ class StructuredTaskRunner:
     ) -> StructuredTaskResult:
         budget = spec.llm_budget or self.settings.llm_budget
         context_policy = spec.llm_context_policy or self.settings.llm_context_policy
+        artifact_policy = spec.tool_artifact_policy or self.settings.tool_artifact_policy
         checkpoint = StructuredTaskCheckpoint(
             spec_fingerprint=spec.fingerprint(),
             phase="model_request",
@@ -484,19 +511,26 @@ class StructuredTaskRunner:
             iterations=1,
             llm_budget=budget,
             llm_context_policy=context_policy,
+            tool_artifact_policy=artifact_policy,
         )
         controller = LLMBudgetController(budget) if budget is not None else None
         context_planner = LLMContextPlanner(context_policy) if context_policy is not None else None
-        with llm_context_scope(context_planner):
-            with llm_budget_scope(controller):
-                self._emit_checkpoint(checkpoint, on_checkpoint)
-                result = self._continue_from_checkpoint(
-                    spec=spec,
-                    context=context,
-                    checkpoint=checkpoint,
-                    on_checkpoint=on_checkpoint,
-                )
-                return self._attach_runtime_metadata(result)
+        artifact_runtime = self._build_artifact_runtime(
+            policy=artifact_policy,
+            context=context,
+            usage=None,
+        )
+        with tool_artifact_scope(artifact_runtime):
+            with llm_context_scope(context_planner):
+                with llm_budget_scope(controller):
+                    self._emit_checkpoint(checkpoint, on_checkpoint)
+                    result = self._continue_from_checkpoint(
+                        spec=spec,
+                        context=context,
+                        checkpoint=checkpoint,
+                        on_checkpoint=on_checkpoint,
+                    )
+                    return self._attach_runtime_metadata(result)
 
     def resume(
         self,
@@ -518,6 +552,11 @@ class StructuredTaskRunner:
             or spec.llm_context_policy
             or self.settings.llm_context_policy
         )
+        artifact_policy = (
+            checkpoint.tool_artifact_policy
+            or spec.tool_artifact_policy
+            or self.settings.tool_artifact_policy
+        )
         controller = (
             LLMBudgetController(budget, usage=checkpoint.llm_budget_usage)
             if budget is not None
@@ -528,15 +567,21 @@ class StructuredTaskRunner:
             if context_policy is not None
             else None
         )
-        with llm_context_scope(context_planner):
-            with llm_budget_scope(controller):
-                result = self._continue_from_checkpoint(
-                    spec=spec,
-                    context=context,
-                    checkpoint=checkpoint,
-                    on_checkpoint=on_checkpoint,
-                )
-                return self._attach_runtime_metadata(result)
+        artifact_runtime = self._build_artifact_runtime(
+            policy=artifact_policy,
+            context=context,
+            usage=checkpoint.tool_artifact_usage,
+        )
+        with tool_artifact_scope(artifact_runtime):
+            with llm_context_scope(context_planner):
+                with llm_budget_scope(controller):
+                    result = self._continue_from_checkpoint(
+                        spec=spec,
+                        context=context,
+                        checkpoint=checkpoint,
+                        on_checkpoint=on_checkpoint,
+                    )
+                    return self._attach_runtime_metadata(result)
 
     @staticmethod
     def _validate_checkpoint_shape(checkpoint: StructuredTaskCheckpoint) -> None:
@@ -698,33 +743,29 @@ class StructuredTaskRunner:
         on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
     ) -> StructuredTaskResult | None:
         while checkpoint.next_tool_call_index < len(checkpoint.pending_tool_calls):
-            if checkpoint.tool_calls_used >= spec.max_tool_calls:
-                remaining = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index :]
+            tool_call = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index]
+            artifact_runtime = active_tool_artifact_runtime()
+            is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tool_call.tool_name)
+            if not is_internal and checkpoint.tool_calls_used >= spec.max_tool_calls:
                 self._append_budget_exhausted_tool_responses(
                     messages=checkpoint.messages,
                     tool_calls=[
                         LLMToolCall(
-                            id=item.tool_call_id,
-                            name=item.tool_name,
-                            arguments_json=item.arguments_json,
+                            id=tool_call.tool_call_id,
+                            name=tool_call.tool_name,
+                            arguments_json=tool_call.arguments_json,
                         )
-                        for item in remaining
                     ],
                     tool_history=checkpoint.tool_history,
                 )
-                for item in remaining:
-                    item.status = "budget_exhausted"
-                checkpoint.next_tool_call_index = len(checkpoint.pending_tool_calls)
-                checkpoint.phase = "finalization"
-                checkpoint.finalization_kind = "budget"
-                checkpoint.finalization_reason = "Maximum number of structured task tool calls reached."
-                checkpoint.raw_failure_content = checkpoint.messages[-1].content if checkpoint.messages else ""
+                tool_call.status = "budget_exhausted"
+                checkpoint.next_tool_call_index += 1
                 self._emit_checkpoint(checkpoint, on_checkpoint)
-                return None
+                continue
 
-            tool_call = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index]
             tool_call.status = "running"
-            checkpoint.tool_calls_used += 1
+            if not is_internal:
+                checkpoint.tool_calls_used += 1
             self._emit_checkpoint(checkpoint, on_checkpoint)
             tool_message, history_item = self._execute_tool_call(
                 registry=registry,
@@ -739,9 +780,15 @@ class StructuredTaskRunner:
             checkpoint.next_tool_call_index += 1
             self._emit_checkpoint(checkpoint, on_checkpoint)
 
+        tool_budget_exhausted = any(item.status == "budget_exhausted" for item in checkpoint.pending_tool_calls)
         checkpoint.pending_tool_calls = []
         checkpoint.next_tool_call_index = 0
-        if checkpoint.iterations >= spec.max_iterations:
+        if tool_budget_exhausted:
+            checkpoint.phase = "finalization"
+            checkpoint.finalization_kind = "budget"
+            checkpoint.finalization_reason = "Maximum number of structured task tool calls reached."
+            checkpoint.raw_failure_content = checkpoint.messages[-1].content if checkpoint.messages else ""
+        elif checkpoint.iterations >= spec.max_iterations:
             checkpoint.phase = "finalization"
             checkpoint.finalization_kind = "budget"
             checkpoint.finalization_reason = "Maximum number of structured task iterations reached."
@@ -898,7 +945,27 @@ class StructuredTaskRunner:
         context_planner = active_llm_context_planner()
         if context_planner is not None:
             result.metadata = {**result.metadata, **context_planner.to_metadata()}
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is not None:
+            result.metadata = {**result.metadata, **artifact_runtime.to_metadata()}
         return result
+
+    def _build_artifact_runtime(
+        self,
+        *,
+        policy: ToolArtifactPolicy | None,
+        context: ExecutionContext,
+        usage: ToolArtifactUsage | dict[str, Any] | None,
+    ) -> ToolArtifactRuntime | None:
+        if policy is None:
+            return None
+        return ToolArtifactRuntime(
+            policy=policy,
+            store=self.artifact_store,
+            namespace_id=context.namespace_id,
+            run_id=context.run_id,
+            usage=usage,
+        )
 
     @staticmethod
     def _emit_checkpoint(
@@ -913,6 +980,10 @@ class StructuredTaskRunner:
         if context_planner is not None:
             checkpoint.llm_context_policy = context_planner.policy
             checkpoint.llm_context_usage = LLMContextUsage.from_any(context_planner.usage)
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is not None:
+            checkpoint.tool_artifact_policy = artifact_runtime.policy
+            checkpoint.tool_artifact_usage = ToolArtifactUsage.from_any(artifact_runtime.usage)
         checkpoint.sequence += 1
         if on_checkpoint is not None:
             on_checkpoint(checkpoint)
@@ -971,6 +1042,12 @@ class StructuredTaskRunner:
             },
         )
         tool_specs = registry.get_tool_specs()
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is not None:
+            if registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
+                raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
+            if artifact_runtime.has_readable_artifacts(messages):
+                tool_specs.extend(artifact_runtime.tool_specs())
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tool_specs,
@@ -1203,8 +1280,10 @@ class StructuredTaskRunner:
                     "arguments_summary": _safe_tool_argument_summary(arguments),
                 },
             )
-            authz = self.policy_engine.authorize(tool_name, arguments, context)
-            if not authz.allowed:
+            artifact_runtime = active_tool_artifact_runtime()
+            is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tool_name)
+            authz = None if is_internal else self.policy_engine.authorize(tool_name, arguments, context)
+            if authz is not None and not authz.allowed:
                 tool_content = f"Tool denied by policy: {authz.reason}"
                 tool_status = "policy_denied"
                 logger.info(
@@ -1218,7 +1297,11 @@ class StructuredTaskRunner:
                 )
             else:
                 try:
-                    result = registry.execute(tool_name, arguments, context)
+                    result = (
+                        artifact_runtime.execute(tool_name=tool_name, arguments=arguments, context=context)
+                        if is_internal and artifact_runtime is not None
+                        else registry.execute(tool_name, arguments, context)
+                    )
                     tool_content = result.content
                     tool_status = "ok" if result.ok else "tool_error"
                     logger.info(
@@ -1236,13 +1319,28 @@ class StructuredTaskRunner:
                     tool_content = f"Tool execution failed: {exc}"
                     tool_status = "execution_failed"
 
-        tool_message = LLMMessage(role="tool", tool_call_id=tool_call_id, content=tool_content)
+        artifact_runtime = active_tool_artifact_runtime()
+        is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tool_name)
+        tool_message = (
+            artifact_runtime.externalize(
+                tool_name=tool_name,
+                content=tool_content,
+                tool_call_id=tool_call_id,
+                metadata={"status": tool_status},
+            )
+            if artifact_runtime is not None and not is_internal
+            else LLMMessage(role="tool", tool_call_id=tool_call_id, content=tool_content)
+        )
         history_item = {
             "tool_name": tool_name,
             "arguments": arguments,
             "status": tool_status,
             "content_preview": safe_preview(tool_content, limit=500),
+            "tool_kind": "runtime" if is_internal else "application",
         }
+        descriptor = artifact_descriptor_from_message(tool_message)
+        if descriptor is not None:
+            history_item["artifact_id"] = descriptor.artifact_id
         return tool_message, history_item
 
     def _finalize_result(

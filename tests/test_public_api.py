@@ -27,12 +27,15 @@ def test_run_engine_public_api_is_small_and_explicit() -> None:
         "AgentRunResult",
         "AgentRunService",
         "AgentRunState",
+        "ArtifactChunk",
+        "ArtifactStore",
         "CoreSettings",
         "ExecutionContext",
         "ExecutionScope",
         "FinalOutputMode",
         "JSON_SCHEMA_DRAFT",
         "JsonFileRunStore",
+        "JsonFileArtifactStore",
         "LLMBudget",
         "LLMBudgetExceededError",
         "LLMBudgetUsage",
@@ -53,6 +56,9 @@ def test_run_engine_public_api_is_small_and_explicit() -> None:
         "StructuredTaskResult",
         "StructuredTaskRunner",
         "StructuredTaskSpec",
+        "ToolArtifactDescriptor",
+        "ToolArtifactPolicy",
+        "ToolArtifactUsage",
         "__version__",
     }
     assert all(
@@ -76,6 +82,7 @@ def test_run_engine_public_api_is_small_and_explicit() -> None:
 def test_extension_conversation_and_observability_facades_are_explicit() -> None:
     assert set(spi.__all__) == {
         "AuthorizationResult",
+        "ArtifactStore",
         "BaseLLMProvider",
         "BaseTool",
         "DomainHooks",

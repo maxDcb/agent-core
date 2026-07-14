@@ -399,6 +399,11 @@ def run_budgeted_llm_call(
     invoke: Callable[[LLMCallOptions | None], T],
     on_reserved: Callable[[], None] | None = None,
 ) -> T:
+    from agent_core.tool_artifacts import active_tool_artifact_runtime
+
+    artifact_runtime = active_tool_artifact_runtime()
+    if artifact_runtime is not None:
+        artifact_runtime.prepare_messages(messages)
     context_planner = active_llm_context_planner()
     effective_options = options
     if context_planner is not None:

@@ -70,6 +70,18 @@ calls are never separated from their responses. An irreducible overflow fails
 before provider invocation. Planner aggregates are persisted in pending turns
 and structured checkpoints and exposed in final metadata.
 
+When `ToolArtifactPolicy` is active, completed application-tool outputs are
+published to an `ArtifactStore` before the corresponding tool execution is
+checkpointed as complete. Persisted transcripts contain an opaque descriptor;
+the provider projection rehydrates only the newest results within the hot-byte
+budget. Large results stay cold from their first projection. The model can use
+the bounded `agent_core_read_artifact` runtime tool to retrieve more data.
+Runtime artifact reads bypass application policy and tool-call accounting, but
+are namespace-scoped and enforce separate per-run call and byte limits.
+The default file store is plaintext and local; deployments with sensitive tool
+outputs must provide storage encryption, permissions, and retention through a
+custom `ArtifactStore`.
+
 A tool call persisted as completed is never replayed. A tool call left in
 `running` is considered ambiguous because its external effect may have happened
 before the process stopped. Recovery becomes `blocked` until the host reconciles
@@ -114,7 +126,9 @@ instead of replacing or duplicating previous usage.
 
 ## Application pipelines
 
-Applications own jobs, phases, retries, artifacts and domain state. A pipeline
+Applications own jobs, phases, retries, domain artifacts and domain state.
+Agent-core owns the optional storage lifecycle for raw tool-result artifacts
+needed to virtualize its internal transcript. A pipeline
 creates one core run per LLM/tool execution and links its `run_id` to the
 application attempt. Pipeline state is passed through explicit correlation;
 it is never injected into conversation memory.

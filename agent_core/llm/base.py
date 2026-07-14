@@ -49,6 +49,7 @@ class LLMMessage:
     content: str
     tool_call_id: str | None = None
     tool_calls: list[LLMToolCall] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def from_history_dict(cls, payload: dict[str, Any]) -> LLMMessage:
@@ -64,12 +65,16 @@ class LLMMessage:
         tool_call_id = payload.get("tool_call_id")
         if not isinstance(tool_call_id, str):
             tool_call_id = None
+        metadata = payload.get("_agent_core")
+        if not isinstance(metadata, dict):
+            metadata = {}
         normalized_role = cast(LLMMessageRole, role if role in {"system", "user", "assistant", "tool"} else "user")
         return cls(
             role=normalized_role,
             content=content,
             tool_call_id=tool_call_id,
             tool_calls=tool_calls,
+            metadata=dict(metadata),
         )
 
     def to_history_dict(self) -> dict[str, Any]:

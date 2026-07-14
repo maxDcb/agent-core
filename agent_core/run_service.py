@@ -25,6 +25,7 @@ from agent_core.structured_tasks import (
     StructuredTaskRunner,
     StructuredTaskSpec,
 )
+from agent_core.tool_artifacts import ArtifactStore
 from agent_core.tool_registry import ToolRegistry
 from agent_core.types import ToolResult
 
@@ -40,6 +41,7 @@ class AgentRunService:
         tool_registry: ToolRegistry,
         policy_engine: PolicyEngine,
         run_store: RunStore,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.settings = settings
         self.run_store = run_store
@@ -48,6 +50,7 @@ class AgentRunService:
             provider=provider,
             tool_registry=tool_registry,
             policy_engine=policy_engine,
+            artifact_store=artifact_store,
         )
 
     def execute(

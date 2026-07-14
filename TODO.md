@@ -6,7 +6,7 @@
 - Keep normal conversation compaction after the run completes.
 - In a future change, distinguish the provider's hard context capacity from the configurable active-history target and expose accurate context-usage telemetry.
 - If the provider's hard capacity cannot be respected, fail explicitly instead of silently truncating evidence or reporting a complete investigation.
-- Consider lossless artifact references and evidence promotion as optional extension points. Storage, pagination, search, and externalization of large tool outputs remain the responsibility of the application/tool project using `agent-core`.
+- Extend the lossless tool-result artifact layer with optional indexed search and explicit retention/encryption policies; bounded reads and externalization are owned by `agent-core`.
 - Preserve the invariant that data removed from an active prompt is never implicitly treated as reviewed evidence.
 
 ## Security policy and sensitive persistence

@@ -35,6 +35,14 @@ from agent_core.run_service import AgentRunService
 from agent_core.run_store import JsonFileRunStore, RunExecutionBusyError, RunStore
 from agent_core.settings import CoreSettings
 from agent_core.structured_tasks import StructuredTaskResult, StructuredTaskRunner, StructuredTaskSpec
+from agent_core.tool_artifacts import (
+    ArtifactChunk,
+    ArtifactStore,
+    JsonFileArtifactStore,
+    ToolArtifactDescriptor,
+    ToolArtifactPolicy,
+    ToolArtifactUsage,
+)
 
 __version__ = "0.4.0"
 
@@ -45,6 +53,8 @@ __all__ = [
     "AgentRunResult",
     "AgentRunService",
     "AgentRunState",
+    "ArtifactChunk",
+    "ArtifactStore",
     "CoreSettings",
     "ExecutionContext",
     "ExecutionScope",
@@ -58,6 +68,7 @@ __all__ = [
     "LLMBudgetExceededError",
     "LLMBudgetUsage",
     "JsonFileRunStore",
+    "JsonFileArtifactStore",
     "RunContext",
     "RunCheckpoint",
     "RunExecutionBusyError",
@@ -71,5 +82,8 @@ __all__ = [
     "StructuredTaskResult",
     "StructuredTaskRunner",
     "StructuredTaskSpec",
+    "ToolArtifactDescriptor",
+    "ToolArtifactPolicy",
+    "ToolArtifactUsage",
     "__version__",
 ]

@@ -26,6 +26,7 @@ public API may still evolve before `1.0.0`.
 - Exact provider token usage, per-call telemetry and run-level usage summaries
 - Optional run-level LLM budgets covering main, reflection, finalization and memory calls
 - Optional provider-window context planning with atomic history compaction
+- Optional lossless tool-result artifacts with bounded on-demand rereads
 - Provider-enforced JSON Schema contracts for structured task final outputs
 - OpenAI/Azure request normalization and adaptive retry handling
 - Typed Python package marker (`py.typed`)
@@ -274,6 +275,45 @@ structured checkpoints persist the same planner usage across resume. Token
 planning uses a deterministic character heuristic, so the safety margin should
 cover tokenizer variance. Output reservation is provider-enforced only when
 the provider supports `LLMCallOptions.max_output_tokens`.
+
+## Lossless Tool-Result Artifacts
+
+`ToolArtifactPolicy` optionally stores every completed application-tool result
+outside the transcript. Recent bounded results remain hot for immediate model
+continuity; older or individually large results are represented by an opaque
+artifact descriptor. The runtime exposes `agent_core_read_artifact` whenever
+the policy is active so the model can read bounded chunks on demand.
+
+```python
+from pathlib import Path
+
+from agent_core import CoreSettings, ToolArtifactPolicy
+
+settings = CoreSettings(
+    artifacts_directory=Path("./artifacts"),
+    tool_artifact_policy=ToolArtifactPolicy(
+        hot_context_bytes=64 * 1024,
+        max_inline_result_bytes=32 * 1024,
+        max_read_bytes=16 * 1024,
+        max_reads_per_run=20,
+        max_total_read_bytes=256 * 1024,
+    ),
+)
+```
+
+The policy can also be overridden with `RunOptions.tool_artifact_policy` or
+`StructuredTaskSpec.tool_artifact_policy`. `JsonFileArtifactStore` is the
+default; hosts may inject an `ArtifactStore` into `AgentRunService` for remote
+or transactional storage. Artifact reads are namespace-scoped, never accept a
+filesystem path, have their own call/byte limits, and do not consume the
+application tool-call budget. Pending conversation state and structured
+checkpoint schema version 5 persist descriptors and artifact usage rather than
+copying the full result.
+
+The feature is disabled by default. `JsonFileArtifactStore` stores plaintext
+UTF-8 files and is intended for trusted local deployments; production hosts
+handling credentials or browser session data should inject an encrypted store
+with explicit access control and retention.
 
 ## Pending Tool Result Flow
 

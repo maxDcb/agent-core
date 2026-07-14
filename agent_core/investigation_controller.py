@@ -18,6 +18,7 @@ from agent_core.output_contracts import StructuredOutputValidationError, parse_j
 from agent_core.run_options import RunOptions
 from agent_core.settings import CoreSettings
 from agent_core.structured_synthesizer import StructuredSynthesisRequest, StructuredSynthesizer
+from agent_core.tool_artifacts import active_tool_artifact_runtime, artifact_descriptor_from_message
 from agent_core.turn_steps import PendingResumeState, ToolExecutionStepResult
 from agent_core.types import AgentTurnResult
 
@@ -388,7 +389,11 @@ class InvestigationController:
                     no_progress_iterations=no_progress_iterations,
                 )
 
-            if tool_calls_used >= options.max_tool_calls:
+            artifact_runtime = active_tool_artifact_runtime()
+            only_internal_calls = bool(assistant_message.tool_calls) and artifact_runtime is not None and all(
+                artifact_runtime.is_internal_tool(tool_call.name) for tool_call in assistant_message.tool_calls
+            )
+            if tool_calls_used >= options.max_tool_calls and not only_internal_calls:
                 return self._complete_with_budget_answer(
                     user_input=user_input,
                     turn_index=turn_index,
@@ -547,6 +552,19 @@ class InvestigationController:
             )
             return None, no_progress_iterations + 1
         state.apply_reflection(reflection)
+        artifact_ids = [
+            descriptor.artifact_id
+            for message in tool_step.tool_messages
+            if (descriptor := artifact_descriptor_from_message(message)) is not None
+        ]
+        if artifact_ids:
+            existing_artifacts = state.metadata.get("tool_artifact_ids")
+            normalized_existing = (
+                [item for item in existing_artifacts if isinstance(item, str)]
+                if isinstance(existing_artifacts, list)
+                else []
+            )
+            state.metadata["tool_artifact_ids"] = list(dict.fromkeys([*normalized_existing, *artifact_ids]))
         if state.progress_fingerprint() == previous_fingerprint:
             no_progress_iterations += 1
         else:
@@ -1048,6 +1066,12 @@ class InvestigationController:
         tool_step: ToolExecutionStepResult,
         options: RunOptions,
     ) -> StepReflection:
+        artifact_runtime = active_tool_artifact_runtime()
+        reflection_messages = (
+            artifact_runtime.project_messages(tool_step.tool_messages)
+            if artifact_runtime is not None
+            else tool_step.tool_messages
+        )
         payload = {
             "current_state": state.to_dict(),
             "tool_results": [
@@ -1055,8 +1079,13 @@ class InvestigationController:
                     "role": message.role,
                     "tool_call_id": message.tool_call_id,
                     "content": message.content,
+                    "artifact_id": (
+                        descriptor.artifact_id
+                        if (descriptor := artifact_descriptor_from_message(message)) is not None
+                        else None
+                    ),
                 }
-                for message in tool_step.tool_messages
+                for message in reflection_messages
             ],
             "tool_statuses": tool_step.tool_statuses,
             "tool_names": tool_step.tool_names,

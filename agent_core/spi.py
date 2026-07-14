@@ -23,12 +23,14 @@ from agent_core.llm.provider_factory import (
 )
 from agent_core.policy_engine import PolicyEngine
 from agent_core.prompt_repository import load_prompt
+from agent_core.tool_artifacts import ArtifactStore
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import BaseTool, build_tool_definition
 from agent_core.types import AuthorizationResult, ToolExecutionStatus, ToolResult
 
 __all__ = [
     "AuthorizationResult",
+    "ArtifactStore",
     "BaseLLMProvider",
     "BaseTool",
     "DomainHooks",

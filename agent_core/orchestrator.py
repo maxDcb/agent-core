@@ -53,6 +53,18 @@ from agent_core.run_trace import PromptSnapshot, RunTrace
 from agent_core.session_manager import SessionManager
 from agent_core.settings import CoreSettings
 from agent_core.structured_synthesizer import StructuredSynthesisRequest, StructuredSynthesizer
+from agent_core.tool_artifacts import (
+    READ_ARTIFACT_TOOL_NAME,
+    ArtifactStore,
+    JsonFileArtifactStore,
+    ToolArtifactPolicy,
+    ToolArtifactRuntime,
+    ToolArtifactUsage,
+    active_tool_artifact_runtime,
+    artifact_descriptor_from_message,
+    message_to_persistence_dict,
+    tool_artifact_scope,
+)
 from agent_core.tool_registry import ToolRegistry
 from agent_core.turn_steps import PendingResumeState, ToolExecutionStepResult
 from agent_core.types import AgentTurnResult, ToolExecutionStatus
@@ -83,6 +95,7 @@ class AgentOrchestrator:
         session_manager: SessionManager,
         policy_engine: PolicyEngine,
         domain_hooks: DomainHooks | None = None,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.settings = settings
         self.provider = provider
@@ -91,6 +104,7 @@ class AgentOrchestrator:
         self.session_manager = session_manager
         self.policy_engine = policy_engine
         self.domain_hooks = domain_hooks or DomainHooks()
+        self.artifact_store = artifact_store or JsonFileArtifactStore(settings.artifacts_directory)
         self._run_context_var: ContextVar[RunContext | None] = ContextVar("agent_run_context", default=None)
         self.prompt_builder = PromptBuilder(
             settings=settings,
@@ -127,6 +141,23 @@ class AgentOrchestrator:
             },
         )
         return messages
+
+    def _build_artifact_runtime(
+        self,
+        *,
+        policy: ToolArtifactPolicy | None,
+        context: RunContext,
+        usage: ToolArtifactUsage | dict[str, Any] | None = None,
+    ) -> ToolArtifactRuntime | None:
+        if policy is None or context.run_id is None:
+            return None
+        return ToolArtifactRuntime(
+            policy=policy,
+            store=self.artifact_store,
+            namespace_id=context.namespace_id,
+            run_id=context.run_id,
+            usage=usage,
+        )
 
     def _estimate_prompt_tokens(self, *, messages: list[LLMMessage]) -> int:
         return estimate_token_count([message.to_history_dict() for message in messages])
@@ -199,6 +230,9 @@ class AgentOrchestrator:
         context_planner = active_llm_context_planner()
         if context_planner is not None:
             result.metadata = {**result.metadata, **context_planner.to_metadata()}
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is not None:
+            result.metadata = {**result.metadata, **artifact_runtime.to_metadata()}
         if expose_trace_id:
             result.metadata = {**result.metadata, "run_trace_id": trace.run_id}
         event_type = "run_completed" if result.status == "completed" else "run_pending"
@@ -467,8 +501,8 @@ class AgentOrchestrator:
         tool_exchange_block = create_tool_exchange_block(
             turn_index=turn_index,
             exchange_index=exchange_index,
-            assistant_message=assistant_message.to_history_dict(),
-            tool_messages=[message.to_history_dict() for message in tool_messages],
+            assistant_message=message_to_persistence_dict(assistant_message),
+            tool_messages=[message_to_persistence_dict(message) for message in tool_messages],
         )
         if not any(block.block_id == tool_exchange_block.block_id for block in self.session_manager.get_context_blocks()):
             self.session_manager.append_context_block(tool_exchange_block)
@@ -589,12 +623,12 @@ class AgentOrchestrator:
         payload = {
             "pending_id": pending_id,
             "user_input": user_input,
-            "messages": [message.to_history_dict() for message in messages],
+            "messages": [message_to_persistence_dict(message) for message in messages],
             "turn_index": turn_index,
             "exchange_index": exchange_index,
             "tool_calls_used": tool_calls_used,
-            "assistant_message": assistant_message.to_history_dict(),
-            "tool_messages": [message.to_history_dict() for message in tool_messages or []],
+            "assistant_message": message_to_persistence_dict(assistant_message),
+            "tool_messages": [message_to_persistence_dict(message) for message in tool_messages or []],
             "tool_call_id": tool_call_id,
             "tool_name": tool_name,
             "arguments": arguments,
@@ -611,6 +645,9 @@ class AgentOrchestrator:
         context_planner = active_llm_context_planner()
         if context_planner is not None:
             payload.update(context_planner.to_metadata())
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is not None:
+            payload.update(artifact_runtime.to_metadata())
         self.session_manager.set_meta_value(self.PENDING_TURN_META_KEY, payload)
 
     def run_turn(self, *, user_input: str, thread_id: str, context: RunContext) -> str:
@@ -641,16 +678,19 @@ class AgentOrchestrator:
         budget_controller = LLMBudgetController(budget) if budget is not None else None
         context_policy = run_options.llm_context_policy or self.settings.llm_context_policy
         context_planner = LLMContextPlanner(context_policy) if context_policy is not None else None
+        artifact_policy = run_options.tool_artifact_policy or self.settings.tool_artifact_policy
+        artifact_runtime = self._build_artifact_runtime(policy=artifact_policy, context=bound_context)
         token = self._run_context_var.set(bound_context)
         try:
-            with llm_context_scope(context_planner):
-                with llm_budget_scope(budget_controller):
-                    with self.session_manager.session_scope(thread_id):
-                        return self._run_turn_result_active(
-                            user_input=user_input,
-                            context=bound_context,
-                            options=options,
-                        )
+            with tool_artifact_scope(artifact_runtime):
+                with llm_context_scope(context_planner):
+                    with llm_budget_scope(budget_controller):
+                        with self.session_manager.session_scope(thread_id):
+                            return self._run_turn_result_active(
+                                user_input=user_input,
+                                context=bound_context,
+                                options=options,
+                            )
         finally:
             self._run_context_var.reset(token)
 
@@ -789,22 +829,35 @@ class AgentOrchestrator:
                     if context_policy is not None
                     else None
                 )
-                with llm_context_scope(context_planner):
-                    with llm_budget_scope(budget_controller):
-                        result = self._resume_turn_active(
-                            pending_id=pending_id,
-                            tool_content=tool_content,
-                            ok=ok,
-                            context=bound_context,
-                        )
-                        active_controller = active_llm_budget_controller()
-                        if active_controller is not None:
-                            result.metadata = {**result.metadata, **active_controller.to_metadata()}
-                        active_planner = active_llm_context_planner()
-                        if active_planner is not None:
-                            result.metadata = {**result.metadata, **active_planner.to_metadata()}
-                        self._store_completed_pending_result(pending_id=pending_id, result=result)
-                        return result
+                artifact_policy = (
+                    ToolArtifactPolicy.from_any(pending.get("tool_artifact_policy"))
+                    or self.settings.tool_artifact_policy
+                )
+                artifact_runtime = self._build_artifact_runtime(
+                    policy=artifact_policy,
+                    context=bound_context,
+                    usage=ToolArtifactUsage.from_any(pending.get("tool_artifact_usage")),
+                )
+                with tool_artifact_scope(artifact_runtime):
+                    with llm_context_scope(context_planner):
+                        with llm_budget_scope(budget_controller):
+                            result = self._resume_turn_active(
+                                pending_id=pending_id,
+                                tool_content=tool_content,
+                                ok=ok,
+                                context=bound_context,
+                            )
+                            active_controller = active_llm_budget_controller()
+                            if active_controller is not None:
+                                result.metadata = {**result.metadata, **active_controller.to_metadata()}
+                            active_planner = active_llm_context_planner()
+                            if active_planner is not None:
+                                result.metadata = {**result.metadata, **active_planner.to_metadata()}
+                            active_artifacts = active_tool_artifact_runtime()
+                            if active_artifacts is not None:
+                                result.metadata = {**result.metadata, **active_artifacts.to_metadata()}
+                            self._store_completed_pending_result(pending_id=pending_id, result=result)
+                            return result
         finally:
             self._run_context_var.reset(token)
 
@@ -988,6 +1041,12 @@ class AgentOrchestrator:
         options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
         tool_specs = self.registry.get_tool_specs()
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is not None:
+            if self.registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
+                raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
+            if artifact_runtime.has_readable_artifacts(messages):
+                tool_specs.extend(artifact_runtime.tool_specs())
         purpose = (
             str(options.metadata.get("target"))
             if options is not None and options.metadata.get("target")
@@ -1084,7 +1143,9 @@ class AgentOrchestrator:
             # The live provider transcript keeps growing inside the loop, but
             # persisted storage records each tool phase as an atomic
             # tool-exchange block once execution completes.
-            if tool_calls_used >= max_tool_calls:
+            artifact_runtime = active_tool_artifact_runtime()
+            is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tc.name)
+            if not is_internal and tool_calls_used >= max_tool_calls:
                 logger.error("Tool-call budget exhausted before executing remaining tool calls")
                 tool_budget_exhausted = True
                 self._record_trace_event(
@@ -1095,15 +1156,16 @@ class AgentOrchestrator:
                 )
                 self._append_budget_exhausted_tool_messages(
                     messages=messages,
-                    tool_calls=assistant_message.tool_calls[tool_call_offset:],
+                    tool_calls=[tc],
                     tool_messages=tool_messages,
                     tool_names=tool_names,
                     tool_statuses=tool_statuses,
                     trace=trace,
                 )
-                break
+                continue
 
-            tool_calls_used += 1
+            if not is_internal:
+                tool_calls_used += 1
             tool_names.append(tc.name)
             logger.info(
                 "Executing tool call",
@@ -1129,8 +1191,8 @@ class AgentOrchestrator:
                 tool_content = f"Invalid JSON arguments for tool {tc.name}"
                 tool_status: ToolExecutionStatus = "invalid_arguments"
             else:
-                authz = self.policy_engine.authorize(tc.name, arguments, context)
-                if not authz.allowed:
+                authz = None if is_internal else self.policy_engine.authorize(tc.name, arguments, context)
+                if authz is not None and not authz.allowed:
                     tool_content = f"Tool denied by policy: {authz.reason}"
                     tool_status = "policy_denied"
                     logger.info(
@@ -1143,7 +1205,11 @@ class AgentOrchestrator:
                             "Dispatching tool execution",
                             extra={"tool_name": tc.name, "argument_keys": sorted(arguments.keys())},
                         )
-                        result = self.registry.execute(tc.name, arguments, context)
+                        result = (
+                            artifact_runtime.execute(tool_name=tc.name, arguments=arguments, context=context)
+                            if is_internal and artifact_runtime is not None
+                            else self.registry.execute(tc.name, arguments, context)
+                        )
                         tool_content = result.content
                         if result.pending:
                             pending_id = result.pending_id or self._build_pending_id(
@@ -1224,18 +1290,30 @@ class AgentOrchestrator:
                         tool_status = "execution_failed"
                         logger.exception("Tool execution crashed", extra={"tool_name": tc.name})
 
-            tool_message = LLMMessage(role="tool", tool_call_id=tc.id, content=tool_content)
+            tool_message = (
+                artifact_runtime.externalize(
+                    tool_name=tc.name,
+                    content=tool_content,
+                    tool_call_id=tc.id,
+                    metadata={"status": tool_status},
+                )
+                if artifact_runtime is not None and not is_internal
+                else LLMMessage(role="tool", tool_call_id=tc.id, content=tool_content)
+            )
             messages.append(tool_message)
             tool_messages.append(tool_message)
             tool_statuses.append(tool_status)
-            self.session_manager.append_tool_history(
-                self._build_tool_history_item(
-                    tool_name=tc.name,
-                    arguments=arguments,
-                    tool_content=tool_content,
-                    status=tool_status,
-                )
+            history_item = self._build_tool_history_item(
+                tool_name=tc.name,
+                arguments=arguments,
+                tool_content=tool_content,
+                status=tool_status,
             )
+            history_item["tool_kind"] = "runtime" if is_internal else "application"
+            descriptor = artifact_descriptor_from_message(tool_message)
+            if descriptor is not None:
+                history_item["artifact_id"] = descriptor.artifact_id
+            self.session_manager.append_tool_history(history_item)
             self._record_trace_event(
                 trace,
                 event_type="tool_call_completed",
@@ -1296,7 +1374,18 @@ class AgentOrchestrator:
         if not isinstance(tool_call_id, str) or not tool_call_id:
             return AgentTurnResult(status="completed", content="Pending agent turn is corrupt: missing tool call id.")
 
-        tool_message = LLMMessage(role="tool", tool_call_id=tool_call_id, content=tool_content)
+        pending_tool_name = str(pending.get("tool_name") or "unknown")
+        artifact_runtime = active_tool_artifact_runtime()
+        tool_message = (
+            artifact_runtime.externalize(
+                tool_name=pending_tool_name,
+                content=tool_content,
+                tool_call_id=tool_call_id,
+                metadata={"status": "ok" if ok else "tool_error", "pending_result": True},
+            )
+            if artifact_runtime is not None
+            else LLMMessage(role="tool", tool_call_id=tool_call_id, content=tool_content)
+        )
         messages.append(tool_message)
 
         turn_index = pending.get("turn_index")
@@ -1315,7 +1404,7 @@ class AgentOrchestrator:
         pending_arguments = pending.get("arguments")
         self.session_manager.append_tool_history(
             self._build_tool_history_item(
-                tool_name=str(pending.get("tool_name") or "unknown"),
+                tool_name=pending_tool_name,
                 arguments=dict(pending_arguments) if isinstance(pending_arguments, dict) else {},
                 tool_content=tool_content,
                 status="ok" if ok else "tool_error",
@@ -1465,7 +1554,13 @@ class AgentOrchestrator:
 
     def _tool_history_delta(self, *, start_count: int) -> int:
         history = self.session_manager.get_state().get("tool_history", [])
-        return max(0, len(history) - start_count) if isinstance(history, list) else 0
+        if not isinstance(history, list):
+            return 0
+        return sum(
+            1
+            for item in history[start_count:]
+            if isinstance(item, dict) and item.get("tool_kind", "application") != "runtime"
+        )
 
     def _continue_turn(
         self,
@@ -1581,43 +1676,6 @@ class AgentOrchestrator:
                 self._refresh_memory_after_turn(turn_index=turn_index)
                 logger.info("Completing run_turn without additional tool calls")
                 return AgentTurnResult(status="completed", content=llm_response.content)
-
-            if tool_calls_used >= self.settings.max_tool_calls_per_turn:
-                exchange_index += 1
-                tool_messages: list[LLMMessage] = []
-                tool_statuses: list[ToolExecutionStatus] = []
-                tool_names: list[str] = []
-                self._append_budget_exhausted_tool_messages(
-                    messages=messages,
-                    tool_calls=assistant_message.tool_calls,
-                    tool_messages=tool_messages,
-                    tool_names=tool_names,
-                    tool_statuses=tool_statuses,
-                    trace=trace,
-                    iteration=model_call_index,
-                )
-                self._persist_tool_exchange_once(
-                    turn_index=turn_index,
-                    exchange_index=exchange_index,
-                    assistant_message=assistant_message,
-                    tool_messages=tool_messages,
-                )
-                msg = "Maximum number of tool calls reached for this turn."
-                logger.error(msg)
-                self._record_trace_event(
-                    trace,
-                    event_type="tool_budget_exhausted",
-                    summary=msg,
-                    iteration=model_call_index,
-                    payload={"tool_calls_used": tool_calls_used},
-                )
-                self._persist_conversation_turn(
-                    turn_index=turn_index,
-                    user_input=user_input,
-                    assistant_content=msg,
-                )
-                self._refresh_memory_after_turn(turn_index=turn_index)
-                return AgentTurnResult(status="completed", content=msg)
 
             tool_step = self._execute_tool_calls_once(
                 user_input=user_input,

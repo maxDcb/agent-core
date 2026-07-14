@@ -14,6 +14,12 @@
   only atomic historical groups, with observe/enforce modes and overflow errors.
 - Persisted context-planning telemetry in pending turns and structured-task
   checkpoint schema version 4 so resumed runs retain planner state.
+- Added optional lossless tool-result externalization with a namespace-scoped
+  `ArtifactStore`, hot/cold prompt projection, and the bounded internal
+  `agent_core_read_artifact` tool.
+- Separated internal artifact-read accounting from application tool budgets and
+  persisted artifact descriptors and usage in structured checkpoint schema
+  version 5 and pending conversation state.
 
 ## 0.4.0
 

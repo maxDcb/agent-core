@@ -6,6 +6,7 @@ from pathlib import Path
 from agent_core.context_planner import LLMContextPolicy
 from agent_core.llm_budget import LLMBudget
 from agent_core.prompt_repository import load_prompt
+from agent_core.tool_artifacts import ToolArtifactPolicy
 
 
 @dataclass(slots=True)
@@ -44,6 +45,7 @@ class CoreSettings:
     llm_max_output_tokens: int | None = None
     llm_budget: LLMBudget | None = None
     llm_context_policy: LLMContextPolicy | None = None
+    tool_artifact_policy: ToolArtifactPolicy | None = None
     log_synthesis_payloads: bool = False
 
     debug: bool = False
@@ -51,6 +53,7 @@ class CoreSettings:
 
     session_file: Path = field(default_factory=lambda: Path("./sessions/session.json"))
     reports_directory: Path = field(default_factory=lambda: Path("./reports"))
+    artifacts_directory: Path = field(default_factory=lambda: Path("./artifacts"))
     prompts_dir: Path = field(default_factory=lambda: Path("./prompts").resolve())
     knowledge_base_dir: Path = field(default_factory=lambda: Path("./knowledge").resolve())
 
@@ -69,6 +72,8 @@ class CoreSettings:
     def __post_init__(self) -> None:
         self.llm_budget = LLMBudget.from_any(self.llm_budget)
         self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
+        self.tool_artifact_policy = ToolArtifactPolicy.from_any(self.tool_artifact_policy)
+        self.artifacts_directory = self.artifacts_directory.resolve()
         self.prompts_dir = self.prompts_dir.resolve()
         self.knowledge_base_dir = self.knowledge_base_dir.resolve()
         self.allowed_read_roots = [path.resolve() for path in self.allowed_read_roots]
