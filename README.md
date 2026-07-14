@@ -24,6 +24,7 @@ public API may still evolve before `1.0.0`.
 - Domain hooks for application-specific prompt and memory extensions
 - Provider adapters for OpenAI, Azure OpenAI and Azure Anthropic backends
 - Exact provider token usage, per-call telemetry and run-level usage summaries
+- Optional run-level LLM budgets covering main, reflection, finalization and memory calls
 - Provider-enforced JSON Schema contracts for structured task final outputs
 - OpenAI/Azure request normalization and adaptive retry handling
 - Typed Python package marker (`py.typed`)
@@ -197,6 +198,46 @@ result = service.execute(
 )
 ```
 
+## Run-Level LLM Budgets
+
+`LLMBudget` applies one shared budget to every model call made by a run,
+including assistant steps, internal investigation synthesis, finalization and
+post-turn memory refresh. No budget is applied unless one is configured, so
+existing integrations preserve their current behavior.
+
+Set a default on `CoreSettings`, or override it for one conversation or
+structured task through `RunOptions.llm_budget` or
+`StructuredTaskSpec.llm_budget`:
+
+```python
+from agent_core import LLMBudget, RunOptions
+
+budget = LLMBudget(
+    max_calls=12,
+    max_input_tokens=80_000,
+    max_output_tokens=12_000,
+    max_total_tokens=90_000,
+    max_duration_seconds=180,
+    mode="enforce",
+)
+
+options = RunOptions.investigate(llm_budget=budget)
+```
+
+`mode="observe"` records limit violations without blocking calls or changing
+provider output limits. In enforcement mode, a call that would exceed the call,
+input-token, total-token or cumulative provider-call-duration limit is rejected
+before provider invocation. The duration limit is checked between calls; it
+does not cancel a provider request already in flight. The controller also caps
+the provider's per-call maximum output to the remaining output/total budget
+when the provider accepts call options.
+
+Completed and pending results expose `llm_budget` and `llm_budget_usage` in
+their metadata. Pending conversation state and structured-task checkpoints
+persist the same usage so resume cannot reset a budget. Exact provider token
+usage replaces pre-call estimates when available; otherwise the controller
+retains its conservative estimate.
+
 ## Pending Tool Result Flow
 
 Tools that need an external asynchronous result can return:
@@ -252,6 +293,9 @@ from agent_core import (
     ExecutionContext,
     ExecutionScope,
     JsonFileRunStore,
+    LLMBudget,
+    LLMBudgetExceededError,
+    LLMBudgetUsage,
     RunContext,
     RunOptions,
     RunStore,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from agent_core.llm_budget import LLMBudget
 from agent_core.prompt_repository import load_prompt
 
 
@@ -40,6 +41,7 @@ class CoreSettings:
     max_tool_calls_per_turn: int = 100
     llm_timeout_seconds: float = 120.0
     llm_max_output_tokens: int | None = None
+    llm_budget: LLMBudget | None = None
     log_synthesis_payloads: bool = False
 
     debug: bool = False
@@ -63,6 +65,7 @@ class CoreSettings:
     session_summary_merge_prompt: str = ""
 
     def __post_init__(self) -> None:
+        self.llm_budget = LLMBudget.from_any(self.llm_budget)
         self.prompts_dir = self.prompts_dir.resolve()
         self.knowledge_base_dir = self.knowledge_base_dir.resolve()
         self.allowed_read_roots = [path.resolve() for path in self.allowed_read_roots]

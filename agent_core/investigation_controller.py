@@ -197,7 +197,7 @@ class InvestigationController:
                     options=options,
                     iterations_used=0,
                     tool_calls_used=0,
-                    stop_reason="provider_failure",
+                    stop_reason="llm_budget_exhausted" if exc.kind == "budget_exhausted" else "provider_failure",
                     state=state,
                 )
             except ValueError as exc:
@@ -334,7 +334,7 @@ class InvestigationController:
                     options=options,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_calls_used,
-                    stop_reason="provider_failure",
+                    stop_reason="llm_budget_exhausted" if exc.kind == "budget_exhausted" else "provider_failure",
                     state=state,
                 )
 
@@ -487,6 +487,23 @@ class InvestigationController:
         previous_fingerprint = state.progress_fingerprint()
         try:
             reflection = self._synthesize_reflection(state=state, tool_step=tool_step, options=options)
+        except LLMProviderError as exc:
+            if exc.kind != "budget_exhausted":
+                raise
+            state.risk_notes.append("The latest tool results could not be synthesized because the LLM budget was exhausted.")
+            return (
+                self._complete_with_budget_answer(
+                    user_input=user_input,
+                    turn_index=turn_index,
+                    options=options,
+                    state=state,
+                    messages=messages,
+                    iterations_used=iterations_used,
+                    tool_calls_used=tool_step.tool_calls_used,
+                    stop_reason="llm_budget_exhausted",
+                ),
+                no_progress_iterations,
+            )
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
                 raise
@@ -527,6 +544,22 @@ class InvestigationController:
                 options=options,
                 iterations_used=iterations_used,
                 tool_calls_used=tool_step.tool_calls_used,
+            )
+        except LLMProviderError as exc:
+            if exc.kind != "budget_exhausted":
+                raise
+            return (
+                self._complete_with_budget_answer(
+                    user_input=user_input,
+                    turn_index=turn_index,
+                    options=options,
+                    state=state,
+                    messages=messages,
+                    iterations_used=iterations_used,
+                    tool_calls_used=tool_step.tool_calls_used,
+                    stop_reason="llm_budget_exhausted",
+                ),
+                no_progress_iterations,
             )
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
@@ -697,6 +730,20 @@ class InvestigationController:
         )
         try:
             critique = self._synthesize_final_critique(state=state, final_draft=final_draft, options=options)
+        except LLMProviderError as exc:
+            if exc.kind != "budget_exhausted":
+                raise
+            return self._complete_turn(
+                user_input=user_input,
+                turn_index=turn_index,
+                options=options,
+                state=state,
+                content=final_draft,
+                messages=messages,
+                iterations_used=iterations_used,
+                tool_calls_used=tool_calls_used,
+                stop_reason="llm_budget_exhausted",
+            )
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
                 raise

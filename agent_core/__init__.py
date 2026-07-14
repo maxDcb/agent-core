@@ -6,6 +6,7 @@ adapters live in :mod:`agent_core.conversation`, and telemetry helpers live in
 """
 
 from agent_core.execution_context import ExecutionContext
+from agent_core.llm_budget import LLMBudget, LLMBudgetExceededError, LLMBudgetUsage
 from agent_core.output_contracts import (
     JSON_SCHEMA_DRAFT,
     FinalOutputMode,
@@ -43,6 +44,9 @@ __all__ = [
     "ExecutionScope",
     "FinalOutputMode",
     "JSON_SCHEMA_DRAFT",
+    "LLMBudget",
+    "LLMBudgetExceededError",
+    "LLMBudgetUsage",
     "JsonFileRunStore",
     "RunContext",
     "RunCheckpoint",

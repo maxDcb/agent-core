@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 ProviderErrorKind = Literal[
+    "budget_exhausted",
     "configuration_error",
     "request_error",
     "response_error",

@@ -50,6 +50,16 @@ aggregate usage summary. Exact totals are `null` whenever any call lacks
 provider usage; partial reported totals remain available separately. Cached
 input and reasoning-token details are retained when the provider exposes them.
 
+When configured, one `LLMBudget` controller spans every LLM call in the run,
+including internal synthesis and post-turn memory calls. It accounts before a
+request, reconciles estimates with provider usage after the response, and
+persists its usage in pending conversation payloads or structured checkpoints.
+`observe` mode reports violations without altering execution; `enforce` mode
+rejects the next request before provider invocation. A resumed run restores the
+previous counters instead of receiving a fresh budget. The duration counter is
+the cumulative time spent in provider calls and is enforced between calls; it
+does not interrupt a request already in flight.
+
 A tool call persisted as completed is never replayed. A tool call left in
 `running` is considered ambiguous because its external effect may have happened
 before the process stopped. Recovery becomes `blocked` until the host reconciles

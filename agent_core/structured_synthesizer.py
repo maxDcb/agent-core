@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from inspect import Parameter, signature
 from typing import Any, Generic, TypeVar
 
-from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMMessage, completion_content
+from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage, completion_content
+from agent_core.llm_budget import run_budgeted_llm_call
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.settings import CoreSettings
 
@@ -72,7 +73,7 @@ class StructuredSynthesizer:
             )
 
         options = request.options or LLMCallOptions(response_format={"type": "json_object"})
-        raw_content = self._complete_text(messages=messages, options=options)
+        raw_content = self._complete_text(messages=messages, options=options, purpose=request.target_name)
 
         if self.settings.log_synthesis_payloads:
             logger.info(
@@ -90,19 +91,35 @@ class StructuredSynthesizer:
             raise ValueError(f"{request.target_name} synthesis returned an invalid structured payload")
         return parsed
 
-    def _complete_text(self, *, messages: list[LLMMessage], options: LLMCallOptions | None) -> str:
-        if options is not None and self._provider_accepts_options("complete_text"):
-            return completion_content(self.provider.complete_text(
+    def _complete_text(
+        self,
+        *,
+        messages: list[LLMMessage],
+        options: LLMCallOptions | None,
+        purpose: str,
+    ) -> str:
+        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+            if effective_options is not None and self._provider_accepts_options("complete_text"):
+                return self.provider.complete_text(
+                    messages=messages,
+                    model=self.settings.memory_model,
+                    temperature=self.settings.memory_temperature,
+                    options=effective_options,
+                )
+            return self.provider.complete_text(
                 messages=messages,
                 model=self.settings.memory_model,
                 temperature=self.settings.memory_temperature,
+            )
+
+        return completion_content(
+            run_budgeted_llm_call(
+                messages=messages,
+                purpose=purpose,
                 options=options,
-            ))
-        return completion_content(self.provider.complete_text(
-            messages=messages,
-            model=self.settings.memory_model,
-            temperature=self.settings.memory_temperature,
-        ))
+                invoke=invoke,
+            )
+        )
 
     def _provider_accepts_options(self, method_name: str) -> bool:
         method = getattr(self.provider, method_name)

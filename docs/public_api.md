@@ -10,6 +10,10 @@ The package root contains the autonomous run lifecycle, execution context,
 structured task contracts, run stores, and their result models. Pipeline
 applications should start here.
 
+`LLMBudget`, `LLMBudgetUsage`, and `LLMBudgetExceededError` are part of this
+surface. They configure run-wide model limits and expose their enforcement
+state without making the internal controller a public extension point.
+
 ## Extension SPI: `agent_core.spi`
 
 The SPI contains contracts intended to be implemented or assembled by a host

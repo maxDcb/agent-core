@@ -5,6 +5,7 @@ from uuid import uuid4
 
 from agent_core.conversation_state import ConversationStateView
 from agent_core.llm.base import LLMCallRecord, capture_llm_calls
+from agent_core.llm_budget import LLMBudgetExceededError
 from agent_core.orchestrator import AgentOrchestrator
 from agent_core.run_context import RunContext
 from agent_core.run_models import (
@@ -227,7 +228,14 @@ class ConversationAgent:
             message="Conversation run failed.",
             detail=str(exc),
         )
-        result = AgentRunResult(run_id=state.run_id, status="failed", error=error, llm_calls=list(llm_calls))
+        budget_metadata = exc.budget_metadata if isinstance(exc, LLMBudgetExceededError) else {}
+        result = AgentRunResult(
+            run_id=state.run_id,
+            status="failed",
+            error=error,
+            llm_calls=list(llm_calls),
+            metadata=budget_metadata,
+        )
         state.error = error
         state.result = result
         attempt.finish("failed", failure_reason=error.message)
