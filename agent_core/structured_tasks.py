@@ -7,6 +7,13 @@ from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any, Literal
 
+from agent_core.context_planner import (
+    LLMContextPlanner,
+    LLMContextPolicy,
+    LLMContextUsage,
+    active_llm_context_planner,
+    llm_context_scope,
+)
 from agent_core.execution_context import ExecutionContext
 from agent_core.llm.base import (
     BaseLLMProvider,
@@ -18,6 +25,14 @@ from agent_core.llm.base import (
     LLMUsageSummary,
 )
 from agent_core.llm.errors import LLMProviderError
+from agent_core.llm_budget import (
+    LLMBudget,
+    LLMBudgetController,
+    LLMBudgetUsage,
+    active_llm_budget_controller,
+    llm_budget_scope,
+    run_budgeted_llm_call,
+)
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.output_contracts import (
     StructuredOutputContract,
@@ -182,6 +197,8 @@ class StructuredTaskSpec:
     temperature: float | None = None
     max_tool_calls: int = 8
     max_iterations: int = 6
+    llm_budget: LLMBudget | None = None
+    llm_context_policy: LLMContextPolicy | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -193,6 +210,8 @@ class StructuredTaskSpec:
         self.constraints = _clean_string_list(self.constraints)
         self.allowed_tools = _clean_string_list(self.allowed_tools)
         self.output_contract = StructuredOutputContract.from_any(self.output_contract)
+        self.llm_budget = LLMBudget.from_any(self.llm_budget)
+        self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
         if not isinstance(self.metadata, dict):
             self.metadata = {}
         self.model = _clean_string(self.model) or None
@@ -235,6 +254,10 @@ class StructuredTaskSpec:
             "max_iterations": self.max_iterations,
             "metadata": self.metadata,
         }
+        if self.llm_budget is not None:
+            payload["llm_budget"] = self.llm_budget.to_dict()
+        if self.llm_context_policy is not None:
+            payload["llm_context_policy"] = self.llm_context_policy.to_dict()
         serialized = json.dumps(
             payload,
             ensure_ascii=False,
@@ -333,10 +356,14 @@ class StructuredTaskCheckpoint:
     raw_failure_content: str = ""
     result_kind: StructuredResultKind | None = None
     sequence: int = 0
+    llm_budget: LLMBudget | None = None
+    llm_budget_usage: LLMBudgetUsage = field(default_factory=LLMBudgetUsage)
+    llm_context_policy: LLMContextPolicy | None = None
+    llm_context_usage: LLMContextUsage = field(default_factory=LLMContextUsage)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 2,
+            "schema_version": 4,
             "spec_fingerprint": self.spec_fingerprint,
             "phase": self.phase,
             "messages": [message.to_history_dict() for message in self.messages],
@@ -351,11 +378,17 @@ class StructuredTaskCheckpoint:
             "raw_failure_content": self.raw_failure_content,
             "result_kind": self.result_kind,
             "sequence": self.sequence,
+            "llm_budget": self.llm_budget.to_dict() if self.llm_budget is not None else None,
+            "llm_budget_usage": self.llm_budget_usage.to_dict(),
+            "llm_context_policy": (
+                self.llm_context_policy.to_dict() if self.llm_context_policy is not None else None
+            ),
+            "llm_context_usage": self.llm_context_usage.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: object) -> StructuredTaskCheckpoint | None:
-        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2}:
+        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2, 3, 4}:
             return None
         spec_fingerprint = payload.get("spec_fingerprint")
         phase = payload.get("phase")
@@ -405,6 +438,10 @@ class StructuredTaskCheckpoint:
             raw_failure_content=str(payload.get("raw_failure_content") or ""),
             result_kind=normalized_result_kind,
             sequence=_clean_positive_int(payload.get("sequence"), default=0),
+            llm_budget=LLMBudget.from_any(payload.get("llm_budget")),
+            llm_budget_usage=LLMBudgetUsage.from_any(payload.get("llm_budget_usage")),
+            llm_context_policy=LLMContextPolicy.from_any(payload.get("llm_context_policy")),
+            llm_context_usage=LLMContextUsage.from_any(payload.get("llm_context_usage")),
         )
 
 
@@ -438,19 +475,28 @@ class StructuredTaskRunner:
         context: ExecutionContext,
         on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None = None,
     ) -> StructuredTaskResult:
+        budget = spec.llm_budget or self.settings.llm_budget
+        context_policy = spec.llm_context_policy or self.settings.llm_context_policy
         checkpoint = StructuredTaskCheckpoint(
             spec_fingerprint=spec.fingerprint(),
             phase="model_request",
             messages=self._build_messages(spec=spec, context=context),
             iterations=1,
+            llm_budget=budget,
+            llm_context_policy=context_policy,
         )
-        self._emit_checkpoint(checkpoint, on_checkpoint)
-        return self._continue_from_checkpoint(
-            spec=spec,
-            context=context,
-            checkpoint=checkpoint,
-            on_checkpoint=on_checkpoint,
-        )
+        controller = LLMBudgetController(budget) if budget is not None else None
+        context_planner = LLMContextPlanner(context_policy) if context_policy is not None else None
+        with llm_context_scope(context_planner):
+            with llm_budget_scope(controller):
+                self._emit_checkpoint(checkpoint, on_checkpoint)
+                result = self._continue_from_checkpoint(
+                    spec=spec,
+                    context=context,
+                    checkpoint=checkpoint,
+                    on_checkpoint=on_checkpoint,
+                )
+                return self._attach_runtime_metadata(result)
 
     def resume(
         self,
@@ -466,12 +512,31 @@ class StructuredTaskRunner:
                 message="The structured task specification does not match the persisted run checkpoint.",
             )
         self._validate_checkpoint_shape(checkpoint)
-        return self._continue_from_checkpoint(
-            spec=spec,
-            context=context,
-            checkpoint=checkpoint,
-            on_checkpoint=on_checkpoint,
+        budget = checkpoint.llm_budget or spec.llm_budget or self.settings.llm_budget
+        context_policy = (
+            checkpoint.llm_context_policy
+            or spec.llm_context_policy
+            or self.settings.llm_context_policy
         )
+        controller = (
+            LLMBudgetController(budget, usage=checkpoint.llm_budget_usage)
+            if budget is not None
+            else None
+        )
+        context_planner = (
+            LLMContextPlanner(context_policy, usage=checkpoint.llm_context_usage)
+            if context_policy is not None
+            else None
+        )
+        with llm_context_scope(context_planner):
+            with llm_budget_scope(controller):
+                result = self._continue_from_checkpoint(
+                    spec=spec,
+                    context=context,
+                    checkpoint=checkpoint,
+                    on_checkpoint=on_checkpoint,
+                )
+                return self._attach_runtime_metadata(result)
 
     @staticmethod
     def _validate_checkpoint_shape(checkpoint: StructuredTaskCheckpoint) -> None:
@@ -568,6 +633,7 @@ class StructuredTaskRunner:
                     messages=checkpoint.messages,
                     registry=registry,
                     final_output=not registry.list_tool_names(),
+                    on_budget_reserved=lambda: self._emit_checkpoint(checkpoint, on_checkpoint),
                 )
             except LLMProviderError as exc:
                 logger.error(
@@ -698,6 +764,7 @@ class StructuredTaskRunner:
                 spec=spec,
                 messages=checkpoint.messages,
                 failure_reason=checkpoint.finalization_reason or "Structured task execution was interrupted.",
+                on_budget_reserved=lambda: self._emit_checkpoint(checkpoint, on_checkpoint),
             )
         except LLMProviderError as exc:
             if checkpoint.finalization_kind == "contract":
@@ -824,10 +891,28 @@ class StructuredTaskRunner:
         return finalized
 
     @staticmethod
+    def _attach_runtime_metadata(result: StructuredTaskResult) -> StructuredTaskResult:
+        controller = active_llm_budget_controller()
+        if controller is not None:
+            result.metadata = {**result.metadata, **controller.to_metadata()}
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            result.metadata = {**result.metadata, **context_planner.to_metadata()}
+        return result
+
+    @staticmethod
     def _emit_checkpoint(
         checkpoint: StructuredTaskCheckpoint,
         on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
     ) -> None:
+        controller = active_llm_budget_controller()
+        if controller is not None:
+            checkpoint.llm_budget = controller.budget
+            checkpoint.llm_budget_usage = LLMBudgetUsage.from_any(controller.usage)
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            checkpoint.llm_context_policy = context_planner.policy
+            checkpoint.llm_context_usage = LLMContextUsage.from_any(context_planner.usage)
         checkpoint.sequence += 1
         if on_checkpoint is not None:
             on_checkpoint(checkpoint)
@@ -873,6 +958,7 @@ class StructuredTaskRunner:
         messages: list[LLMMessage],
         registry: ToolRegistry,
         final_output: bool = False,
+        on_budget_reserved: Callable[[], None] | None = None,
     ) -> LLMCompletionResult:
         options = LLMCallOptions(
             response_format=_response_format_for_spec(spec, final_output=final_output),
@@ -884,29 +970,48 @@ class StructuredTaskRunner:
                 **spec.metadata,
             },
         )
+        tool_specs = registry.get_tool_specs()
         kwargs: dict[str, Any] = {
             "messages": messages,
-            "tools": registry.get_tool_specs(),
+            "tools": tool_specs,
             "model": spec.model or self.settings.model,
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
-        logger.info(
-            "Structured task LLM request prepared",
-            extra={
-                "task_id": spec.task_id,
-                "model": kwargs["model"],
-                "final_output": final_output,
-                "tool_count": len(kwargs["tools"]),
-                "response_format_type": _response_format_type(options.response_format),
-                "response_format_chars": _jsonish_char_count(options.response_format),
-                "response_format_fallback_type": _response_format_type(options.response_format_fallback),
-                "max_output_tokens": options.max_output_tokens,
-                **_message_content_stats(messages),
-            },
+
+        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+            logger.info(
+                "Structured task LLM request prepared",
+                extra={
+                    "task_id": spec.task_id,
+                    "model": kwargs["model"],
+                    "final_output": final_output,
+                    "tool_count": len(tool_specs),
+                    "response_format_type": _response_format_type(
+                        effective_options.response_format if effective_options is not None else None
+                    ),
+                    "response_format_chars": _jsonish_char_count(
+                        effective_options.response_format if effective_options is not None else None
+                    ),
+                    "response_format_fallback_type": _response_format_type(
+                        effective_options.response_format_fallback if effective_options is not None else None
+                    ),
+                    "max_output_tokens": effective_options.max_output_tokens if effective_options is not None else None,
+                    **_message_content_stats(messages),
+                },
+            )
+            effective_kwargs = dict(kwargs)
+            if effective_options is not None and self._provider_accepts_options("complete_with_tools"):
+                effective_kwargs["options"] = effective_options
+            return self.provider.complete_with_tools(**effective_kwargs)
+
+        return run_budgeted_llm_call(
+            messages=messages,
+            tools=tool_specs,
+            purpose="structured_direct" if final_output else "structured_tool_loop",
+            options=options,
+            invoke=invoke,
+            on_reserved=on_budget_reserved,
         )
-        if self._provider_accepts_options("complete_with_tools"):
-            kwargs["options"] = options
-        return self.provider.complete_with_tools(**kwargs)
 
     def _call_model_for_final_output(
         self,
@@ -914,6 +1019,7 @@ class StructuredTaskRunner:
         spec: StructuredTaskSpec,
         messages: list[LLMMessage],
         failure_reason: str,
+        on_budget_reserved: Callable[[], None] | None = None,
     ) -> LLMCompletionResult:
         options = LLMCallOptions(
             response_format=_response_format_for_spec(spec, final_output=True),
@@ -952,22 +1058,39 @@ class StructuredTaskRunner:
             "model": spec.model or self.settings.model,
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
-        logger.info(
-            "Structured task finalization LLM request prepared",
-            extra={
-                "task_id": spec.task_id,
-                "model": kwargs["model"],
-                "failure_reason": failure_reason,
-                "response_format_type": _response_format_type(options.response_format),
-                "response_format_chars": _jsonish_char_count(options.response_format),
-                "response_format_fallback_type": _response_format_type(options.response_format_fallback),
-                "max_output_tokens": options.max_output_tokens,
-                **_message_content_stats(final_messages),
-            },
+        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+            logger.info(
+                "Structured task finalization LLM request prepared",
+                extra={
+                    "task_id": spec.task_id,
+                    "model": kwargs["model"],
+                    "failure_reason": failure_reason,
+                    "response_format_type": _response_format_type(
+                        effective_options.response_format if effective_options is not None else None
+                    ),
+                    "response_format_chars": _jsonish_char_count(
+                        effective_options.response_format if effective_options is not None else None
+                    ),
+                    "response_format_fallback_type": _response_format_type(
+                        effective_options.response_format_fallback if effective_options is not None else None
+                    ),
+                    "max_output_tokens": effective_options.max_output_tokens if effective_options is not None else None,
+                    **_message_content_stats(final_messages),
+                },
+            )
+            effective_kwargs = dict(kwargs)
+            if effective_options is not None and self._provider_accepts_options("complete_with_tools"):
+                effective_kwargs["options"] = effective_options
+            return self.provider.complete_with_tools(**effective_kwargs)
+
+        return run_budgeted_llm_call(
+            messages=final_messages,
+            tools=[],
+            purpose="structured_finalization",
+            options=options,
+            invoke=invoke,
+            on_reserved=on_budget_reserved,
         )
-        if self._provider_accepts_options("complete_with_tools"):
-            kwargs["options"] = options
-        return self.provider.complete_with_tools(**kwargs)
 
     def _build_messages(
         self,

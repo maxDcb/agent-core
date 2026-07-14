@@ -7,6 +7,13 @@ from inspect import Parameter, signature
 from typing import Any
 from uuid import uuid4
 
+from agent_core.context_planner import (
+    LLMContextPlanner,
+    LLMContextPolicy,
+    LLMContextUsage,
+    active_llm_context_planner,
+    llm_context_scope,
+)
 from agent_core.conversation_state import build_conversation_state_view
 from agent_core.domain_hooks import DomainHooks
 from agent_core.execution_context import (
@@ -20,6 +27,14 @@ from agent_core.investigation_prompts import DEFAULT_INVESTIGATION_PROMPTS, Inve
 from agent_core.investigation_state import InvestigationState
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage
 from agent_core.llm.errors import LLMProviderError
+from agent_core.llm_budget import (
+    LLMBudget,
+    LLMBudgetController,
+    LLMBudgetUsage,
+    active_llm_budget_controller,
+    llm_budget_scope,
+    run_budgeted_llm_call,
+)
 from agent_core.logging_utils import get_logger, safe_preview
 from agent_core.memory.context_block import ContextBlock, estimate_token_count
 from agent_core.memory.session_summary import SessionSummary
@@ -178,6 +193,12 @@ class AgentOrchestrator:
         result: AgentTurnResult,
         expose_trace_id: bool,
     ) -> AgentTurnResult:
+        budget_controller = active_llm_budget_controller()
+        if budget_controller is not None:
+            result.metadata = {**result.metadata, **budget_controller.to_metadata()}
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            result.metadata = {**result.metadata, **context_planner.to_metadata()}
         if expose_trace_id:
             result.metadata = {**result.metadata, "run_trace_id": trace.run_id}
         event_type = "run_completed" if result.status == "completed" else "run_pending"
@@ -524,7 +545,16 @@ class AgentOrchestrator:
             assistant_content=error.user_message,
         )
         self._refresh_memory_after_turn(turn_index=turn_index)
-        return AgentTurnResult(status="completed", content=error.user_message)
+        stop_reasons = {
+            "budget_exhausted": "llm_budget_exhausted",
+            "context_overflow": "llm_context_overflow",
+        }
+        stop_reason = stop_reasons.get(error.kind, "provider_failure")
+        return AgentTurnResult(
+            status="completed",
+            content=error.user_message,
+            metadata={"stop_reason": stop_reason, "provider_error_kind": error.kind},
+        )
 
     def _build_pending_id(
         self,
@@ -575,6 +605,12 @@ class AgentOrchestrator:
         }
         if pending_metadata_extra:
             payload.update(pending_metadata_extra)
+        budget_controller = active_llm_budget_controller()
+        if budget_controller is not None:
+            payload.update(budget_controller.to_metadata())
+        context_planner = active_llm_context_planner()
+        if context_planner is not None:
+            payload.update(context_planner.to_metadata())
         self.session_manager.set_meta_value(self.PENDING_TURN_META_KEY, payload)
 
     def run_turn(self, *, user_input: str, thread_id: str, context: RunContext) -> str:
@@ -600,14 +636,21 @@ class AgentOrchestrator:
                 correlation=bound_context.correlation,
                 application_context=bound_context.application_context,
             )
+        run_options = options or RunOptions.direct()
+        budget = run_options.llm_budget or self.settings.llm_budget
+        budget_controller = LLMBudgetController(budget) if budget is not None else None
+        context_policy = run_options.llm_context_policy or self.settings.llm_context_policy
+        context_planner = LLMContextPlanner(context_policy) if context_policy is not None else None
         token = self._run_context_var.set(bound_context)
         try:
-            with self.session_manager.session_scope(thread_id):
-                return self._run_turn_result_active(
-                    user_input=user_input,
-                    context=bound_context,
-                    options=options,
-                )
+            with llm_context_scope(context_planner):
+                with llm_budget_scope(budget_controller):
+                    with self.session_manager.session_scope(thread_id):
+                        return self._run_turn_result_active(
+                            user_input=user_input,
+                            context=bound_context,
+                            options=options,
+                        )
         finally:
             self._run_context_var.reset(token)
 
@@ -685,7 +728,7 @@ class AgentOrchestrator:
                     "mode": run_options.mode,
                     "iterations_used": 1,
                     "tool_calls_used": self._tool_history_delta(start_count=tool_history_start_count),
-                    "stop_reason": result.status,
+                    "stop_reason": result.metadata.get("stop_reason", result.status),
                 }
             return self._finalize_run_trace_result(
                 trace=trace,
@@ -725,14 +768,43 @@ class AgentOrchestrator:
                     pending_run_id if isinstance(pending_run_id, str) else (context.run_id or f"run-{uuid4().hex}")
                 )
                 self._run_context_var.set(bound_context)
-                result = self._resume_turn_active(
-                    pending_id=pending_id,
-                    tool_content=tool_content,
-                    ok=ok,
-                    context=bound_context,
+                budget = LLMBudget.from_any(pending.get("llm_budget")) or self.settings.llm_budget
+                budget_controller = (
+                    LLMBudgetController(
+                        budget,
+                        usage=LLMBudgetUsage.from_any(pending.get("llm_budget_usage")),
+                    )
+                    if budget is not None
+                    else None
                 )
-                self._store_completed_pending_result(pending_id=pending_id, result=result)
-                return result
+                context_policy = (
+                    LLMContextPolicy.from_any(pending.get("llm_context_policy"))
+                    or self.settings.llm_context_policy
+                )
+                context_planner = (
+                    LLMContextPlanner(
+                        context_policy,
+                        usage=LLMContextUsage.from_any(pending.get("llm_context_usage")),
+                    )
+                    if context_policy is not None
+                    else None
+                )
+                with llm_context_scope(context_planner):
+                    with llm_budget_scope(budget_controller):
+                        result = self._resume_turn_active(
+                            pending_id=pending_id,
+                            tool_content=tool_content,
+                            ok=ok,
+                            context=bound_context,
+                        )
+                        active_controller = active_llm_budget_controller()
+                        if active_controller is not None:
+                            result.metadata = {**result.metadata, **active_controller.to_metadata()}
+                        active_planner = active_llm_context_planner()
+                        if active_planner is not None:
+                            result.metadata = {**result.metadata, **active_planner.to_metadata()}
+                        self._store_completed_pending_result(pending_id=pending_id, result=result)
+                        return result
         finally:
             self._run_context_var.reset(token)
 
@@ -915,19 +987,35 @@ class AgentOrchestrator:
         messages: list[LLMMessage],
         options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
-        if options is not None and self._provider_accepts_options("complete_with_tools"):
+        tool_specs = self.registry.get_tool_specs()
+        purpose = (
+            str(options.metadata.get("target"))
+            if options is not None and options.metadata.get("target")
+            else "conversation_tool_loop"
+        )
+
+        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+            if effective_options is not None and self._provider_accepts_options("complete_with_tools"):
+                return self.provider.complete_with_tools(
+                    messages=messages,
+                    tools=tool_specs,
+                    model=self.settings.model,
+                    temperature=self.settings.temperature,
+                    options=effective_options,
+                )
             return self.provider.complete_with_tools(
                 messages=messages,
-                tools=self.registry.get_tool_specs(),
+                tools=tool_specs,
                 model=self.settings.model,
                 temperature=self.settings.temperature,
-                options=options,
             )
-        return self.provider.complete_with_tools(
+
+        return run_budgeted_llm_call(
             messages=messages,
-            tools=self.registry.get_tool_specs(),
-            model=self.settings.model,
-            temperature=self.settings.temperature,
+            tools=tool_specs,
+            purpose=purpose,
+            options=options,
+            invoke=invoke,
         )
 
     def _call_final_model_once(
@@ -936,15 +1024,30 @@ class AgentOrchestrator:
         messages: list[LLMMessage],
         options: LLMCallOptions | None = None,
     ) -> LLMCompletionResult:
-        kwargs: dict[str, Any] = {
-            "messages": messages,
-            "tools": [],
-            "model": self.settings.model,
-            "temperature": self.settings.temperature,
-        }
-        if options is not None and self._provider_accepts_options("complete_with_tools"):
-            kwargs["options"] = options
-        return self.provider.complete_with_tools(**kwargs)
+        purpose = (
+            str(options.metadata.get("target"))
+            if options is not None and options.metadata.get("target")
+            else "conversation_finalization"
+        )
+
+        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+            kwargs: dict[str, Any] = {
+                "messages": messages,
+                "tools": [],
+                "model": self.settings.model,
+                "temperature": self.settings.temperature,
+            }
+            if effective_options is not None and self._provider_accepts_options("complete_with_tools"):
+                kwargs["options"] = effective_options
+            return self.provider.complete_with_tools(**kwargs)
+
+        return run_budgeted_llm_call(
+            messages=messages,
+            tools=[],
+            purpose=purpose,
+            options=options,
+            invoke=invoke,
+        )
 
     def _execute_tool_calls_once(
         self,

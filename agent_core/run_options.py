@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, TypeAlias
 
+from agent_core.context_planner import LLMContextPolicy
+from agent_core.llm_budget import LLMBudget
 from agent_core.output_contracts import FinalOutputMode, StructuredOutputContract
 
 AgentRunMode: TypeAlias = Literal["direct", "investigate", "deep_investigate"]
@@ -22,6 +24,8 @@ class RunOptions:
     min_confidence_to_answer: float = 0.70
     reasoning_effort: str | None = None
     reasoning_summary: str | None = None
+    llm_budget: LLMBudget | None = None
+    llm_context_policy: LLMContextPolicy | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -38,6 +42,8 @@ class RunOptions:
         if not 0.0 <= self.min_confidence_to_answer <= 1.0:
             raise ValueError("min_confidence_to_answer must be between 0.0 and 1.0")
         self.metadata = dict(self.metadata)
+        self.llm_budget = LLMBudget.from_any(self.llm_budget)
+        self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
         self.final_output_contract = StructuredOutputContract.from_any(self.final_output_contract)
         if self.mode == "direct" and self.final_output_mode != "text":
             raise ValueError("json_schema final output requires investigate or deep_investigate mode")

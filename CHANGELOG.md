@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- Added optional run-level `LLMBudget` enforcement and observation across
+  conversation, investigation, structured-task, finalization and memory calls.
+- Persisted LLM budget usage in pending conversation state and structured-task
+  checkpoint schema version 3 so resumed runs retain prior consumption.
+- Added budget metadata with accounted and provider-reported token usage,
+  elapsed time, violations and the exhausted dimension.
+- Added an optional provider-window context planner covering messages, tools,
+  response schemas, output reservation and tokenizer safety margin.
+- Preserved system prompts and complete current tool turns while compacting
+  only atomic historical groups, with observe/enforce modes and overflow errors.
+- Persisted context-planning telemetry in pending turns and structured-task
+  checkpoint schema version 4 so resumed runs retain planner state.
+
 ## 0.4.0
 
 - Added exact provider token usage, per-call LLM telemetry, retry counts, cache
