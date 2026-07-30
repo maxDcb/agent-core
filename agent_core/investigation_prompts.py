@@ -10,6 +10,12 @@ INVESTIGATION_DECISION_PROMPT = """You are choosing the next generic investigati
 
 FINAL_CRITIQUE_PROMPT = """You are critiquing a final draft against a generic investigation state. Do not output chain-of-thought. Return JSON only. Identify unsupported claims, missing evidence, scope or safety issues, and follow-up actions. Do not invent new facts."""
 
+FINAL_RESPONSE_PROMPT = """Write the user-visible final response for this investigation. Do not output chain-of-thought or describe the controller's internal process.
+
+Use the original request, the candidate answer, and the auditable investigation state in the supplied payload. Answer directly in the user's language and follow the requested format and level of detail. Preserve material uncertainty, scope limits, blocked actions, and required follow-up without inventing facts. Treat the candidate answer as a draft, not as evidence.
+
+Return natural conversational text or Markdown only. Do not return the controller state, a serialized JSON document, generic investigation headings, or raw internal fields. Do not request or call tools."""
+
 RUN_GUIDANCE_PROMPT = (
     "Run mode: {mode}. Work within the bounded investigation loop. "
     "Use tools only when useful and in scope. Do not expose chain-of-thought; "
@@ -25,6 +31,7 @@ class InvestigationPromptSet:
     step_reflection: str
     decision: str
     final_critique: str
+    final_response: str
     run_guidance: str
 
     def append_domain_guidance(self, guidance: str) -> InvestigationPromptSet:
@@ -37,6 +44,7 @@ class InvestigationPromptSet:
             step_reflection=_append_guidance(self.step_reflection, appendix),
             decision=_append_guidance(self.decision, appendix),
             final_critique=_append_guidance(self.final_critique, appendix),
+            final_response=_append_guidance(self.final_response, appendix),
             run_guidance=_append_guidance(self.run_guidance, appendix),
         )
 
@@ -53,5 +61,6 @@ DEFAULT_INVESTIGATION_PROMPTS = InvestigationPromptSet(
     step_reflection=STEP_REFLECTION_PROMPT,
     decision=INVESTIGATION_DECISION_PROMPT,
     final_critique=FINAL_CRITIQUE_PROMPT,
+    final_response=FINAL_RESPONSE_PROMPT,
     run_guidance=RUN_GUIDANCE_PROMPT,
 )

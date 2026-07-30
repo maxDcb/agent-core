@@ -84,12 +84,14 @@ class ScriptedProvider:
         reflections: list[dict[str, Any]] | None = None,
         decisions: list[dict[str, Any]] | None = None,
         critiques: list[dict[str, Any]] | None = None,
+        finals: list[LLMCompletionResult | Exception] | None = None,
     ) -> None:
         self.chat = list(chat)
         self.plans = list(plans or [])
         self.reflections = list(reflections or [])
         self.decisions = list(decisions or [])
         self.critiques = list(critiques or [])
+        self.finals = list(finals or [])
         self.tool_options = []
         self.chat_tools = []
         self.text_options = []
@@ -100,6 +102,22 @@ class ScriptedProvider:
         self.tool_options.append(options)
         self.chat_tools.append(list(tools))
         self.chat_messages.append(list(messages))
+        target = (options.metadata or {}).get("target") if options is not None else None
+        if target == "investigation_final_response":
+            if self.finals:
+                scripted = self.finals.pop(0)
+                if isinstance(scripted, Exception):
+                    raise scripted
+                return scripted
+            payload = json.loads(messages[-1].content)
+            candidate = payload.get("candidate_answer")
+            if candidate:
+                return LLMCompletionResult(content=candidate)
+            state = payload["investigation_state"]
+            facts = [item["summary"] for item in state.get("facts", [])]
+            gaps = list(state.get("evidence_gaps", []))
+            rendered = "\n".join([*facts, *gaps]).strip() or "No conclusive result was established."
+            return LLMCompletionResult(content=rendered)
         if not self.chat:
             raise AssertionError("No scripted chat response left")
         return self.chat.pop(0)
@@ -283,7 +301,10 @@ def test_prompt_sanitizer_drops_legacy_unanswered_tool_call_messages(tmp_path) -
 
 
 def test_investigation_no_tool_no_critique_returns_final(tmp_path) -> None:
-    provider = ScriptedProvider(chat=[LLMCompletionResult(content="plain final")])
+    provider = ScriptedProvider(
+        chat=[LLMCompletionResult(content='{"raw":"draft"}')],
+        finals=[LLMCompletionResult(content="Polished conversational answer.")],
+    )
     orchestrator = build_orchestrator(tmp_path, provider)
 
     result = run_turn(
@@ -292,10 +313,52 @@ def test_investigation_no_tool_no_critique_returns_final(tmp_path) -> None:
         options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
     )
 
-    assert result.content == "plain final"
+    assert result.content == "Polished conversational answer."
     assert result.metadata["mode"] == "investigate"
     assert result.metadata["iterations_used"] == 1
+    assert result.metadata["final_response_origin"] == "model"
+    assert provider.chat_tools[0]
+    assert provider.chat_tools[1] == []
+    assert (provider.tool_options[1].metadata or {})["target"] == "investigation_final_response"
+    final_payload = json.loads(provider.chat_messages[1][-1].content)
+    assert final_payload["original_user_request"] == "answer"
+    assert final_payload["candidate_answer"] == '{"raw":"draft"}'
     assert "reasoning" not in json.dumps(result.metadata)
+
+
+@pytest.mark.parametrize(
+    "invalid_final",
+    [
+        LLMCompletionResult(content='{"answer":"raw"}'),
+        LLMCompletionResult(content='```json\n{"answer":"raw"}\n```'),
+        LLMCompletionResult(content=""),
+        LLMCompletionResult(
+            content="",
+            tool_calls=[LLMToolCall(id="unexpected", name="echo", arguments_json='{"value":"x"}')],
+        ),
+        RuntimeError("provider unavailable"),
+    ],
+)
+def test_investigation_conversational_finalization_uses_state_renderer_only_as_fallback(
+    tmp_path,
+    invalid_final,
+) -> None:
+    provider = ScriptedProvider(
+        chat=[LLMCompletionResult(content="candidate answer")],
+        finals=[invalid_final],
+    )
+    orchestrator = build_orchestrator(tmp_path, provider)
+
+    result = run_turn(
+        orchestrator,
+        "answer",
+        options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
+    )
+
+    assert result.content.startswith("Investigation complete.")
+    assert "Established facts:" in result.content
+    assert result.metadata["final_response_origin"] == "fallback"
+    assert result.metadata["final_response_error_type"]
 
 
 def test_investigation_json_schema_final_output_uses_last_no_tool_turn(tmp_path) -> None:

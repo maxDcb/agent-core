@@ -33,6 +33,19 @@ def _llm_failure_stop_reason(error: LLMProviderError) -> str:
     return "provider_failure"
 
 
+def _is_raw_json_document(content: str) -> bool:
+    candidate = content.strip()
+    if candidate.startswith("```") and candidate.endswith("```"):
+        lines = candidate.splitlines()
+        if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"}:
+            candidate = "\n".join(lines[1:-1]).strip()
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, (dict, list))
+
+
 class ModelCaller(Protocol):
     def __call__(
         self,
@@ -671,11 +684,12 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
-                    content=self._answer_from_state(state=state, final=not reflection.should_continue),
+                    content="",
                     messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason=reflection.stop_reason or "decision_synthesis_unavailable",
+                    fallback_complete=not reflection.should_continue,
                 ),
                 no_progress_iterations,
             )
@@ -699,6 +713,7 @@ class InvestigationController:
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="ask_user",
+                    fallback_complete=False,
                 ),
                 no_progress_iterations,
             )
@@ -715,6 +730,7 @@ class InvestigationController:
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="blocked",
+                    fallback_complete=False,
                 ),
                 no_progress_iterations,
             )
@@ -738,11 +754,12 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
-                    content=self._answer_from_state(state=state, final=True),
+                    content="",
                     messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason=decision.reason_summary or reflection.stop_reason or "final",
+                    fallback_complete=True,
                 ),
                 no_progress_iterations,
             )
@@ -806,6 +823,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final",
+                fallback_complete=True,
             )
 
         self._record_event(
@@ -829,6 +847,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason=_llm_failure_stop_reason(exc),
+                fallback_complete=True,
             )
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
@@ -856,6 +875,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final_critique_unavailable",
+                fallback_complete=True,
             )
         self._record_event(
             event_type="final_critique_completed",
@@ -874,6 +894,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final_critique_approved",
+                fallback_complete=True,
             )
 
         state.apply_critique(critique)
@@ -919,9 +940,9 @@ class InvestigationController:
         iterations_used: int,
         tool_calls_used: int,
         stop_reason: str,
+        fallback_complete: bool,
     ) -> AgentTurnResult:
         state.stop_reason = stop_reason
-        final_content = content
         final_metadata: dict[str, Any] = {}
         if options.final_output_mode == "json_schema":
             final_content, final_metadata = self._render_final_json_schema(
@@ -930,6 +951,16 @@ class InvestigationController:
                 options=options,
                 state=state,
                 stop_reason=stop_reason,
+            )
+        else:
+            final_content, final_metadata = self._render_final_text_with_fallback(
+                user_input=user_input,
+                content=content,
+                messages=messages,
+                options=options,
+                state=state,
+                stop_reason=stop_reason,
+                fallback_complete=fallback_complete,
             )
         self._record_event(
             event_type="investigation_completed",
@@ -964,6 +995,119 @@ class InvestigationController:
                 **final_metadata,
             },
         )
+
+    def _render_final_text_with_fallback(
+        self,
+        *,
+        user_input: str,
+        content: str,
+        messages: list[LLMMessage],
+        options: RunOptions,
+        state: InvestigationState,
+        stop_reason: str,
+        fallback_complete: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        self._record_event(
+            event_type="final_response_started",
+            summary="Conversational final response generation started",
+            payload={
+                "candidate_length": len(content),
+                "completion_status": "complete" if fallback_complete else "incomplete",
+            },
+        )
+        try:
+            final_content = self._render_final_text(
+                user_input=user_input,
+                content=content,
+                messages=messages,
+                options=options,
+                state=state,
+                stop_reason=stop_reason,
+                fallback_complete=fallback_complete,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Conversational final response generation failed; using deterministic fallback",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "error_preview": safe_preview(str(exc), limit=200),
+                },
+            )
+            self._record_event(
+                event_type="final_response_fallback",
+                summary="Conversational final response generation failed; deterministic fallback used",
+                payload={
+                    "error_type": type(exc).__name__,
+                    "error_preview": safe_preview(str(exc), limit=200),
+                },
+            )
+            return self._answer_from_state(state=state, final=fallback_complete), {
+                "final_response_origin": "fallback",
+                "final_response_error_type": type(exc).__name__,
+            }
+
+        self._record_event(
+            event_type="final_response_completed",
+            summary="Conversational final response generation completed",
+            payload={"content_length": len(final_content)},
+        )
+        return final_content, {"final_response_origin": "model"}
+
+    def _render_final_text(
+        self,
+        *,
+        user_input: str,
+        content: str,
+        messages: list[LLMMessage],
+        options: RunOptions,
+        state: InvestigationState,
+        stop_reason: str,
+        fallback_complete: bool,
+    ) -> str:
+        payload = {
+            "original_user_request": user_input,
+            "candidate_answer": content.strip() or None,
+            "completion_status": "complete" if fallback_complete else "incomplete",
+            "stop_reason": stop_reason,
+            "investigation_state": state.to_dict(),
+        }
+        final_messages = [
+            *messages,
+            LLMMessage(role="system", content=self.prompt_set.final_response),
+            LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+        ]
+        llm_response = self.call_final_model_once(
+            messages=final_messages,
+            options=LLMCallOptions(
+                reasoning_effort=options.reasoning_effort,
+                reasoning_summary=options.reasoning_summary,
+                response_format=None,
+                max_output_tokens=self.settings.llm_max_output_tokens,
+                metadata={
+                    **options.metadata,
+                    "mode": options.mode,
+                    "target": "investigation_final_response",
+                },
+            ),
+        )
+        if llm_response.tool_calls:
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The conversational final response unexpectedly requested tools.",
+                detail=f"tool_call_count={len(llm_response.tool_calls)}",
+            )
+        final_content = llm_response.content.strip()
+        if not final_content:
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The conversational final response was empty.",
+            )
+        if _is_raw_json_document(final_content):
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The conversational final response returned raw JSON.",
+            )
+        return final_content
 
     def _render_final_json_schema(
         self,
@@ -1063,11 +1207,12 @@ class InvestigationController:
             turn_index=turn_index,
             options=options,
             state=state,
-            content=self._answer_from_state(state=state, final=False),
+            content="",
             messages=messages,
             iterations_used=iterations_used,
             tool_calls_used=tool_calls_used,
             stop_reason=stop_reason,
+            fallback_complete=False,
         )
 
     def _synthesize_initial_plan(

@@ -161,12 +161,17 @@ For multi-step work, `investigate` and `deep_investigate` add bounded planning,
 reflection, decision and optional final critique phases while storing only
 auditable artifacts, not raw chain-of-thought.
 
-Investigation modes are conversation modes by default: their user-visible
-answer is text. Their planning, reflection, decision and critique phases use
-internal JSON synthesis. If a caller needs a structured final answer, pass
-`final_output_mode="json_schema"` with a `StructuredOutputContract`; the
-investigation still runs normally, then a final no-tool turn renders the answer
-through the provider-enforced JSON Schema contract.
+Investigation modes are conversation modes by default: after the investigation
+stops, a dedicated no-tool model call renders the user-visible answer as natural
+text from the original request, candidate draft, and auditable state. Empty,
+tool-calling, raw-JSON, or failed final responses fall back to the bounded
+deterministic state renderer so the conversation still completes. The result
+metadata reports `final_response_origin` as `model` or `fallback`.
+
+Planning, reflection, decision and critique phases use internal JSON synthesis.
+If a caller needs a structured final answer, pass
+`final_output_mode="json_schema"` with a `StructuredOutputContract`; this stays
+on its separate provider-enforced and locally validated JSON Schema path.
 
 ```python
 from agent_core import RunContext, RunOptions
