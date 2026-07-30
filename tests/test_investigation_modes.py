@@ -629,6 +629,7 @@ def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) ->
         if message.role == "system" and message.content.startswith(INVESTIGATION_STATE_MESSAGE_PREFIX)
     ]
     assert len(second_iteration_state_messages) == 1
+    assert "When next_actions is non-empty" in second_iteration_state_messages[0]
     second_iteration_state = json.loads(second_iteration_state_messages[0].splitlines()[-1])
     assert second_iteration_state["facts"][0]["summary"] == "navigation succeeded"
     assert second_iteration_state["evidence_gaps"] == ["browser_snapshot not yet performed"]
