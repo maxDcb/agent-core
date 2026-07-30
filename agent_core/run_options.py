@@ -46,7 +46,8 @@ class RunOptions:
         self.metadata = dict(self.metadata)
         self.llm_budget = LLMBudget.from_any(self.llm_budget)
         self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
-        self.tool_artifact_policy = ToolArtifactPolicy.from_any(self.tool_artifact_policy)
+        if self.tool_artifact_policy is not None:
+            self.tool_artifact_policy = ToolArtifactPolicy.from_any(self.tool_artifact_policy)
         self.final_output_contract = StructuredOutputContract.from_any(self.final_output_contract)
         if self.mode == "direct" and self.final_output_mode != "text":
             raise ValueError("json_schema final output requires investigate or deep_investigate mode")

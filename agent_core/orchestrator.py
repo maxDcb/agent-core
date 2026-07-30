@@ -159,12 +159,12 @@ class AgentOrchestrator:
     def _build_artifact_runtime(
         self,
         *,
-        policy: ToolArtifactPolicy | None,
+        policy: ToolArtifactPolicy,
         context: RunContext,
         usage: ToolArtifactUsage | dict[str, Any] | None = None,
-    ) -> ToolArtifactRuntime | None:
-        if policy is None or context.run_id is None:
-            return None
+    ) -> ToolArtifactRuntime:
+        if context.run_id is None:
+            raise ValueError("RunContext must have a run_id before artifact storage")
         return ToolArtifactRuntime(
             policy=policy,
             store=self.artifact_store,
@@ -547,9 +547,18 @@ class AgentOrchestrator:
         trace: RunTrace | None = None,
         iteration: int | None = None,
     ) -> None:
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during tool execution")
         for tool_call in tool_calls:
             tool_content = f"Tool call skipped: maximum tool-call budget reached before executing {tool_call.name}."
-            tool_message = LLMMessage(role="tool", tool_call_id=tool_call.id, content=tool_content)
+            tool_message = artifact_runtime.externalize(
+                tool_name=tool_call.name,
+                content=tool_content,
+                tool_call_id=tool_call.id,
+                status="budget_exhausted",
+                metadata={"status": "budget_exhausted", "synthetic": True},
+            )
             messages.append(tool_message)
             tool_messages.append(tool_message)
             tool_names.append(tool_call.name)
@@ -558,14 +567,16 @@ class AgentOrchestrator:
                 arguments = json.loads(tool_call.arguments_json or "{}")
             except json.JSONDecodeError:
                 arguments = {}
-            self.session_manager.append_tool_history(
-                self._build_tool_history_item(
-                    tool_name=tool_call.name,
-                    arguments=arguments,
-                    tool_content=tool_content,
-                    status="budget_exhausted",
-                )
+            history_item = self._build_tool_history_item(
+                tool_name=tool_call.name,
+                arguments=arguments,
+                tool_content=tool_content,
+                status="budget_exhausted",
             )
+            descriptor = artifact_descriptor_from_message(tool_message)
+            if descriptor is not None:
+                history_item["artifact_id"] = descriptor.artifact_id
+            self.session_manager.append_tool_history(history_item)
             self._record_trace_event(
                 trace,
                 event_type="tool_call_skipped_budget_exhausted",
@@ -629,6 +640,7 @@ class AgentOrchestrator:
         pending_metadata_extra: dict[str, Any] | None = None,
     ) -> None:
         payload = {
+            "schema_version": "2",
             "pending_id": pending_id,
             "user_input": user_input,
             "messages": [message_to_persistence_dict(message) for message in messages],
@@ -812,6 +824,11 @@ class AgentOrchestrator:
                         status="completed",
                         content=f"No pending agent turn found for pending_id={pending_id}",
                     )
+                if pending.get("schema_version") != "2":
+                    return AgentTurnResult(
+                        status="completed",
+                        content="Pending agent turn is incompatible with the current artifact contract.",
+                    )
 
                 pending_run_id = pending.get("run_trace_id")
                 bound_context = context.with_run_id(
@@ -838,10 +855,7 @@ class AgentOrchestrator:
                     if context_policy is not None
                     else None
                 )
-                artifact_policy = (
-                    ToolArtifactPolicy.from_any(pending.get("tool_artifact_policy"))
-                    or self.settings.tool_artifact_policy
-                )
+                artifact_policy = ToolArtifactPolicy.from_any(pending.get("tool_artifact_policy"))
                 artifact_runtime = self._build_artifact_runtime(
                     policy=artifact_policy,
                     context=bound_context,
@@ -1052,11 +1066,12 @@ class AgentOrchestrator:
     ) -> LLMCompletionResult:
         tool_specs = self.registry.get_tool_specs()
         artifact_runtime = active_tool_artifact_runtime()
-        if artifact_runtime is not None:
-            if self.registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
-                raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
-            if artifact_runtime.has_readable_artifacts(messages):
-                tool_specs.extend(artifact_runtime.tool_specs())
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during model execution")
+        if self.registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
+            raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
+        if artifact_runtime.has_readable_artifacts(messages):
+            tool_specs.extend(artifact_runtime.tool_specs())
         purpose = (
             str(options.metadata.get("target"))
             if options is not None and options.metadata.get("target")
@@ -1154,7 +1169,9 @@ class AgentOrchestrator:
             # persisted storage records each tool phase as an atomic
             # tool-exchange block once execution completes.
             artifact_runtime = active_tool_artifact_runtime()
-            is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tc.name)
+            if artifact_runtime is None:
+                raise RuntimeError("Tool artifact runtime is required during tool execution")
+            is_internal = artifact_runtime.is_internal_tool(tc.name)
             if not is_internal and tool_calls_used >= max_tool_calls:
                 logger.error("Tool-call budget exhausted before executing remaining tool calls")
                 tool_budget_exhausted = True
@@ -1217,7 +1234,7 @@ class AgentOrchestrator:
                         )
                         result = (
                             artifact_runtime.execute(tool_name=tc.name, arguments=arguments, context=context)
-                            if is_internal and artifact_runtime is not None
+                            if is_internal
                             else self.registry.execute(tc.name, arguments, context)
                         )
                         tool_content = result.content
@@ -1305,9 +1322,10 @@ class AgentOrchestrator:
                     tool_name=tc.name,
                     content=tool_content,
                     tool_call_id=tc.id,
+                    status=tool_status,
                     metadata={"status": tool_status},
                 )
-                if artifact_runtime is not None and not is_internal
+                if not is_internal
                 else LLMMessage(role="tool", tool_call_id=tc.id, content=tool_content)
             )
             messages.append(tool_message)
@@ -1384,15 +1402,14 @@ class AgentOrchestrator:
 
         pending_tool_name = str(pending.get("tool_name") or "unknown")
         artifact_runtime = active_tool_artifact_runtime()
-        tool_message = (
-            artifact_runtime.externalize(
-                tool_name=pending_tool_name,
-                content=tool_content,
-                tool_call_id=tool_call_id,
-                metadata={"status": "ok" if ok else "tool_error", "pending_result": True},
-            )
-            if artifact_runtime is not None
-            else LLMMessage(role="tool", tool_call_id=tool_call_id, content=tool_content)
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required while resuming tool execution")
+        tool_message = artifact_runtime.externalize(
+            tool_name=pending_tool_name,
+            content=tool_content,
+            tool_call_id=tool_call_id,
+            status="ok" if ok else "tool_error",
+            metadata={"status": "ok" if ok else "tool_error", "pending_result": True},
         )
         messages.append(tool_message)
 

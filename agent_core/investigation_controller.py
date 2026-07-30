@@ -1378,6 +1378,7 @@ class InvestigationController:
                     INVESTIGATION_STATE_MESSAGE_PREFIX,
                     "This is the controller's current auditable state, not new user evidence.",
                     "Use established facts, prioritize next actions, close evidence gaps, and respect risk notes.",
+                    "When next_actions is non-empty and an available tool can perform the next action within scope and budget, call that tool now. Do not produce a final answer instead of performing a required next action. Finalize only when no required next action remains or the state establishes that continuation is blocked, unsafe, unavailable, or over budget.",
                     "Do not repeat completed actions unless verification requires it.",
                     json.dumps(state_payload, ensure_ascii=False, separators=(",", ":")),
                 ]

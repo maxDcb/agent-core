@@ -28,6 +28,7 @@ def test_run_engine_public_api_is_small_and_explicit() -> None:
         "AgentRunService",
         "AgentRunState",
         "ArtifactChunk",
+        "ArtifactResultEnvelope",
         "ArtifactStore",
         "CoreSettings",
         "ExecutionContext",

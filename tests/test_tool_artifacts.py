@@ -47,6 +47,7 @@ class _ReadBackProvider:
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
         self.artifact_id = ""
+        self.next_offset = 0
 
     def complete_with_tools(self, **kwargs: Any) -> LLMCompletionResult:
         self.calls.append(kwargs)
@@ -60,23 +61,38 @@ class _ReadBackProvider:
         if call_index == 2:
             assert any(tool.name == READ_ARTIFACT_TOOL_NAME for tool in kwargs["tools"])
             result_message = next(message for message in kwargs["messages"] if message.tool_call_id == "call-large")
-            assert "PLAYWRIGHT-EVIDENCE" not in result_message.content
-            descriptor = json.loads(result_message.content)
-            self.artifact_id = descriptor["artifact_id"]
+            envelope = json.loads(result_message.content)
+            assert envelope["kind"] == "artifact_result"
+            assert envelope["materialization"] == "preview"
+            assert envelope["content"].startswith("PLAYWRIGHT-EVIDENCE")
+            assert envelope["complete"] is False
+            assert len(envelope["content"].encode("utf-8")) == envelope["returned_bytes"]
+            assert envelope["returned_bytes"] <= 64
+            assert envelope["returned_bytes"] < envelope["artifact"]["size_bytes"]
+            self.artifact_id = envelope["artifact"]["artifact_id"]
+            self.next_offset = envelope["next_offset"]
             return LLMCompletionResult(
                 content="",
                 tool_calls=[
                     LLMToolCall(
                         id="call-read",
                         name=READ_ARTIFACT_TOOL_NAME,
-                        arguments_json=json.dumps({"artifact_id": self.artifact_id, "offset": 0, "limit": 80}),
+                        arguments_json=json.dumps(
+                            {
+                                "artifact_id": self.artifact_id,
+                                "offset": self.next_offset,
+                                "limit": 80,
+                            }
+                        ),
                     )
                 ],
             )
         read_message = next(message for message in kwargs["messages"] if message.tool_call_id == "call-read")
         payload = json.loads(read_message.content)
+        assert payload["kind"] == "artifact_chunk"
         assert payload["artifact_id"] == self.artifact_id
-        assert payload["content"].startswith("PLAYWRIGHT-EVIDENCE")
+        assert payload["offset"] == self.next_offset
+        assert payload["content"].startswith("x")
         return LLMCompletionResult(content="done")
 
     def complete_text(self, **kwargs: Any) -> LLMCompletionResult:
@@ -112,8 +128,11 @@ class _PendingReadProvider:
             )
         if self.calls == 2:
             message = next(item for item in kwargs["messages"] if item.tool_call_id == "call-pending")
-            descriptor = json.loads(message.content)
-            self.artifact_id = descriptor["artifact_id"]
+            envelope = json.loads(message.content)
+            assert envelope["kind"] == "artifact_result"
+            assert envelope["materialization"] == "preview"
+            assert envelope["content"].startswith("ASYNC-EVIDENCE")
+            self.artifact_id = envelope["artifact"]["artifact_id"]
             return LLMCompletionResult(
                 content="",
                 tool_calls=[
@@ -160,12 +179,28 @@ def test_file_artifact_store_is_namespace_scoped_and_reads_bounded_chunks(tmp_pa
         store.read_all_text(namespace_id="tenant-b", artifact_id=descriptor.artifact_id)
 
 
+def test_core_settings_require_artifact_storage_policy(tmp_path) -> None:
+    settings = CoreSettings(
+        base_system_prompt="system",
+        artifacts_directory=tmp_path / "artifacts",
+    )
+
+    assert settings.tool_artifact_policy == ToolArtifactPolicy()
+    with pytest.raises(ValueError, match="Tool artifact policy"):
+        CoreSettings(
+            base_system_prompt="system",
+            artifacts_directory=tmp_path / "disabled",
+            tool_artifact_policy=None,  # type: ignore[arg-type]
+        )
+
+
 def test_runtime_keeps_only_newest_artifact_results_hot_and_persists_references(tmp_path) -> None:
     store = JsonFileArtifactStore(tmp_path / "artifacts")
     runtime = ToolArtifactRuntime(
         policy=ToolArtifactPolicy(
             hot_context_bytes=10,
-            max_inline_result_bytes=10,
+            max_complete_result_bytes=10,
+            preview_bytes=4,
             max_read_bytes=16,
             max_reads_per_run=2,
             max_total_read_bytes=32,
@@ -174,14 +209,31 @@ def test_runtime_keeps_only_newest_artifact_results_hot_and_persists_references(
         namespace_id="tenant",
         run_id="run",
     )
-    older = runtime.externalize(tool_name="one", content="12345678", tool_call_id="call-1")
-    newest = runtime.externalize(tool_name="two", content="abcdefgh", tool_call_id="call-2")
+    older = runtime.externalize(
+        tool_name="one",
+        content="12345678",
+        tool_call_id="call-1",
+        status="ok",
+    )
+    newest = runtime.externalize(
+        tool_name="two",
+        content="abcdefgh",
+        tool_call_id="call-2",
+        status="tool_error",
+    )
 
     projected = runtime.project_messages([older, newest])
 
-    assert json.loads(projected[0].content)["externalized"] is True
-    assert projected[1].content == "abcdefgh"
-    assert json.loads(message_to_persistence_dict(newest)["content"])["artifact_id"] == (
+    older_envelope = json.loads(projected[0].content)
+    newest_envelope = json.loads(projected[1].content)
+    assert older_envelope["materialization"] == "reference"
+    assert older_envelope["content"] is None
+    assert newest_envelope["materialization"] == "complete"
+    assert newest_envelope["content"] == "abcdefgh"
+    assert newest_envelope["status"] == "tool_error"
+    persisted_envelope = json.loads(message_to_persistence_dict(newest)["content"])
+    assert persisted_envelope["materialization"] == "reference"
+    assert persisted_envelope["artifact"]["artifact_id"] == (
         artifact_descriptor_from_message(newest).artifact_id  # type: ignore[union-attr]
     )
 
@@ -203,7 +255,8 @@ def test_structured_loop_externalizes_results_and_dispatches_internal_reads_outs
     checkpoints: list[dict[str, Any]] = []
     policy = ToolArtifactPolicy(
         hot_context_bytes=128,
-        max_inline_result_bytes=128,
+        max_complete_result_bytes=128,
+        preview_bytes=64,
         max_read_bytes=80,
         max_reads_per_run=3,
         max_total_read_bytes=240,
@@ -248,6 +301,9 @@ def test_structured_loop_externalizes_results_and_dispatches_internal_reads_outs
     assert restored is not None
     assert restored.tool_artifact_policy == policy
     assert restored.tool_artifact_usage.internal_tool_calls == 1
+    previous_contract = dict(checkpoints[-1])
+    previous_contract["schema_version"] = 5
+    assert StructuredTaskCheckpoint.from_dict(previous_contract) is None
 
 
 def test_conversation_loop_exposes_internal_reader_without_consuming_application_budget(tmp_path) -> None:
@@ -271,7 +327,8 @@ def test_conversation_loop_exposes_internal_reader_without_consuming_application
     )
     policy = ToolArtifactPolicy(
         hot_context_bytes=128,
-        max_inline_result_bytes=128,
+        max_complete_result_bytes=128,
+        preview_bytes=64,
         max_read_bytes=80,
         max_reads_per_run=3,
         max_total_read_bytes=240,
@@ -315,7 +372,8 @@ def test_pending_conversation_resume_restores_artifact_policy_and_usage(tmp_path
     )
     policy = ToolArtifactPolicy(
         hot_context_bytes=64,
-        max_inline_result_bytes=64,
+        max_complete_result_bytes=64,
+        preview_bytes=32,
         max_read_bytes=32,
         max_reads_per_run=2,
         max_total_read_bytes=64,

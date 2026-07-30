@@ -107,3 +107,24 @@ def test_default_investigation_prompts_are_available() -> None:
         assert prompt.strip()
 
     assert DEFAULT_INVESTIGATION_PROMPTS.render_run_guidance(mode="investigate").strip()
+
+
+def test_reflection_prompt_keeps_relevant_explicit_actions_open() -> None:
+    prompt = DEFAULT_INVESTIGATION_PROMPTS.step_reflection
+
+    assert "mandatory completion check" in prompt
+    assert "satisfied, open, or closed with an auditable reason" in prompt
+    assert "set should_continue=true" in prompt
+    assert "No result always means open" in prompt
+    assert "after receiving only A's result you must classify B as open" in prompt
+
+
+def test_decision_prompt_allows_bounded_conditional_completion() -> None:
+    prompt = DEFAULT_INVESTIGATION_PROMPTS.decision
+
+    assert "every explicitly requested action" in prompt
+    assert "closed for an auditable reason" in prompt
+    assert "A missing prerequisite result is not a false condition" in prompt
+    assert "a state containing only A's result requires continue to B" in prompt
+    assert "Conditional or superseded actions do not need to run" in prompt
+    assert "optional extra investigation" in prompt

@@ -409,9 +409,10 @@ class IncrementalMemoryJournal:
         raw_exchanges = payload.get("exchanges")
         exchanges = (
             [
-                memory
+                exchange
                 for item in raw_exchanges
-                if (memory := ExchangeMemory.from_any(item)) is not None and memory.thread_id == thread_id
+                if (exchange := ExchangeMemory.from_any(item)) is not None
+                and exchange.thread_id == thread_id
             ]
             if isinstance(raw_exchanges, list)
             else []
@@ -420,10 +421,10 @@ class IncrementalMemoryJournal:
         raw_turns = payload.get("turns")
         turns = (
             [
-                memory
+                turn
                 for item in raw_turns
-                if (memory := TurnMemory.from_any(item)) is not None
-                and memory.thread_id == thread_id
+                if (turn := TurnMemory.from_any(item)) is not None
+                and turn.thread_id == thread_id
             ]
             if isinstance(raw_turns, list)
             else []
