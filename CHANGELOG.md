@@ -10,6 +10,10 @@
   recovery that never blocks the user-visible answer.
 - Reused investigation step reflections as grounded memory events and removed
   the obsolete summary marker, delta/merge prompts, and legacy memory models.
+- Made replacement handoff synthesis conservatively retain still-relevant prior
+  facts, constraints, failed approaches and unresolved contradictions.
+- Changed raw-history compaction to keep a contiguous suffix of complete turn
+  groups, always retaining the newest group without isolated pinned history.
 - Added optional run-level `LLMBudget` enforcement and observation across
   conversation, investigation, structured-task, finalization and memory calls.
 - Persisted LLM budget usage in pending conversation state and structured-task
@@ -22,12 +26,13 @@
   only atomic historical groups, with observe/enforce modes and overflow errors.
 - Persisted context-planning telemetry in pending turns and structured-task
   checkpoint schema version 4 so resumed runs retain planner state.
-- Added optional lossless tool-result externalization with a namespace-scoped
-  `ArtifactStore`, hot/cold prompt projection, and the bounded internal
-  `agent_core_read_artifact` tool.
+- Made lossless tool-result externalization always active with a
+  namespace-scoped `ArtifactStore`, stable complete/preview/reference
+  `artifact_result` envelopes, hot/cold prompt projection, and the bounded
+  internal `agent_core_read_artifact` tool.
 - Separated internal artifact-read accounting from application tool budgets and
-  persisted artifact descriptors and usage in structured checkpoint schema
-  version 5 and pending conversation state.
+  persisted artifact references and usage in structured checkpoint schema
+  version 6 and pending conversation state schema version 2.
 
 ## 0.4.0
 

@@ -26,7 +26,7 @@ public API may still evolve before `1.0.0`.
 - Exact provider token usage, per-call telemetry and run-level usage summaries
 - Optional run-level LLM budgets covering main, reflection, finalization and memory calls
 - Optional provider-window context planning with atomic history compaction
-- Optional lossless tool-result artifacts with bounded on-demand rereads
+- Always-on lossless tool-result artifacts with bounded on-demand rereads
 - Provider-enforced JSON Schema contracts for structured task final outputs
 - OpenAI/Azure request normalization and adaptive retry handling
 - Typed Python package marker (`py.typed`)
@@ -139,11 +139,24 @@ retried indefinitely. If execution stops after the raw conversation block is
 saved but before its memory commit, the next prompt build reconstructs the
 missing exchange and turn records without an LLM call.
 
+The replacement handoff is updated conservatively from the previous handoff and
+the current turn. Still-relevant facts, constraints, failed approaches and
+unresolved contradictions are retained even when the current turn does not
+repeat them. They are removed only when the objective changes or current
+evidence explicitly resolves, supersedes or invalidates them.
+
 `CoreSettings.turn_memory_synthesis_prompt` customizes the single post-turn
 memory call. `memory_max_turn_input_chars`, `memory_max_handoff_chars`, and
 `memory_max_turn_summary_chars` bound its input and prose outputs. The complete
 turn journal remains persisted even though only the latest compact handoff is
 injected into later prompts.
+
+Raw history compaction keeps a contiguous suffix of complete turn groups. It
+stops at the first older group that does not fit instead of creating holes or
+retaining isolated pinned groups. The newest group is always kept, even when it
+alone exceeds the soft `max_active_context_tokens` history budget. Configure an
+enforced `LLMContextPolicy` when the complete provider request must stay inside
+a hard context limit.
 
 Memory journal schema 2 is intentionally breaking while the package is
 pre-1.0. Schema 1 memory payloads are ignored; no compatibility parser or
@@ -153,6 +166,9 @@ Domain packages can implement `DomainHooks.extend_turn_memory_payload()` and
 `DomainHooks.turn_memory_guidance()` to add bounded context and prose guidance
 without introducing a second memory schema. Headless structured tasks and
 application pipelines do not use this conversation journal.
+
+See [docs/memory_and_artifacts.md](docs/memory_and_artifacts.md) for the memory
+commit, compaction, recovery and persistence contracts.
 
 ## Run Modes
 
@@ -319,12 +335,13 @@ the provider supports `LLMCallOptions.max_output_tokens`.
 
 ## Lossless Tool-Result Artifacts
 
-Every completed application-tool result is stored outside the transcript.
+Every application-tool result is stored outside the transcript, including
+pending, failed, denied and budget-exhausted results.
 The model always receives an `artifact_result` envelope: a small result is
 `complete`, a large result is a bounded `preview`, and an older result that has
 left the hot context is a `reference`. The runtime exposes
-`agent_core_read_artifact` so the model can continue reading bounded chunks on
-demand.
+`agent_core_read_artifact` after at least one readable artifact exists so the
+model can continue reading bounded chunks on demand.
 
 ```python
 from pathlib import Path
@@ -346,17 +363,22 @@ settings = CoreSettings(
 
 The policy can also be overridden with `RunOptions.tool_artifact_policy` or
 `StructuredTaskSpec.tool_artifact_policy`. `JsonFileArtifactStore` is the
-default; hosts may inject an `ArtifactStore` into `AgentRunService` for remote
-or transactional storage. Artifact reads are namespace-scoped, never accept a
-filesystem path, have their own call/byte limits, and do not consume the
-application tool-call budget. Pending conversation state schema version 2 and
-structured checkpoint schema version 6 persist `artifact_result` references
-and artifact usage rather than copying the full result.
+default; hosts may inject an `ArtifactStore` into `AgentRunService` or
+`AgentOrchestrator` for remote or transactional storage. Artifact reads are
+namespace-scoped, never accept a filesystem path, have their own call/byte
+limits, and do not consume the application tool-call budget. Continue a
+`preview` from its `next_offset`; subsequent `artifact_chunk` responses provide
+another `next_offset` and an `eof` flag. Pending conversation state schema
+version 2 and structured checkpoint schema version 6 persist `artifact_result`
+references and artifact usage rather than copying the full result.
 
 Artifact storage is always enabled. `JsonFileArtifactStore` stores plaintext
 UTF-8 files and is intended for trusted local deployments; production hosts
 handling credentials or browser session data should inject an encrypted store
 with explicit access control and retention.
+
+See [docs/memory_and_artifacts.md](docs/memory_and_artifacts.md) for the envelope
+schema, projection rules, read limits and custom-store contract.
 
 ## Pending Tool Result Flow
 
@@ -409,9 +431,13 @@ from agent_core import (
     AgentRunService,
     AgentRunState,
     AgentRunMode,
+    ArtifactChunk,
+    ArtifactResultEnvelope,
+    ArtifactStore,
     CoreSettings,
     ExecutionContext,
     ExecutionScope,
+    JsonFileArtifactStore,
     JsonFileRunStore,
     LLMBudget,
     LLMBudgetExceededError,
@@ -427,6 +453,9 @@ from agent_core import (
     StructuredTaskResult,
     StructuredTaskRunner,
     StructuredTaskSpec,
+    ToolArtifactDescriptor,
+    ToolArtifactPolicy,
+    ToolArtifactUsage,
 )
 ```
 

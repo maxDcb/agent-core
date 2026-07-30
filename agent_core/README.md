@@ -3,50 +3,97 @@
 Reusable, domain-agnostic runtime for tool-using LLM agents.
 
 This package provides:
-- orchestration loop (`AgentOrchestrator`)
-- tool registry and tool protocol (`ToolRegistry`, `BaseTool`)
-- provider abstraction (`BaseLLMProvider`)
-- session persistence and memory lifecycle (`SessionManager`, `SessionRepository`)
-- policy guardrails (`PolicyEngine`)
-- domain extension hooks (`DomainHooks`)
+
+- a persisted autonomous run service and structured task runner;
+- an optional conversation adapter with incremental memory;
+- a tool registry, tool protocol and policy guardrails;
+- provider abstractions and built-in provider adapters;
+- always-on lossless tool-result artifacts;
+- domain extension hooks.
 
 ## Design Scope
 
 `agent-core` intentionally does not ship domain-specific prompts, checklists, or reporting logic.
 Those concerns should live in an application/domain layer that composes the core runtime.
 
-## Public API
+## Public API surfaces
+
+Autonomous run applications import the run engine from `agent_core`:
 
 ```python
 from agent_core import (
-    AgentOrchestrator,
-    BaseTool,
+    AgentRunService,
+    ArtifactResultEnvelope,
     CoreSettings,
+    JsonFileArtifactStore,
+    JsonFileRunStore,
+    RunContext,
+    RunOptions,
+    StructuredTaskSpec,
+    ToolArtifactPolicy,
+)
+```
+
+Host extension contracts live in `agent_core.spi`:
+
+```python
+from agent_core.spi import (
+    BaseLLMProvider,
+    BaseTool,
     DomainHooks,
-    ExecutionContext,
     PolicyEngine,
-    SessionManager,
-    SessionRepository,
     ToolRegistry,
     build_tool_definition,
 )
 ```
 
-## Minimal Integration Pattern
+Conversation-only components live in `agent_core.conversation`:
+
+```python
+from agent_core.conversation import (
+    AgentOrchestrator,
+    ConversationAgent,
+    JsonFileSessionStore,
+    SessionManager,
+    SessionRepository,
+)
+```
+
+Only names listed in the `__all__` of these supported facades are public.
+See [Public API boundary](../docs/public_api.md) for the complete rule.
+
+## Integration patterns
+
+For a headless run:
+
+1. Build `CoreSettings`, a provider, `ToolRegistry`, `PolicyEngine` and
+   `JsonFileRunStore` or another `RunStore`.
+2. Build `AgentRunService`.
+3. Execute a `StructuredTaskSpec` with a bound `RunContext`.
+
+For a conversation with incremental memory:
 
 1. Build `CoreSettings` from your app config.
-2. Create one `BaseLLMProvider` implementation.
+2. Create the main provider and, optionally, a separate memory provider.
 3. Register tools in `ToolRegistry`.
 4. Instantiate `SessionRepository` + `SessionManager`.
-5. Instantiate `PolicyEngine`.
-6. Optionally implement `DomainHooks` for app-specific prompt blocks and memory payload extension.
-7. Build `AgentOrchestrator` and call `run_turn()`.
+5. Instantiate `PolicyEngine` and optional `DomainHooks`.
+6. Build `AgentOrchestrator`, then wrap it in `ConversationAgent` with a
+   `RunStore`.
+7. Call `ConversationAgent.execute_turn()`.
+
+Conversation memory uses append-only exchange and turn journals plus a bounded
+operational handoff. Tool results are always externalized to an artifact store.
+See [Conversation memory and tool-result artifacts](../docs/memory_and_artifacts.md)
+for lifecycle, recovery, projection and persistence details.
 
 ## Provider Notes
 
 Built-in provider adapters are available under `agent_core.llm`.
 The runtime depends on:
+
 - `anthropic`
+- `jsonschema`
 - `openai`
 - `requests`
 

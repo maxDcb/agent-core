@@ -70,17 +70,23 @@ calls are never separated from their responses. An irreducible overflow fails
 before provider invocation. Planner aggregates are persisted in pending turns
 and structured checkpoints and exposed in final metadata.
 
-When `ToolArtifactPolicy` is active, completed application-tool outputs are
-published to an `ArtifactStore` before the corresponding tool execution is
-checkpointed as complete. Persisted transcripts contain an opaque descriptor;
-the provider projection rehydrates only the newest results within the hot-byte
-budget. Large results stay cold from their first projection. The model can use
-the bounded `agent_core_read_artifact` runtime tool to retrieve more data.
-Runtime artifact reads bypass application policy and tool-call accounting, but
-are namespace-scoped and enforce separate per-run call and byte limits.
-The default file store is plaintext and local; deployments with sensitive tool
-outputs must provide storage encryption, permissions, and retention through a
-custom `ArtifactStore`.
+Tool-result artifact storage is always active. Every application-tool result is
+published to an `ArtifactStore` before its execution state is persisted.
+Provider-facing results use a stable `artifact_result` envelope: small results
+are `complete`, large results expose a bounded `preview`, and results outside
+the newest hot-byte window become `reference` envelopes. Persisted transcripts
+always contain the reference form, so checkpoints do not duplicate raw tool
+output. Provider projection walks artifacts from newest to oldest and
+rehydrates complete results or previews while the hot-byte budget permits.
+
+Once a readable artifact exists, the model can use the bounded
+`agent_core_read_artifact` runtime tool. Reads accept an opaque artifact id,
+byte offset and bounded limit, then return an `artifact_chunk` with
+`next_offset` and `eof`. Runtime reads bypass application policy and
+application tool-call accounting, but remain namespace-scoped and enforce
+separate per-run call and byte limits. The default file store is plaintext and
+local; deployments with sensitive tool outputs must provide storage encryption,
+permissions and retention through a custom `ArtifactStore`.
 
 A tool call persisted as completed is never replayed. A tool call left in
 `running` is considered ambiguous because its external effect may have happened
@@ -133,7 +139,9 @@ Conversation memory has three layers:
 2. `TurnMemory` stores one immutable turn summary and the complete replacement
    operational handoff synthesized from the previous bounded handoff and the
    completed current turn. It never reads the full thread or a historical
-   overflow.
+   overflow. The default synthesis prompt retains prior facts, constraints,
+   failed approaches and unresolved contradictions while they remain relevant;
+   absence from the current turn is not treated as evidence of obsolescence.
 3. `SessionView` is the latest valid bounded handoff. Its generation and
    terminal turn id make it rebuildable deterministically from the append-only
    journal without a semantic merge.
@@ -145,15 +153,22 @@ memory persistence is reconciled on the next prompt build without calling the
 model. Memory persistence failure is isolated from the user-visible result;
 the persisted raw turn remains available for the same reconciliation path.
 
-Recent raw history is still selected in whole turn groups for provider
-continuity. Historical blocks outside that window are retained for audit, but
-long-term memory no longer depends on a block crossing an overflow threshold.
+Recent raw history is selected as a contiguous suffix of whole turn groups for
+provider continuity. Selection stops at the first older group that does not fit;
+it never creates holes by retaining isolated pinned history. The newest group
+is always retained even if it alone exceeds the soft history budget. Historical
+blocks outside that window remain stored for audit, but long-term memory no
+longer depends on a block crossing an overflow threshold. An enforced
+`LLMContextPolicy` is the separate hard guard for the complete provider request.
 
 ## Application pipelines
 
 Applications own jobs, phases, retries, domain artifacts and domain state.
-Agent-core owns the optional storage lifecycle for raw tool-result artifacts
+Agent-core owns the always-on storage lifecycle for raw tool-result artifacts
 needed to virtualize its internal transcript. A pipeline
 creates one core run per LLM/tool execution and links its `run_id` to the
 application attempt. Pipeline state is passed through explicit correlation;
 it is never injected into conversation memory.
+
+The detailed memory and tool-result artifact contracts are documented in
+[memory_and_artifacts.md](memory_and_artifacts.md).

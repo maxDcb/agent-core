@@ -19,10 +19,11 @@ state without making the internal controller a public extension point.
 planner and expose content-free planning telemetry; the stateful planner itself
 remains an implementation detail.
 
-`ToolArtifactPolicy`, `ToolArtifactDescriptor`, `ToolArtifactUsage`,
-`ArtifactChunk`, and `JsonFileArtifactStore` configure and describe lossless
-tool-result externalization. `ArtifactStore` is also exported through the SPI
-for hosts that provide remote or transactional artifact persistence.
+`ToolArtifactPolicy`, `ToolArtifactDescriptor`, `ArtifactResultEnvelope`,
+`ToolArtifactUsage`, `ArtifactChunk`, and `JsonFileArtifactStore` configure and
+describe lossless tool-result externalization. `ArtifactStore` is exported from
+both the package root and the SPI for hosts that provide remote or
+transactional artifact persistence.
 
 ## Extension SPI: `agent_core.spi`
 
@@ -44,8 +45,9 @@ conversation agent, session stores and manager, and a detached read-only-style
 `ConversationStateView` passed to domain hooks. The mutable internal thread
 state is deliberately not public. The detached view exposes the materialized
 `session_view` and detached exchange/turn journal snapshots; turn-memory
-synthesis hooks receive the public `TurnMemoryContextView`, a smaller
-current-turn-only context. Pipeline-only consumers do not need this module.
+synthesis hooks receive the public `TurnMemoryContextView`, a smaller bounded
+context containing the previous handoff and current-turn exchange memories.
+Pipeline-only consumers do not need this module.
 
 ## Observability: `agent_core.observability`
 
