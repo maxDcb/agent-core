@@ -47,6 +47,7 @@ def build_empty_session_state(*, session_id: str = "default", storage_backend: s
             "turns": [],
             "view_policy": {
                 "max_handoff_chars": 6000,
+                "max_turn_summary_chars": 4000,
             },
             "session_view": {
                 "thread_id": session_id,

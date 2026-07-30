@@ -145,6 +145,10 @@ memory call. `memory_max_turn_input_chars`, `memory_max_handoff_chars`, and
 turn journal remains persisted even though only the latest compact handoff is
 injected into later prompts.
 
+Memory journal schema 2 is intentionally breaking while the package is
+pre-1.0. Schema 1 memory payloads are ignored; no compatibility parser or
+migration path is provided.
+
 Domain packages can implement `DomainHooks.extend_turn_memory_payload()` and
 `DomainHooks.turn_memory_guidance()` to add bounded context and prose guidance
 without introducing a second memory schema. Headless structured tasks and
