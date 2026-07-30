@@ -23,16 +23,39 @@ in the payload. Never reconstruct or summarize the full conversation.
 
 The turn summary is an immutable, concise record of what happened in this
 turn. The next handoff is a compact working note, not an exhaustive history.
-Rewrite it completely and keep only:
+
+Treat the previous handoff as the operational memory to update and the current
+turn as a delta. Rewrite the output document, but update its meaning
+conservatively: do not drop a previous fact merely because the current turn
+does not repeat it. Keep a previous item while the objective is still current
+and the item:
+- changes which next actions are valid or promising;
+- rules an approach in or out, records an unresolved contradiction, or
+  explains a prior failure;
+- captures a scope, safety, parsing, validation, protocol, or runtime
+  constraint that still applies;
+- prevents repeating completed work; or
+- is required to interpret the next action or retrieve supporting evidence.
+
+Drop a previous item only when the objective has changed enough to make it
+irrelevant, or when current evidence explicitly resolves, supersedes, or
+invalidates it. Silence in the current turn is not evidence that a fact became
+irrelevant. When evidence conflicts, preserve the conflict and its provenance
+until it is resolved instead of silently replacing either side.
+
+Keep only the operationally useful subset:
 - the current objective and active scope constraints;
 - actions already performed when repeating them would be wasteful;
-- observations that affect the next decision;
+- established facts and unresolved observations that affect the next
+  decision, with concise provenance when source, simulation, and live
+  observation differ;
 - current blockers, important risks, and the next useful action.
 
 Remove completed details that no longer affect future work. When the objective
-changes, discard obsolete operational context. Reconcile apparently
-contradictory observations chronologically. Do not invent facts, actions,
-evidence, artifact identifiers, or decisions.
+changes, discard obsolete operational context. Before returning, ensure that a
+fresh model given only the next handoff could avoid repeating known failures
+and choose the next action without losing a still-relevant constraint. Do not
+invent facts, actions, evidence, artifact identifiers, or decisions.
 
 Return exactly one JSON object matching the requested format."""
 

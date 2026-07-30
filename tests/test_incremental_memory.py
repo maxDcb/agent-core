@@ -6,6 +6,7 @@ import pytest
 
 from agent_core.context_assembler import ContextAssembler
 from agent_core.llm.base import LLMCompletionResult, LLMMessage
+from agent_core.memory.committer import DEFAULT_TURN_MEMORY_SYNTHESIS_PROMPT
 from agent_core.memory.context_block import estimate_token_count
 from agent_core.memory.derivation import derive_final_response_memory
 from agent_core.memory.journal import (
@@ -68,6 +69,17 @@ def test_session_view_is_the_latest_rebuildable_handoff() -> None:
     assert restored.session_view is not None
     assert restored.session_view.generation == journal.session_view.generation
     assert restored.session_view.content == journal.session_view.content
+
+
+def test_default_memory_prompt_requires_conservative_retention() -> None:
+    prompt = " ".join(DEFAULT_TURN_MEMORY_SYNTHESIS_PROMPT.split())
+
+    assert "current turn as a delta" in prompt
+    assert "do not drop a previous fact merely because the current turn does not repeat it" in prompt
+    assert "Silence in the current turn is not evidence that a fact became irrelevant" in prompt
+    assert "rules an approach in or out" in prompt
+    assert "preserve the conflict and its provenance" in prompt
+    assert "fresh model given only the next handoff" in prompt
 
 
 def test_journal_rejects_an_oversized_turn_summary() -> None:
