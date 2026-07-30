@@ -43,16 +43,31 @@ class FakeProvider:
     def complete_text(self, *, messages, model, temperature, options=None):
         return json.dumps(
             {
-                "run_id": "run-0000",
-                "objective": "Demonstrate pending tool resume",
-                "scope": [],
-                "source_code_locations": [],
+                "memory_id": "turn-0000-memory",
+                "thread_id": "demo",
+                "turn_index": 0,
+                "user_intent": "Run the external job.",
+                "assistant_outcome": "The external job completed successfully.",
+                "active_task": {
+                    "objective": "Demonstrate pending tool resume",
+                    "status": "completed",
+                    "next_action": None,
+                    "open_questions": [],
+                    "constraints": [],
+                },
+                "exchange_memory_ids": [],
+                "source_block_ids": [],
+                "confirmed_facts": [],
+                "superseded_facts": [],
+                "open_hypotheses": [],
+                "rejected_hypotheses": [],
                 "open_questions": [],
-                "next_action": None,
-                "stop_conditions": [],
-                "constraints": [],
+                "resolved_questions": [],
+                "decisions": [],
+                "completed_actions": ["External job completed."],
+                "next_actions": [],
                 "relevant_artifacts": [],
-                "status": "active",
+                "risk_notes": [],
                 "domain_extensions": {},
             }
         )
@@ -93,9 +108,7 @@ def build_orchestrator(session_file: Path) -> AgentOrchestrator:
         memory_model="fake-model",
         session_file=session_file,
         base_system_prompt="You demonstrate pending tool result resume.",
-        task_state_synthesis_prompt="Return JSON.",
-        session_summary_synthesis_prompt="Return JSON.",
-        session_summary_merge_prompt="Return JSON.",
+        turn_memory_synthesis_prompt="Return JSON.",
     )
     registry = ToolRegistry()
     registry.register(ExternalJobTool())

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from agent_core.conversation_state import ConversationStateView
+    from agent_core.conversation_state import ConversationStateView, TurnMemoryContextView
     from agent_core.investigation_prompts import InvestigationPromptSet
     from agent_core.run_options import RunOptions
     from agent_core.session_manager import SessionManager
@@ -22,34 +21,17 @@ class DomainHooks:
     ) -> list[str]:
         return []
 
-    def extend_task_state_payload(
+    def extend_turn_memory_payload(
         self,
         *,
-        thread_state: ConversationStateView,
-        turn_index: int,
+        memory_context: TurnMemoryContextView,
     ) -> dict[str, Any]:
         return {}
 
-    def extend_session_summary_delta_payload(
+    def turn_memory_extensions_template(
         self,
         *,
-        thread_state: ConversationStateView,
-        new_overflow_blocks: tuple[Mapping[str, Any], ...],
-    ) -> dict[str, Any]:
-        return {}
-
-    def task_state_extensions_template(
-        self,
-        *,
-        thread_state: ConversationStateView,
-        turn_index: int,
-    ) -> dict[str, Any]:
-        return {}
-
-    def session_summary_extensions_template(
-        self,
-        *,
-        thread_state: ConversationStateView,
+        memory_context: TurnMemoryContextView,
     ) -> dict[str, Any]:
         return {}
 

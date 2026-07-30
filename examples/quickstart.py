@@ -38,13 +38,8 @@ DEMO_STATE_DIR = Path(".agent-core-demo")
 BASE_SYSTEM_PROMPT = """You are a concise assistant running inside an agent-core quickstart.
 Use tools when they are relevant. Answer directly and do not mention internal implementation details."""
 
-TASK_STATE_PROMPT = """Update the task state from the conversation.
-Return only valid JSON matching the provided output format."""
-
-SESSION_SUMMARY_PROMPT = """Summarize the supplied overflow conversation blocks.
-Return only valid JSON matching the provided output format."""
-
-SESSION_SUMMARY_MERGE_PROMPT = """Merge the old session summary with the new summary delta.
+TURN_MEMORY_PROMPT = """Synthesize a memory delta for the supplied completed turn only.
+Use the ordered exchange-memory events and do not reconstruct older conversation history.
 Return only valid JSON matching the provided output format."""
 
 
@@ -139,9 +134,7 @@ def build_settings(*, model: str, memory_model: str, session_file: Path) -> Core
         allowed_read_roots=[Path.cwd()],
         allowed_http_hosts=[],
         base_system_prompt=BASE_SYSTEM_PROMPT,
-        task_state_synthesis_prompt=TASK_STATE_PROMPT,
-        session_summary_synthesis_prompt=SESSION_SUMMARY_PROMPT,
-        session_summary_merge_prompt=SESSION_SUMMARY_MERGE_PROMPT,
+        turn_memory_synthesis_prompt=TURN_MEMORY_PROMPT,
     )
 
 
@@ -431,10 +424,7 @@ def main() -> int:
     )
     missing_config = missing_provider_config(settings)
     if missing_config:
-        print(
-            f"Missing provider configuration for LLM_PROVIDER={settings.llm_provider!r}: "
-            f"{', '.join(missing_config)}"
-        )
+        print(f"Missing provider configuration for LLM_PROVIDER={settings.llm_provider!r}: {', '.join(missing_config)}")
         return 2
 
     if args.compat_check:

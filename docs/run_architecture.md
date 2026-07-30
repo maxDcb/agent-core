@@ -124,6 +124,29 @@ Conversation execution captures all built-in provider calls made in the turn,
 including internal synthesis calls. Pending resumes append stable call records
 instead of replacing or duplicating previous usage.
 
+Conversation memory has three layers:
+
+1. `ExchangeMemory` records each atomic assistant/tool interaction. Runtime
+   records are written atomically with their context block; investigation
+   reflections add grounded facts, gaps and next actions without another model
+   call.
+2. `TurnMemory` is one bounded delta synthesized only from the completed
+   current turn. It never reads the full thread or a historical overflow.
+3. `SessionView` is a bounded materialized projection merged
+   deterministically from committed turn deltas. Its generation and terminal
+   turn id make it rebuildable from the append-only journal.
+
+The raw transcript remains the recovery source until a turn memory is
+committed. Invalid model JSON, provider failure or budget exhaustion produces a
+deterministic `TurnMemory` fallback. An interruption between transcript and
+memory persistence is reconciled on the next prompt build without calling the
+model. Memory persistence failure is isolated from the user-visible result;
+the persisted raw turn remains available for the same reconciliation path.
+
+Recent raw history is still selected in whole turn groups for provider
+continuity. Historical blocks outside that window are retained for audit, but
+long-term memory no longer depends on a block crossing an overflow threshold.
+
 ## Application pipelines
 
 Applications own jobs, phases, retries, domain artifacts and domain state.

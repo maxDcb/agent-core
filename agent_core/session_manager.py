@@ -3,14 +3,24 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
+from copy import deepcopy
 from threading import Lock, RLock
 from typing import Any
 
+from agent_core.llm.base import LLMMessage
 from agent_core.logging_utils import get_logger
 from agent_core.memory.context_block import ContextBlock
+from agent_core.memory.derivation import (
+    derive_final_response_memory,
+    derive_tool_exchange_memory,
+)
 from agent_core.memory.history_compactor import CompactionPolicy, HistoryCompactor
-from agent_core.memory.session_summary import SessionSummary
-from agent_core.memory.task_state import TaskState
+from agent_core.memory.journal import (
+    ExchangeMemory,
+    IncrementalMemoryJournal,
+    TurnMemory,
+    build_fallback_turn_memory,
+)
 from agent_core.memory.thread_state import ThreadState
 from agent_core.run_trace import RunTrace
 from agent_core.session_repo import SessionRepository
@@ -23,7 +33,7 @@ class SessionManager:
     """Own the mutable session state between orchestration and storage.
 
     The manager exposes a small write API around the canonical session payload:
-    context blocks, synthesized memory objects, domain state, and metadata.
+    context blocks, incremental memory journals, domain state, and metadata.
     It deliberately sits between the orchestrator and repository so storage
     normalization stays outside the runtime flow.
     """
@@ -109,7 +119,11 @@ class SessionManager:
             self._scope_depth_var.reset(depth_token)
             self._state_var.reset(state_token)
             self._session_id_var.reset(session_token)
-            if previous_context_session_id == session_id and previous_context_state is not None and scoped_state is not None:
+            if (
+                previous_context_session_id == session_id
+                and previous_context_state is not None
+                and scoped_state is not None
+            ):
                 self._session_id_var.set(session_id)
                 self._state_var.set(scoped_state)
             lock.release()
@@ -198,17 +212,202 @@ class SessionManager:
         ]
         return (max(turn_indices) + 1) if turn_indices else 0
 
-    def set_summary(self, summary: SessionSummary | dict[str, Any] | str | None) -> None:
-        normalized = SessionSummary.from_any(summary, thread_id=self.session_id)
-        self.state["summary"] = normalized.to_dict() if normalized is not None else None
-        logger.debug("Persisting session summary", extra={"has_summary": normalized is not None})
-        self._save()
+    def get_memory_journal(self) -> IncrementalMemoryJournal:
+        return IncrementalMemoryJournal.from_any(
+            self.state.get("memory"),
+            thread_id=self.session_id or "default",
+        )
 
-    def set_task_state(self, task_state: TaskState | dict[str, Any] | None) -> None:
-        normalized = TaskState.from_any(task_state)
-        self.state["task_state"] = normalized.to_dict() if normalized is not None else None
-        logger.debug("Persisting task state", extra={"has_task_state": normalized is not None})
-        self._save()
+    def commit_tool_exchange(
+        self,
+        *,
+        block: ContextBlock,
+        memory: ExchangeMemory,
+    ) -> bool:
+        return self._commit_context_block_with_exchange(block=block, memory=memory)
+
+    def commit_conversation_turn(
+        self,
+        *,
+        block: ContextBlock,
+        memory: ExchangeMemory,
+    ) -> bool:
+        return self._commit_context_block_with_exchange(block=block, memory=memory)
+
+    def append_exchange_memory(self, memory: ExchangeMemory) -> bool:
+        journal = self.get_memory_journal()
+        changed = journal.append_exchange(memory)
+        if not changed:
+            return False
+        self._save_memory_transaction(journal)
+        logger.debug(
+            "Persisted exchange memory",
+            extra={"memory_id": memory.memory_id, "turn_index": memory.turn_index},
+        )
+        return True
+
+    def commit_turn_memory(
+        self,
+        memory: TurnMemory,
+        *,
+        max_session_items: int,
+        max_recent_outcomes: int,
+    ) -> bool:
+        journal = self.get_memory_journal()
+        changed = journal.commit_turn(
+            memory,
+            max_session_items=max_session_items,
+            max_recent_outcomes=max_recent_outcomes,
+        )
+        if not changed:
+            return False
+        self._save_memory_transaction(journal)
+        logger.debug(
+            "Committed turn memory",
+            extra={
+                "memory_id": memory.memory_id,
+                "turn_index": memory.turn_index,
+                "origin": memory.origin,
+            },
+        )
+        return True
+
+    def reconcile_memory(
+        self,
+        *,
+        max_session_items: int,
+        max_recent_outcomes: int,
+    ) -> bool:
+        """Recover journal entries after interruption without calling an LLM."""
+
+        journal = self.get_memory_journal()
+        context_blocks = self.get_context_blocks()
+        policy_changed = (
+            journal.max_session_items != max_session_items or journal.max_recent_outcomes != max_recent_outcomes
+        )
+        changed = policy_changed
+        recovered = False
+        if policy_changed:
+            journal.rebuild_session_view(
+                max_session_items=max_session_items,
+                max_recent_outcomes=max_recent_outcomes,
+            )
+
+        for block in context_blocks:
+            turn_index = block.metadata.get("turn_index")
+            if not isinstance(turn_index, int):
+                continue
+            if block.kind == "tool_exchange":
+                exchange_index = block.metadata.get("exchange_index")
+                if not isinstance(exchange_index, int):
+                    continue
+                memory_id = f"turn-{turn_index:04d}-exchange-{exchange_index:02d}-runtime"
+                if any(item.memory_id == memory_id for item in journal.exchanges):
+                    continue
+                assistant_payload = block.content.get("assistant_message")
+                assistant_message = (
+                    LLMMessage.from_history_dict(assistant_payload)
+                    if isinstance(assistant_payload, dict)
+                    else LLMMessage(role="assistant", content="")
+                )
+                raw_tool_messages = block.content.get("tool_messages")
+                tool_messages = (
+                    [LLMMessage.from_history_dict(item) for item in raw_tool_messages if isinstance(item, dict)]
+                    if isinstance(raw_tool_messages, list)
+                    else []
+                )
+                appended = journal.append_exchange(
+                    derive_tool_exchange_memory(
+                        thread_id=self.session_id,
+                        turn_index=turn_index,
+                        exchange_index=exchange_index,
+                        assistant_message=assistant_message,
+                        tool_messages=tool_messages,
+                        source_block_id=block.block_id,
+                        origin="recovery",
+                    )
+                )
+                changed = appended or changed
+                recovered = appended or recovered
+
+        conversation_blocks = [
+            block
+            for block in context_blocks
+            if block.kind == "conversation_turn" and isinstance(block.metadata.get("turn_index"), int)
+        ]
+        for block in sorted(conversation_blocks, key=lambda item: int(item.metadata["turn_index"])):
+            turn_index = int(block.metadata["turn_index"])
+            exchange_index = (
+                max(
+                    (
+                        int(candidate.metadata["exchange_index"])
+                        for candidate in context_blocks
+                        if candidate.kind == "tool_exchange"
+                        and candidate.metadata.get("turn_index") == turn_index
+                        and isinstance(candidate.metadata.get("exchange_index"), int)
+                    ),
+                    default=-1,
+                )
+                + 1
+            )
+            final_memory_id = f"turn-{turn_index:04d}-final-response"
+            assistant_content = self._message_content(block.content.get("assistant_message"))
+            user_intent = self._message_content(block.content.get("user_message"))
+            if not any(item.memory_id == final_memory_id for item in journal.exchanges):
+                appended = journal.append_exchange(
+                    derive_final_response_memory(
+                        thread_id=self.session_id,
+                        turn_index=turn_index,
+                        exchange_index=exchange_index,
+                        assistant_content=assistant_content,
+                        source_block_id=block.block_id,
+                        origin="recovery",
+                    )
+                )
+                changed = appended or changed
+                recovered = appended or recovered
+
+            if journal.turn_for_index(turn_index) is not None:
+                continue
+            exchanges = journal.exchanges_for_turn(turn_index)
+            previous_view = journal.session_view
+            fallback = build_fallback_turn_memory(
+                thread_id=self.session_id,
+                turn_index=turn_index,
+                user_intent=user_intent,
+                assistant_outcome=assistant_content,
+                exchanges=exchanges,
+                source_block_ids=[
+                    candidate.block_id
+                    for candidate in context_blocks
+                    if candidate.metadata.get("turn_index") == turn_index
+                ],
+                previous_active_task=previous_view.active_task if previous_view is not None else None,
+                origin="recovery",
+            )
+            committed = journal.commit_turn(
+                fallback,
+                max_session_items=max_session_items,
+                max_recent_outcomes=max_recent_outcomes,
+            )
+            changed = committed or changed
+            recovered = committed or recovered
+
+        if not changed:
+            return False
+        self._save_memory_transaction(journal)
+        log = logger.warning if recovered else logger.info
+        log(
+            "Recovered incomplete incremental memory journal"
+            if recovered
+            else "Updated incremental memory view policy",
+            extra={
+                "session_id": self.session_id,
+                "exchange_count": len(journal.exchanges),
+                "turn_count": len(journal.turns),
+            },
+        )
+        return True
 
     def get_thread_state(self) -> ThreadState:
         return ThreadState.from_session_state(self.state, thread_id=self.session_id or "default")
@@ -216,10 +415,16 @@ class SessionManager:
     def compact_history(self, *, max_active_tokens: int) -> ThreadState:
         # Compaction does not rewrite history; it only updates which blocks are
         # considered active versus overflow for prompt construction.
+        state_before = deepcopy(self.state)
         thread_state = self.get_thread_state()
         compacted = HistoryCompactor(CompactionPolicy(max_active_tokens=max_active_tokens)).compact(thread_state)
-        self.state["active_block_ids"] = [block.block_id for block in compacted.active_blocks]
-        self.state["overflow_block_ids"] = [block.block_id for block in compacted.overflow_blocks]
+        try:
+            self.state["active_block_ids"] = [block.block_id for block in compacted.active_blocks]
+            self.state["overflow_block_ids"] = [block.block_id for block in compacted.overflow_blocks]
+            self._save()
+        except Exception:
+            self.state = state_before
+            raise
         logger.debug(
             "Compacted thread history",
             extra={
@@ -228,7 +433,6 @@ class SessionManager:
                 "max_active_tokens": max_active_tokens,
             },
         )
-        self._save()
         return compacted
 
     def reset(self) -> None:
@@ -260,6 +464,59 @@ class SessionManager:
         meta["schema_version"] = SESSION_SCHEMA_VERSION
         meta["updated_at"] = utc_now_iso()
         self.repo.save(self.session_id, self.state)
+
+    def _commit_context_block_with_exchange(
+        self,
+        *,
+        block: ContextBlock,
+        memory: ExchangeMemory,
+    ) -> bool:
+        state_before = deepcopy(self.state)
+        try:
+            blocks = self.get_context_blocks()
+            existing_block = next((item for item in blocks if item.block_id == block.block_id), None)
+            block_changed = existing_block is None
+            if existing_block is not None and existing_block.to_dict() != block.to_dict():
+                raise ValueError(f"Context block id already exists with different content: {block.block_id}")
+            if block_changed:
+                blocks.append(block)
+
+            journal = self.get_memory_journal()
+            memory_changed = journal.append_exchange(memory)
+            if not block_changed and not memory_changed:
+                return False
+
+            self._store_context_blocks(blocks)
+            self.state["active_block_ids"] = []
+            self.state["overflow_block_ids"] = []
+            self.state["memory"] = journal.to_dict()
+            self._save()
+        except Exception:
+            self.state = state_before
+            raise
+        logger.debug(
+            "Persisted atomic context and exchange memory",
+            extra={"block_id": block.block_id, "memory_id": memory.memory_id},
+        )
+        return True
+
+    def _save_memory_transaction(self, journal: IncrementalMemoryJournal) -> None:
+        state_before = deepcopy(self.state)
+        try:
+            self.state["memory"] = journal.to_dict()
+            self._save()
+        except Exception:
+            self.state = state_before
+            raise
+
+    @staticmethod
+    def _message_content(payload: object) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        content = payload.get("content")
+        if isinstance(content, str):
+            return content
+        return "" if content is None else str(content)
 
     def _coerce_context_block(self, block: ContextBlock | dict[str, Any]) -> ContextBlock | None:
         return block if isinstance(block, ContextBlock) else ContextBlock.from_dict(block)

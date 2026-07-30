@@ -39,8 +39,7 @@ class ModelCaller(Protocol):
         *,
         messages: list[LLMMessage],
         options: LLMCallOptions | None = None,
-    ) -> LLMCompletionResult:
-        ...
+    ) -> LLMCompletionResult: ...
 
 
 class FinalModelCaller(Protocol):
@@ -49,8 +48,7 @@ class FinalModelCaller(Protocol):
         *,
         messages: list[LLMMessage],
         options: LLMCallOptions | None = None,
-    ) -> LLMCompletionResult:
-        ...
+    ) -> LLMCompletionResult: ...
 
 
 class ToolExecutor(Protocol):
@@ -67,23 +65,35 @@ class ToolExecutor(Protocol):
         assistant_message: LLMMessage,
         max_tool_calls: int,
         pending_metadata_extra: dict[str, Any] | None = None,
-    ) -> ToolExecutionStepResult:
-        ...
+    ) -> ToolExecutionStepResult: ...
 
 
 class ConversationPersister(Protocol):
-    def __call__(self, *, turn_index: int, user_input: str, assistant_content: str) -> None:
-        ...
+    def __call__(self, *, turn_index: int, user_input: str, assistant_content: str) -> None: ...
 
 
 class MemoryRefresher(Protocol):
-    def __call__(self, *, turn_index: int) -> None:
-        ...
+    def __call__(
+        self,
+        *,
+        turn_index: int,
+        controller_state: dict[str, Any] | None = None,
+    ) -> None: ...
+
+
+class ExchangeReflectionRecorder(Protocol):
+    def __call__(
+        self,
+        *,
+        turn_index: int,
+        exchange_index: int,
+        reflection: StepReflection,
+        relevant_artifacts: list[str],
+    ) -> None: ...
 
 
 class ProviderFailureHandler(Protocol):
-    def __call__(self, *, error: LLMProviderError, user_input: str, turn_index: int) -> AgentTurnResult:
-        ...
+    def __call__(self, *, error: LLMProviderError, user_input: str, turn_index: int) -> AgentTurnResult: ...
 
 
 class TraceRecorder(Protocol):
@@ -95,8 +105,7 @@ class TraceRecorder(Protocol):
         iteration: int | None = None,
         payload: dict[str, Any] | None = None,
         related_tool_call_id: str | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 INVESTIGATION_STATE_MESSAGE_PREFIX = "Investigation controller state:"
@@ -109,8 +118,7 @@ def with_investigation_guidance(
     prompt_set: InvestigationPromptSet | None = None,
 ) -> list[LLMMessage]:
     if any(
-        message.role == "system" and message.content.startswith(f"Run mode: {options.mode}.")
-        for message in messages
+        message.role == "system" and message.content.startswith(f"Run mode: {options.mode}.") for message in messages
     ):
         return list(messages)
 
@@ -122,6 +130,7 @@ def with_investigation_guidance(
     if messages and messages[-1].role == "user":
         return [*messages[:-1], guidance, messages[-1]]
     return [*messages, guidance]
+
 
 class InvestigationController:
     """Bounded, domain-agnostic investigation loop.
@@ -141,6 +150,7 @@ class InvestigationController:
         execute_tool_calls_once: ToolExecutor,
         persist_conversation_turn_once: ConversationPersister,
         refresh_memory_after_turn: MemoryRefresher,
+        record_exchange_reflection: ExchangeReflectionRecorder,
         handle_provider_failure: ProviderFailureHandler,
         record_event: TraceRecorder | None = None,
         prompt_set: InvestigationPromptSet | None = None,
@@ -152,6 +162,7 @@ class InvestigationController:
         self.execute_tool_calls_once = execute_tool_calls_once
         self.persist_conversation_turn_once = persist_conversation_turn_once
         self.refresh_memory_after_turn = refresh_memory_after_turn
+        self.record_exchange_reflection = record_exchange_reflection
         self.handle_provider_failure = handle_provider_failure
         self.record_event = record_event
         self.prompt_set = prompt_set or DEFAULT_INVESTIGATION_PROMPTS
@@ -361,8 +372,7 @@ class InvestigationController:
                     "content_length": len(llm_response.content),
                     "tool_call_count": len(llm_response.tool_calls),
                     "tool_calls": [
-                        {"id": tool_call.id, "name": tool_call.name}
-                        for tool_call in llm_response.tool_calls
+                        {"id": tool_call.id, "name": tool_call.name} for tool_call in llm_response.tool_calls
                     ],
                 },
             )
@@ -390,8 +400,10 @@ class InvestigationController:
                 )
 
             artifact_runtime = active_tool_artifact_runtime()
-            only_internal_calls = bool(assistant_message.tool_calls) and artifact_runtime is not None and all(
-                artifact_runtime.is_internal_tool(tool_call.name) for tool_call in assistant_message.tool_calls
+            only_internal_calls = (
+                bool(assistant_message.tool_calls)
+                and artifact_runtime is not None
+                and all(artifact_runtime.is_internal_tool(tool_call.name) for tool_call in assistant_message.tool_calls)
             )
             if tool_calls_used >= options.max_tool_calls and not only_internal_calls:
                 return self._complete_with_budget_answer(
@@ -520,7 +532,9 @@ class InvestigationController:
                 )
             if exc.kind != "budget_exhausted":
                 raise
-            state.risk_notes.append("The latest tool results could not be synthesized because the LLM budget was exhausted.")
+            state.risk_notes.append(
+                "The latest tool results could not be synthesized because the LLM budget was exhausted."
+            )
             return (
                 self._complete_with_budget_answer(
                     user_input=user_input,
@@ -565,6 +579,18 @@ class InvestigationController:
                 else []
             )
             state.metadata["tool_artifact_ids"] = list(dict.fromkeys([*normalized_existing, *artifact_ids]))
+        try:
+            self.record_exchange_reflection(
+                turn_index=turn_index,
+                exchange_index=tool_step.exchange_index,
+                reflection=reflection,
+                relevant_artifacts=artifact_ids,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist investigation reflection memory",
+                extra={"error_preview": safe_preview(str(exc), limit=200)},
+            )
         if state.progress_fingerprint() == previous_fingerprint:
             no_progress_iterations += 1
         else:
@@ -920,7 +946,10 @@ class InvestigationController:
             user_input=user_input,
             assistant_content=final_content,
         )
-        self.refresh_memory_after_turn(turn_index=turn_index)
+        self.refresh_memory_after_turn(
+            turn_index=turn_index,
+            controller_state=state.compact_summary(),
+        )
         return AgentTurnResult(
             status="completed",
             content=final_content,

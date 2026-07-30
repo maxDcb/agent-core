@@ -118,6 +118,36 @@ repository.
 - `DomainHooks` let applications add domain prompt blocks and memory payloads
   without adding domain logic to the core package.
 
+## Incremental Conversation Memory
+
+Conversation memory is committed as an append-only journal instead of being
+re-summarized from the full thread:
+
+- every completed assistant/tool exchange produces an `ExchangeMemory`;
+- investigation reflections are reused as structured exchange-memory events;
+- one bounded `TurnMemory` delta is synthesized from the current turn's ordered
+  events after the final answer;
+- `SessionView` is a deterministic, bounded projection of committed turn
+  deltas and is rebuilt from the journal when its generation is inconsistent.
+
+The turn-memory synthesizer never receives the complete conversation or an
+overflow backlog. A synthesis failure commits a deterministic fallback, so it
+cannot block the user-visible answer or leave the same historical backlog to be
+retried indefinitely. If execution stops after the raw conversation block is
+saved but before its memory commit, the next prompt build reconstructs the
+missing exchange and turn records without an LLM call.
+
+`CoreSettings.turn_memory_synthesis_prompt` customizes the single post-turn
+memory call. `memory_max_turn_input_chars`, `memory_max_session_items`, and
+`memory_max_recent_outcomes` bound the synthesis projection and materialized
+view. The complete turn journal remains persisted even when older items leave
+the bounded `SessionView`.
+
+Domain packages can implement `DomainHooks.extend_turn_memory_payload()` and
+`DomainHooks.turn_memory_extensions_template()` to add grounded, typed fields
+to each turn delta. Headless structured tasks and application pipelines do not
+use this conversation journal.
+
 ## Run Modes
 
 The default mode is `direct`, which preserves the ordinary assistant/tool loop.

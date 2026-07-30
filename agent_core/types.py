@@ -21,15 +21,14 @@ class SessionState(TypedDict):
     context_blocks: list[dict[str, Any]]
     active_block_ids: list[str]
     overflow_block_ids: list[str]
-    summary: object | None
-    task_state: object | None
+    memory: dict[str, Any]
     tool_history: list[dict[str, Any]]
     domain_state: dict[str, Any]
     meta: dict[str, Any]
     execution_scope: NotRequired[dict[str, Any]]
 
 
-SESSION_SCHEMA_VERSION = 4
+SESSION_SCHEMA_VERSION = 5
 
 
 def utc_now_iso() -> str:
@@ -41,8 +40,36 @@ def build_empty_session_state(*, session_id: str = "default", storage_backend: s
         "context_blocks": [],
         "active_block_ids": [],
         "overflow_block_ids": [],
-        "summary": None,
-        "task_state": None,
+        "memory": {
+            "schema_version": "1",
+            "thread_id": session_id,
+            "exchanges": [],
+            "turns": [],
+            "view_policy": {
+                "max_session_items": 100,
+                "max_recent_outcomes": 12,
+            },
+            "session_view": {
+                "thread_id": session_id,
+                "generation": 0,
+                "through_turn_index": -1,
+                "through_turn_memory_id": None,
+                "updated_at": utc_now_iso(),
+                "active_task": None,
+                "confirmed_facts": [],
+                "open_hypotheses": [],
+                "rejected_hypotheses": [],
+                "open_questions": [],
+                "decisions": [],
+                "completed_actions": [],
+                "next_actions": [],
+                "relevant_artifacts": [],
+                "risk_notes": [],
+                "recent_outcomes": [],
+                "domain_extensions": {},
+                "schema_version": "1",
+            },
+        },
         "tool_history": [],
         "domain_state": {},
         "meta": {

@@ -16,23 +16,7 @@ from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
-from tests.run_helpers import run_turn
-
-
-def task_state_payload() -> dict[str, Any]:
-    return {
-        "run_id": "run-0000",
-        "objective": "Trace test",
-        "scope": [],
-        "source_code_locations": [],
-        "domain_extensions": {},
-        "open_questions": [],
-        "next_action": None,
-        "stop_conditions": [],
-        "constraints": [],
-        "relevant_artifacts": [],
-        "status": "active",
-    }
+from tests.run_helpers import run_turn, turn_memory_payload
 
 
 def reflection_payload() -> dict[str, Any]:
@@ -75,7 +59,7 @@ class ScriptedProvider:
             return json.dumps(reflection_payload())
         if target == "investigation_decision":
             return json.dumps(decision_payload())
-        return json.dumps(task_state_payload())
+        return json.dumps(turn_memory_payload(objective="Trace test"))
 
 
 class EchoTool:
@@ -118,9 +102,7 @@ def build_orchestrator(tmp_path, provider: ScriptedProvider) -> AgentOrchestrato
         memory_model="fake",
         session_file=tmp_path / "session.json",
         base_system_prompt="system",
-        task_state_synthesis_prompt="task",
-        session_summary_synthesis_prompt="summary",
-        session_summary_merge_prompt="merge",
+        turn_memory_synthesis_prompt="memory",
         max_active_context_tokens=100000,
     )
     registry = ToolRegistry()
@@ -239,7 +221,8 @@ def test_investigation_run_persists_process_events_and_trace_id(tmp_path) -> Non
     provider = ScriptedProvider(chat=[tool_call(value="fact")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )

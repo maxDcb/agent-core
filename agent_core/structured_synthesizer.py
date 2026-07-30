@@ -31,10 +31,9 @@ class StructuredSynthesisRequest(Generic[T]):
 class StructuredSynthesizer:
     """Generic JSON synthesizer for structured memory objects.
 
-    The synthesizer does not know about TaskState or SessionSummary directly. It
-    only knows how to ask the LLM for a single JSON object that matches a caller
-    supplied output format, then validate that object through the caller's
-    parser.
+    The synthesizer does not know about domain memory models directly. It only
+    knows how to ask the LLM for one JSON object that matches a caller-supplied
+    output format, then validate it through the caller's parser.
     """
 
     def __init__(
@@ -127,10 +126,7 @@ class StructuredSynthesizer:
             parameters = signature(method).parameters.values()
         except (TypeError, ValueError):
             return True
-        return any(
-            parameter.kind == Parameter.VAR_KEYWORD or parameter.name == "options"
-            for parameter in parameters
-        )
+        return any(parameter.kind == Parameter.VAR_KEYWORD or parameter.name == "options" for parameter in parameters)
 
     def _build_system_prompt(self, *, instructions: str, output_format: dict[str, Any]) -> str:
         return "\n\n".join(

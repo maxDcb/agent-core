@@ -21,23 +21,7 @@ from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import AuthorizationResult, ToolResult
-from tests.run_helpers import resume_turn, run_turn
-
-
-def task_state_payload() -> dict[str, Any]:
-    return {
-        "run_id": "run-0000",
-        "objective": "Test objective",
-        "scope": [],
-        "source_code_locations": [],
-        "domain_extensions": {},
-        "open_questions": [],
-        "next_action": None,
-        "stop_conditions": [],
-        "constraints": [],
-        "relevant_artifacts": [],
-        "status": "active",
-    }
+from tests.run_helpers import resume_turn, run_turn, turn_memory_payload
 
 
 def reflection_payload(
@@ -133,7 +117,7 @@ class ScriptedProvider:
             return json.dumps(self.decisions.pop(0))
         if target == "investigation_final_critique":
             return json.dumps(self.critiques.pop(0))
-        return json.dumps(task_state_payload())
+        return json.dumps(turn_memory_payload())
 
 
 class EchoTool:
@@ -210,9 +194,7 @@ def build_orchestrator(
         memory_model="fake",
         session_file=tmp_path / "session.json",
         base_system_prompt="system",
-        task_state_synthesis_prompt="task",
-        session_summary_synthesis_prompt="summary",
-        session_summary_merge_prompt="merge",
+        turn_memory_synthesis_prompt="memory",
         max_active_context_tokens=100000,
     )
     registry = ToolRegistry()
@@ -304,7 +286,8 @@ def test_investigation_no_tool_no_critique_returns_final(tmp_path) -> None:
     provider = ScriptedProvider(chat=[LLMCompletionResult(content="plain final")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "answer",
         options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
     )
@@ -333,7 +316,8 @@ def test_investigation_json_schema_final_output_uses_last_no_tool_turn(tmp_path)
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "answer as schema",
         options=RunOptions.investigate(
             max_iterations=1,
@@ -379,7 +363,8 @@ def test_investigation_json_schema_final_output_is_validated_locally(tmp_path) -
     orchestrator = build_orchestrator(tmp_path, provider)
 
     with pytest.raises(LLMProviderError) as captured:
-        run_turn(orchestrator,
+        run_turn(
+            orchestrator,
             "answer as schema",
             options=RunOptions.investigate(
                 max_iterations=1,
@@ -413,7 +398,8 @@ def test_internal_synthesis_recovery_option_recovers_invalid_initial_plan_json(t
     provider = InvalidInitialPlanProvider(chat=[LLMCompletionResult(content="final after internal synthesis failure")])
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "recover from invalid initial plan",
         options=RunOptions.investigate(
             max_iterations=1,
@@ -448,7 +434,8 @@ def test_domain_hooks_customize_investigation_prompts_and_guidance(tmp_path) -> 
     hooks = CustomInvestigationHooks()
     orchestrator = build_orchestrator(tmp_path, provider, domain_hooks=hooks)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate with domain hooks",
         options=RunOptions.investigate(max_iterations=1),
     )
@@ -456,9 +443,7 @@ def test_domain_hooks_customize_investigation_prompts_and_guidance(tmp_path) -> 
     assert result.content == "domain-guided final"
     assert hooks.modes == ["investigate"]
     assert any("Domain investigation guidance" in prompt for prompt in provider.text_prompts)
-    first_chat_system_messages = [
-        message.content for message in provider.chat_messages[0] if message.role == "system"
-    ]
+    first_chat_system_messages = [message.content for message in provider.chat_messages[0] if message.role == "system"]
     assert any("Domain investigation guidance" in content for content in first_chat_system_messages)
     assert sum(content.startswith("Run mode: investigate.") for content in first_chat_system_messages) == 1
     assert sum(content.startswith(INVESTIGATION_STATE_MESSAGE_PREFIX) for content in first_chat_system_messages) == 1
@@ -490,7 +475,8 @@ def test_investigation_internal_synthesis_can_use_dedicated_memory_provider(tmp_
     )
     orchestrator = build_orchestrator(tmp_path, primary_provider, memory_provider=memory_provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate with memory provider",
         options=RunOptions.investigate(max_iterations=1),
     )
@@ -517,7 +503,8 @@ def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_pa
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )
@@ -526,6 +513,15 @@ def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_pa
     assert "need second source" in result.content
     assert result.metadata["stop_reason"] == "enough evidence"
     assert result.metadata["investigation_state"]["facts"] == ["echo returned fact"]
+    journal = orchestrator.session_manager.get_memory_journal()
+    assert [item.kind for item in journal.exchanges] == [
+        "tool_exchange",
+        "reflection",
+        "final_response",
+    ]
+    assert journal.turns[0].confirmed_facts == ["echo returned fact"]
+    assert journal.session_view is not None
+    assert journal.session_view.confirmed_facts == ["echo returned fact"]
 
 
 def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) -> None:
@@ -554,7 +550,8 @@ def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) ->
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate browser target",
         options=RunOptions(mode="investigate", max_iterations=3, require_initial_plan=False),
     )
@@ -589,7 +586,8 @@ def test_investigation_does_not_finalize_when_reflection_requires_continuation(t
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
     )
@@ -613,7 +611,8 @@ def test_investigation_stops_at_max_iterations_with_budget_answer(tmp_path) -> N
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=1, require_initial_plan=False),
     )
@@ -631,7 +630,8 @@ def test_investigation_stops_after_no_progress(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(
             mode="investigate",
@@ -652,7 +652,8 @@ def test_investigation_stops_at_max_tool_calls(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=3, max_tool_calls=1, require_initial_plan=False),
     )
@@ -668,7 +669,8 @@ def test_investigation_returns_ask_user_question(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )
@@ -688,7 +690,8 @@ def test_investigation_policy_denial_can_block_safely(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider, policy_engine=PolicyEngine(validators={"echo": deny}))
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "investigate",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )
@@ -704,7 +707,8 @@ def test_final_critique_approved_returns_draft(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "answer",
         options=RunOptions(
             mode="investigate",
@@ -728,7 +732,8 @@ def test_final_critique_rejected_continues_when_budget_remains(tmp_path) -> None
     )
     orchestrator = build_orchestrator(tmp_path, provider)
 
-    result = run_turn(orchestrator,
+    result = run_turn(
+        orchestrator,
         "answer",
         options=RunOptions(
             mode="investigate",
@@ -759,7 +764,8 @@ def test_investigation_pending_resume_continues_same_mode(tmp_path) -> None:
     )
     orchestrator = build_orchestrator(tmp_path, provider, pending=True)
 
-    pending = run_turn(orchestrator,
+    pending = run_turn(
+        orchestrator,
         "start pending",
         options=RunOptions(mode="investigate", max_iterations=2, require_initial_plan=False),
     )

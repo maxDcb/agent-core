@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+- Replaced overflow-driven conversation summaries and separately synthesized
+  task state with append-only `ExchangeMemory` and `TurnMemory` journals plus a
+  deterministic, rebuildable `SessionView`.
+- Reduced post-turn conversation memory to at most one bounded model call over
+  the current turn, with deterministic fallback and interrupted-commit
+  recovery that never blocks the user-visible answer.
+- Reused investigation step reflections as grounded memory events and removed
+  the obsolete summary marker, delta/merge prompts, and legacy memory models.
 - Added optional run-level `LLMBudget` enforcement and observation across
   conversation, investigation, structured-task, finalization and memory calls.
 - Persisted LLM budget usage in pending conversation state and structured-task

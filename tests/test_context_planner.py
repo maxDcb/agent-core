@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import pytest
@@ -25,7 +26,7 @@ from agent_core.structured_tasks import StructuredTaskCheckpoint, StructuredTask
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
-from tests.run_helpers import execution_context, resume_turn, run_turn
+from tests.run_helpers import execution_context, resume_turn, run_turn, turn_memory_payload
 
 
 def _tool_exchange() -> list[LLMMessage]:
@@ -356,14 +357,7 @@ class _PendingThenFinalProvider:
         return LLMCompletionResult(content="final")
 
     def complete_text(self, **kwargs: Any) -> LLMCompletionResult:
-        return LLMCompletionResult(
-            content=(
-                '{"run_id":"run-0000","objective":"test","scope":[],'
-                '"source_code_locations":[],"open_questions":[],"next_action":null,'
-                '"stop_conditions":[],"constraints":[],"relevant_artifacts":[],'
-                '"status":"active","domain_extensions":{}}'
-            )
-        )
+        return LLMCompletionResult(content=json.dumps(turn_memory_payload(objective="test")))
 
 
 def test_pending_conversation_resume_restores_context_usage(tmp_path) -> None:
@@ -373,7 +367,7 @@ def test_pending_conversation_resume_restores_context_usage(tmp_path) -> None:
         memory_model="fake",
         session_file=tmp_path / "session.json",
         base_system_prompt="system",
-        task_state_synthesis_prompt="task state",
+        turn_memory_synthesis_prompt="memory",
         llm_context_policy=policy,
     )
     provider = _PendingThenFinalProvider()
