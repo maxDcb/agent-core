@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 from uuid import uuid4
 
-from agent_core.conversation_state import ConversationStateView
+from agent_core.conversation_state import ConversationStateView, TurnMemoryContextView
 from agent_core.llm.base import LLMCallRecord, capture_llm_calls
 from agent_core.llm_budget import LLMBudgetExceededError
 from agent_core.orchestrator import AgentOrchestrator
@@ -27,6 +27,7 @@ __all__ = [
     "AgentTurnResult",
     "ConversationAgent",
     "ConversationStateView",
+    "TurnMemoryContextView",
     "JsonFileSessionStore",
     "SessionManager",
     "SessionRepository",
