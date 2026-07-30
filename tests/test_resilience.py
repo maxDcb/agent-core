@@ -78,7 +78,7 @@ def test_context_block_round_trip_is_stable(
     token_estimates=st.lists(st.integers(min_value=1, max_value=200), min_size=1, max_size=30),
     budget=st.integers(min_value=1, max_value=1000),
 )
-def test_history_compaction_preserves_every_atomic_turn_and_keeps_latest_active(
+def test_history_compaction_preserves_a_contiguous_suffix_and_keeps_latest_active(
     token_estimates: list[int],
     budget: int,
 ) -> None:
@@ -101,5 +101,27 @@ def test_history_compaction_preserves_every_atomic_turn_and_keeps_latest_active(
     assert active_ids.isdisjoint(overflow_ids)
     assert active_ids | overflow_ids == {block.block_id for block in blocks}
     assert blocks[-1].block_id in active_ids
+    assert compacted.overflow_blocks + compacted.active_blocks == blocks
     active_tokens = sum(block.token_estimate for block in compacted.active_blocks)
     assert active_tokens <= budget or compacted.active_blocks == [blocks[-1]]
+
+
+def test_history_compaction_stops_at_first_group_that_does_not_fit() -> None:
+    blocks = [
+        ContextBlock(
+            block_id=f"turn-{index}",
+            kind="conversation_turn",
+            content={},
+            token_estimate=token_estimate,
+            pinned=index == 0,
+            metadata={"turn_index": index},
+        )
+        for index, token_estimate in enumerate([10, 80, 10, 10])
+    ]
+
+    compacted = HistoryCompactor(CompactionPolicy(max_active_tokens=30)).compact(
+        ThreadState(thread_id="chronological-test", context_blocks=blocks)
+    )
+
+    assert compacted.overflow_blocks == blocks[:2]
+    assert compacted.active_blocks == blocks[2:]

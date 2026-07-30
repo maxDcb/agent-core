@@ -33,14 +33,26 @@ def _llm_failure_stop_reason(error: LLMProviderError) -> str:
     return "provider_failure"
 
 
+def _is_raw_json_document(content: str) -> bool:
+    candidate = content.strip()
+    if candidate.startswith("```") and candidate.endswith("```"):
+        lines = candidate.splitlines()
+        if len(lines) >= 3 and lines[0].strip().lower() in {"```", "```json"}:
+            candidate = "\n".join(lines[1:-1]).strip()
+    try:
+        parsed = json.loads(candidate)
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(parsed, (dict, list))
+
+
 class ModelCaller(Protocol):
     def __call__(
         self,
         *,
         messages: list[LLMMessage],
         options: LLMCallOptions | None = None,
-    ) -> LLMCompletionResult:
-        ...
+    ) -> LLMCompletionResult: ...
 
 
 class FinalModelCaller(Protocol):
@@ -49,8 +61,7 @@ class FinalModelCaller(Protocol):
         *,
         messages: list[LLMMessage],
         options: LLMCallOptions | None = None,
-    ) -> LLMCompletionResult:
-        ...
+    ) -> LLMCompletionResult: ...
 
 
 class ToolExecutor(Protocol):
@@ -67,23 +78,35 @@ class ToolExecutor(Protocol):
         assistant_message: LLMMessage,
         max_tool_calls: int,
         pending_metadata_extra: dict[str, Any] | None = None,
-    ) -> ToolExecutionStepResult:
-        ...
+    ) -> ToolExecutionStepResult: ...
 
 
 class ConversationPersister(Protocol):
-    def __call__(self, *, turn_index: int, user_input: str, assistant_content: str) -> None:
-        ...
+    def __call__(self, *, turn_index: int, user_input: str, assistant_content: str) -> None: ...
 
 
 class MemoryRefresher(Protocol):
-    def __call__(self, *, turn_index: int) -> None:
-        ...
+    def __call__(
+        self,
+        *,
+        turn_index: int,
+        controller_state: dict[str, Any] | None = None,
+    ) -> None: ...
+
+
+class ExchangeReflectionRecorder(Protocol):
+    def __call__(
+        self,
+        *,
+        turn_index: int,
+        exchange_index: int,
+        reflection: StepReflection,
+        relevant_artifacts: list[str],
+    ) -> None: ...
 
 
 class ProviderFailureHandler(Protocol):
-    def __call__(self, *, error: LLMProviderError, user_input: str, turn_index: int) -> AgentTurnResult:
-        ...
+    def __call__(self, *, error: LLMProviderError, user_input: str, turn_index: int) -> AgentTurnResult: ...
 
 
 class TraceRecorder(Protocol):
@@ -95,8 +118,7 @@ class TraceRecorder(Protocol):
         iteration: int | None = None,
         payload: dict[str, Any] | None = None,
         related_tool_call_id: str | None = None,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 INVESTIGATION_STATE_MESSAGE_PREFIX = "Investigation controller state:"
@@ -109,8 +131,7 @@ def with_investigation_guidance(
     prompt_set: InvestigationPromptSet | None = None,
 ) -> list[LLMMessage]:
     if any(
-        message.role == "system" and message.content.startswith(f"Run mode: {options.mode}.")
-        for message in messages
+        message.role == "system" and message.content.startswith(f"Run mode: {options.mode}.") for message in messages
     ):
         return list(messages)
 
@@ -122,6 +143,7 @@ def with_investigation_guidance(
     if messages and messages[-1].role == "user":
         return [*messages[:-1], guidance, messages[-1]]
     return [*messages, guidance]
+
 
 class InvestigationController:
     """Bounded, domain-agnostic investigation loop.
@@ -141,6 +163,7 @@ class InvestigationController:
         execute_tool_calls_once: ToolExecutor,
         persist_conversation_turn_once: ConversationPersister,
         refresh_memory_after_turn: MemoryRefresher,
+        record_exchange_reflection: ExchangeReflectionRecorder,
         handle_provider_failure: ProviderFailureHandler,
         record_event: TraceRecorder | None = None,
         prompt_set: InvestigationPromptSet | None = None,
@@ -152,6 +175,7 @@ class InvestigationController:
         self.execute_tool_calls_once = execute_tool_calls_once
         self.persist_conversation_turn_once = persist_conversation_turn_once
         self.refresh_memory_after_turn = refresh_memory_after_turn
+        self.record_exchange_reflection = record_exchange_reflection
         self.handle_provider_failure = handle_provider_failure
         self.record_event = record_event
         self.prompt_set = prompt_set or DEFAULT_INVESTIGATION_PROMPTS
@@ -361,8 +385,7 @@ class InvestigationController:
                     "content_length": len(llm_response.content),
                     "tool_call_count": len(llm_response.tool_calls),
                     "tool_calls": [
-                        {"id": tool_call.id, "name": tool_call.name}
-                        for tool_call in llm_response.tool_calls
+                        {"id": tool_call.id, "name": tool_call.name} for tool_call in llm_response.tool_calls
                     ],
                 },
             )
@@ -390,8 +413,10 @@ class InvestigationController:
                 )
 
             artifact_runtime = active_tool_artifact_runtime()
-            only_internal_calls = bool(assistant_message.tool_calls) and artifact_runtime is not None and all(
-                artifact_runtime.is_internal_tool(tool_call.name) for tool_call in assistant_message.tool_calls
+            only_internal_calls = (
+                bool(assistant_message.tool_calls)
+                and artifact_runtime is not None
+                and all(artifact_runtime.is_internal_tool(tool_call.name) for tool_call in assistant_message.tool_calls)
             )
             if tool_calls_used >= options.max_tool_calls and not only_internal_calls:
                 return self._complete_with_budget_answer(
@@ -520,7 +545,9 @@ class InvestigationController:
                 )
             if exc.kind != "budget_exhausted":
                 raise
-            state.risk_notes.append("The latest tool results could not be synthesized because the LLM budget was exhausted.")
+            state.risk_notes.append(
+                "The latest tool results could not be synthesized because the LLM budget was exhausted."
+            )
             return (
                 self._complete_with_budget_answer(
                     user_input=user_input,
@@ -565,6 +592,18 @@ class InvestigationController:
                 else []
             )
             state.metadata["tool_artifact_ids"] = list(dict.fromkeys([*normalized_existing, *artifact_ids]))
+        try:
+            self.record_exchange_reflection(
+                turn_index=turn_index,
+                exchange_index=tool_step.exchange_index,
+                reflection=reflection,
+                relevant_artifacts=artifact_ids,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to persist investigation reflection memory",
+                extra={"error_preview": safe_preview(str(exc), limit=200)},
+            )
         if state.progress_fingerprint() == previous_fingerprint:
             no_progress_iterations += 1
         else:
@@ -645,11 +684,12 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
-                    content=self._answer_from_state(state=state, final=not reflection.should_continue),
+                    content="",
                     messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason=reflection.stop_reason or "decision_synthesis_unavailable",
+                    fallback_complete=not reflection.should_continue,
                 ),
                 no_progress_iterations,
             )
@@ -673,6 +713,7 @@ class InvestigationController:
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="ask_user",
+                    fallback_complete=False,
                 ),
                 no_progress_iterations,
             )
@@ -689,6 +730,7 @@ class InvestigationController:
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason="blocked",
+                    fallback_complete=False,
                 ),
                 no_progress_iterations,
             )
@@ -712,11 +754,12 @@ class InvestigationController:
                     turn_index=turn_index,
                     options=options,
                     state=state,
-                    content=self._answer_from_state(state=state, final=True),
+                    content="",
                     messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_step.tool_calls_used,
                     stop_reason=decision.reason_summary or reflection.stop_reason or "final",
+                    fallback_complete=True,
                 ),
                 no_progress_iterations,
             )
@@ -780,6 +823,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final",
+                fallback_complete=True,
             )
 
         self._record_event(
@@ -803,6 +847,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason=_llm_failure_stop_reason(exc),
+                fallback_complete=True,
             )
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
@@ -830,6 +875,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final_critique_unavailable",
+                fallback_complete=True,
             )
         self._record_event(
             event_type="final_critique_completed",
@@ -848,6 +894,7 @@ class InvestigationController:
                 iterations_used=iterations_used,
                 tool_calls_used=tool_calls_used,
                 stop_reason="final_critique_approved",
+                fallback_complete=True,
             )
 
         state.apply_critique(critique)
@@ -893,9 +940,9 @@ class InvestigationController:
         iterations_used: int,
         tool_calls_used: int,
         stop_reason: str,
+        fallback_complete: bool,
     ) -> AgentTurnResult:
         state.stop_reason = stop_reason
-        final_content = content
         final_metadata: dict[str, Any] = {}
         if options.final_output_mode == "json_schema":
             final_content, final_metadata = self._render_final_json_schema(
@@ -904,6 +951,16 @@ class InvestigationController:
                 options=options,
                 state=state,
                 stop_reason=stop_reason,
+            )
+        else:
+            final_content, final_metadata = self._render_final_text_with_fallback(
+                user_input=user_input,
+                content=content,
+                messages=messages,
+                options=options,
+                state=state,
+                stop_reason=stop_reason,
+                fallback_complete=fallback_complete,
             )
         self._record_event(
             event_type="investigation_completed",
@@ -920,7 +977,10 @@ class InvestigationController:
             user_input=user_input,
             assistant_content=final_content,
         )
-        self.refresh_memory_after_turn(turn_index=turn_index)
+        self.refresh_memory_after_turn(
+            turn_index=turn_index,
+            controller_state=state.compact_summary(),
+        )
         return AgentTurnResult(
             status="completed",
             content=final_content,
@@ -935,6 +995,119 @@ class InvestigationController:
                 **final_metadata,
             },
         )
+
+    def _render_final_text_with_fallback(
+        self,
+        *,
+        user_input: str,
+        content: str,
+        messages: list[LLMMessage],
+        options: RunOptions,
+        state: InvestigationState,
+        stop_reason: str,
+        fallback_complete: bool,
+    ) -> tuple[str, dict[str, Any]]:
+        self._record_event(
+            event_type="final_response_started",
+            summary="Conversational final response generation started",
+            payload={
+                "candidate_length": len(content),
+                "completion_status": "complete" if fallback_complete else "incomplete",
+            },
+        )
+        try:
+            final_content = self._render_final_text(
+                user_input=user_input,
+                content=content,
+                messages=messages,
+                options=options,
+                state=state,
+                stop_reason=stop_reason,
+                fallback_complete=fallback_complete,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Conversational final response generation failed; using deterministic fallback",
+                extra={
+                    "error_type": type(exc).__name__,
+                    "error_preview": safe_preview(str(exc), limit=200),
+                },
+            )
+            self._record_event(
+                event_type="final_response_fallback",
+                summary="Conversational final response generation failed; deterministic fallback used",
+                payload={
+                    "error_type": type(exc).__name__,
+                    "error_preview": safe_preview(str(exc), limit=200),
+                },
+            )
+            return self._answer_from_state(state=state, final=fallback_complete), {
+                "final_response_origin": "fallback",
+                "final_response_error_type": type(exc).__name__,
+            }
+
+        self._record_event(
+            event_type="final_response_completed",
+            summary="Conversational final response generation completed",
+            payload={"content_length": len(final_content)},
+        )
+        return final_content, {"final_response_origin": "model"}
+
+    def _render_final_text(
+        self,
+        *,
+        user_input: str,
+        content: str,
+        messages: list[LLMMessage],
+        options: RunOptions,
+        state: InvestigationState,
+        stop_reason: str,
+        fallback_complete: bool,
+    ) -> str:
+        payload = {
+            "original_user_request": user_input,
+            "candidate_answer": content.strip() or None,
+            "completion_status": "complete" if fallback_complete else "incomplete",
+            "stop_reason": stop_reason,
+            "investigation_state": state.to_dict(),
+        }
+        final_messages = [
+            *messages,
+            LLMMessage(role="system", content=self.prompt_set.final_response),
+            LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
+        ]
+        llm_response = self.call_final_model_once(
+            messages=final_messages,
+            options=LLMCallOptions(
+                reasoning_effort=options.reasoning_effort,
+                reasoning_summary=options.reasoning_summary,
+                response_format=None,
+                max_output_tokens=self.settings.llm_max_output_tokens,
+                metadata={
+                    **options.metadata,
+                    "mode": options.mode,
+                    "target": "investigation_final_response",
+                },
+            ),
+        )
+        if llm_response.tool_calls:
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The conversational final response unexpectedly requested tools.",
+                detail=f"tool_call_count={len(llm_response.tool_calls)}",
+            )
+        final_content = llm_response.content.strip()
+        if not final_content:
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The conversational final response was empty.",
+            )
+        if _is_raw_json_document(final_content):
+            raise LLMProviderError(
+                kind="response_error",
+                user_message="The conversational final response returned raw JSON.",
+            )
+        return final_content
 
     def _render_final_json_schema(
         self,
@@ -1034,11 +1207,12 @@ class InvestigationController:
             turn_index=turn_index,
             options=options,
             state=state,
-            content=self._answer_from_state(state=state, final=False),
+            content="",
             messages=messages,
             iterations_used=iterations_used,
             tool_calls_used=tool_calls_used,
             stop_reason=stop_reason,
+            fallback_complete=False,
         )
 
     def _synthesize_initial_plan(

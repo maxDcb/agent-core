@@ -7,14 +7,13 @@ from typing import Any
 
 from agent_core.llm.base import LLMMessage
 from agent_core.memory.context_block import ContextBlock, estimate_token_count
-from agent_core.memory.session_summary import SessionSummary
-from agent_core.memory.task_state import TaskState
+from agent_core.memory.journal import IncrementalMemoryJournal, SessionView
 
 
 def render_context_blocks_to_messages(blocks: list[ContextBlock]) -> list[LLMMessage]:
     """Project stored context blocks back into a flat chat transcript.
 
-    Summary-like blocks are emitted as system messages first. Conversation and
+    Memory-like blocks are emitted as system messages first. Conversation and
     tool-exchange blocks are then replayed in turn order so the provider sees a
     chronological transcript even though storage keeps richer grouped objects.
     """
@@ -23,17 +22,13 @@ def render_context_blocks_to_messages(blocks: list[ContextBlock]) -> list[LLMMes
     history_groups = _group_blocks_by_turn(blocks)
 
     for block in blocks:
-        if block.kind in {"summary", "task_state", "retrieved_memory"}:
+        if block.kind in {"memory_view", "retrieved_memory"}:
             rendered.extend(block.to_llm_messages())
 
     for group_blocks in history_groups.values():
         rendered.extend(_render_history_group(group_blocks))
 
     return rendered
-
-
-def render_context_blocks_to_history_dicts(blocks: list[ContextBlock]) -> list[dict[str, Any]]:
-    return [message.to_history_dict() for message in render_context_blocks_to_messages(blocks) if message.role != "system"]
 
 
 def group_context_blocks(blocks: list[ContextBlock]) -> list[list[ContextBlock]]:
@@ -47,16 +42,22 @@ class ThreadState:
     `context_blocks` is the canonical stored history. `active_blocks` and
     `overflow_blocks` are the compaction split used by the prompt stack:
     active blocks are eligible for immediate replay, overflow blocks are kept in
-    storage and may be summarized.
+    storage and remains available for audit or later retrieval.
     """
 
     thread_id: str
     context_blocks: list[ContextBlock] = field(default_factory=list)
-    summary: SessionSummary | None = None
-    task_state: TaskState | None = None
+    memory_journal: IncrementalMemoryJournal | None = None
     meta: dict[str, Any] = field(default_factory=dict)
     active_blocks: list[ContextBlock] = field(default_factory=list)
     overflow_blocks: list[ContextBlock] = field(default_factory=list)
+
+    @property
+    def session_view(self) -> SessionView:
+        journal = self.memory_journal
+        if journal is None or journal.session_view is None:
+            return SessionView.empty(thread_id=self.thread_id)
+        return journal.session_view
 
     @classmethod
     def from_session_state(cls, state: Mapping[str, Any], *, thread_id: str) -> ThreadState:
@@ -69,9 +70,10 @@ class ThreadState:
             else []
         )
 
-        last_block_id = context_blocks[-1].block_id if context_blocks else ""
-        summary = SessionSummary.from_any(state.get("summary"), thread_id=thread_id, covers_blocks_until=last_block_id)
-        task_state = TaskState.from_any(state.get("task_state"))
+        memory_journal = IncrementalMemoryJournal.from_any(
+            state.get("memory"),
+            thread_id=thread_id,
+        )
 
         meta = state.get("meta", {})
         if not isinstance(meta, dict):
@@ -86,8 +88,7 @@ class ThreadState:
         return cls(
             thread_id=thread_id,
             context_blocks=context_blocks,
-            summary=summary,
-            task_state=task_state,
+            memory_journal=memory_journal,
             meta=meta,
             active_blocks=active_blocks,
             overflow_blocks=overflow_blocks,
@@ -134,7 +135,7 @@ def _group_blocks_by_turn(blocks: list[ContextBlock]) -> OrderedDict[tuple[str, 
 
     groups: OrderedDict[tuple[str, str], list[ContextBlock]] = OrderedDict()
     for block in blocks:
-        if block.kind in {"summary", "task_state", "retrieved_memory"}:
+        if block.kind in {"memory_view", "retrieved_memory"}:
             continue
         turn_index = block.metadata.get("turn_index")
         if isinstance(turn_index, int):

@@ -9,8 +9,7 @@ from typing import Protocol
 
 from agent_core.logging_utils import get_logger
 from agent_core.memory.context_block import ContextBlock
-from agent_core.memory.session_summary import SessionSummary
-from agent_core.memory.task_state import TaskState
+from agent_core.memory.journal import IncrementalMemoryJournal
 from agent_core.run_trace import RunTrace
 from agent_core.types import SessionState, build_empty_session_state
 
@@ -20,26 +19,19 @@ logger = get_logger(__name__)
 class SessionStore(Protocol):
     storage_backend: str
 
-    def load(self, session_id: str) -> SessionState:
-        ...
+    def load(self, session_id: str) -> SessionState: ...
 
-    def save(self, session_id: str, state: SessionState) -> None:
-        ...
+    def save(self, session_id: str, state: SessionState) -> None: ...
 
-    def save_run_trace(self, session_id: str, trace_payload: dict[str, object]) -> None:
-        ...
+    def save_run_trace(self, session_id: str, trace_payload: dict[str, object]) -> None: ...
 
-    def load_run_trace(self, session_id: str, run_id: str) -> dict[str, object] | None:
-        ...
+    def load_run_trace(self, session_id: str, run_id: str) -> dict[str, object] | None: ...
 
-    def list_run_traces(self, session_id: str) -> list[dict[str, object]]:
-        ...
+    def list_run_traces(self, session_id: str) -> list[dict[str, object]]: ...
 
-    def list_session_ids(self) -> list[str]:
-        ...
+    def list_session_ids(self) -> list[str]: ...
 
-    def describe(self) -> dict[str, object]:
-        ...
+    def describe(self) -> dict[str, object]: ...
 
 
 class SessionRepository:
@@ -120,16 +112,10 @@ class JsonFileSessionStore:
                 extra={"session_file": str(session_file), "backup_path": str(backup_path)},
             )
             return build_empty_session_state(session_id=session_id, storage_backend=self.storage_backend)
-        normalized = self._normalize_state(state)
+        normalized = self._normalize_state(state, session_id=session_id)
         normalized_meta = normalized.setdefault("meta", {})
         normalized_meta["session_id"] = session_id
         normalized_meta["storage_backend"] = self.storage_backend
-        summary = SessionSummary.from_any(
-            normalized.get("summary"),
-            thread_id=session_id,
-            covers_blocks_until=normalized.get("context_blocks", [])[-1]["block_id"] if normalized.get("context_blocks") else "",
-        )
-        normalized["summary"] = summary.to_dict() if summary is not None else None
         logger.info(
             "Loaded session state",
             extra={
@@ -216,8 +202,11 @@ class JsonFileSessionStore:
             "default_session_file": str(self.default_session_file),
         }
 
-    def _normalize_state(self, state: object) -> SessionState:
-        normalized = build_empty_session_state(storage_backend=self.storage_backend)
+    def _normalize_state(self, state: object, *, session_id: str) -> SessionState:
+        normalized = build_empty_session_state(
+            session_id=session_id,
+            storage_backend=self.storage_backend,
+        )
         if not isinstance(state, dict):
             logger.info("Loaded session state is not a dictionary; falling back to empty state")
             return normalized
@@ -239,9 +228,7 @@ class JsonFileSessionStore:
         normalized_blocks: list[dict[str, object]] = []
         if isinstance(context_blocks, list):
             normalized_blocks = [
-                block.to_dict()
-                for item in context_blocks
-                if (block := ContextBlock.from_dict(item)) is not None
+                block.to_dict() for item in context_blocks if (block := ContextBlock.from_dict(item)) is not None
             ]
         elif "context_blocks" in state:
             logger.info("Loaded session context_blocks field is not a list; resetting context_blocks")
@@ -266,16 +253,11 @@ class JsonFileSessionStore:
 
         normalized["context_blocks"] = normalized_blocks
 
-        last_block_id = str(normalized_blocks[-1]["block_id"]) if normalized_blocks else ""
-        summary = SessionSummary.from_any(
-            state.get("summary"),
-            thread_id=str(normalized["meta"].get("session_id", "")),
-            covers_blocks_until=last_block_id,
+        memory = IncrementalMemoryJournal.from_any(
+            state.get("memory"),
+            thread_id=session_id,
         )
-        normalized["summary"] = summary.to_dict() if summary is not None else None
-
-        task_state = TaskState.from_any(state.get("task_state"))
-        normalized["task_state"] = task_state.to_dict() if task_state is not None else None
+        normalized["memory"] = memory.to_dict()
 
         return normalized
 

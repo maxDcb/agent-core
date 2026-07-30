@@ -118,6 +118,42 @@ repository.
 - `DomainHooks` let applications add domain prompt blocks and memory payloads
   without adding domain logic to the core package.
 
+## Incremental Conversation Memory
+
+Conversation memory is committed as an append-only journal instead of being
+re-summarized from the full thread:
+
+- every completed assistant/tool exchange produces an `ExchangeMemory`;
+- investigation reflections are reused as structured exchange-memory events;
+- one bounded `TurnMemory` is synthesized from the current turn's ordered
+  events after the final answer;
+- each turn stores an immutable turn summary and a complete replacement
+  operational handoff;
+- `SessionView` is the latest valid handoff and is rebuilt deterministically
+  from the append-only turn journal.
+
+The turn-memory synthesizer never receives the complete conversation or an
+overflow backlog. A synthesis failure commits a deterministic fallback, so it
+cannot block the user-visible answer or leave the same historical backlog to be
+retried indefinitely. If execution stops after the raw conversation block is
+saved but before its memory commit, the next prompt build reconstructs the
+missing exchange and turn records without an LLM call.
+
+`CoreSettings.turn_memory_synthesis_prompt` customizes the single post-turn
+memory call. `memory_max_turn_input_chars`, `memory_max_handoff_chars`, and
+`memory_max_turn_summary_chars` bound its input and prose outputs. The complete
+turn journal remains persisted even though only the latest compact handoff is
+injected into later prompts.
+
+Memory journal schema 2 is intentionally breaking while the package is
+pre-1.0. Schema 1 memory payloads are ignored; no compatibility parser or
+migration path is provided.
+
+Domain packages can implement `DomainHooks.extend_turn_memory_payload()` and
+`DomainHooks.turn_memory_guidance()` to add bounded context and prose guidance
+without introducing a second memory schema. Headless structured tasks and
+application pipelines do not use this conversation journal.
+
 ## Run Modes
 
 The default mode is `direct`, which preserves the ordinary assistant/tool loop.
@@ -125,12 +161,17 @@ For multi-step work, `investigate` and `deep_investigate` add bounded planning,
 reflection, decision and optional final critique phases while storing only
 auditable artifacts, not raw chain-of-thought.
 
-Investigation modes are conversation modes by default: their user-visible
-answer is text. Their planning, reflection, decision and critique phases use
-internal JSON synthesis. If a caller needs a structured final answer, pass
-`final_output_mode="json_schema"` with a `StructuredOutputContract`; the
-investigation still runs normally, then a final no-tool turn renders the answer
-through the provider-enforced JSON Schema contract.
+Investigation modes are conversation modes by default: after the investigation
+stops, a dedicated no-tool model call renders the user-visible answer as natural
+text from the original request, candidate draft, and auditable state. Empty,
+tool-calling, raw-JSON, or failed final responses fall back to the bounded
+deterministic state renderer so the conversation still completes. The result
+metadata reports `final_response_origin` as `model` or `fallback`.
+
+Planning, reflection, decision and critique phases use internal JSON synthesis.
+If a caller needs a structured final answer, pass
+`final_output_mode="json_schema"` with a `StructuredOutputContract`; this stays
+on its separate provider-enforced and locally validated JSON Schema path.
 
 ```python
 from agent_core import RunContext, RunOptions

@@ -25,7 +25,7 @@ from agent_core.structured_tasks import StructuredTaskCheckpoint, StructuredTask
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
-from tests.run_helpers import execution_context, resume_turn, run_structured, run_turn
+from tests.run_helpers import execution_context, resume_turn, run_structured, run_turn, turn_memory_payload
 
 
 def _completion(*, input_tokens: int = 10, output_tokens: int = 2) -> LLMCompletionResult:
@@ -194,21 +194,7 @@ class ToolThenFinalProvider:
         return LLMCompletionResult(content="final")
 
     def complete_text(self, *, messages, model, temperature, options=None):
-        return json.dumps(
-            {
-                "run_id": "run-0000",
-                "objective": "test",
-                "scope": [],
-                "source_code_locations": [],
-                "open_questions": [],
-                "next_action": None,
-                "stop_conditions": [],
-                "constraints": [],
-                "relevant_artifacts": [],
-                "status": "active",
-                "domain_extensions": {},
-            }
-        )
+        return json.dumps(turn_memory_payload(objective="test"))
 
 
 class FinalProvider(ToolThenFinalProvider):
@@ -224,9 +210,7 @@ def _settings(tmp_path) -> CoreSettings:
         memory_model="fake",
         session_file=tmp_path / "session.json",
         base_system_prompt="system",
-        task_state_synthesis_prompt="task",
-        session_summary_synthesis_prompt="summary",
-        session_summary_merge_prompt="merge",
+        turn_memory_synthesis_prompt="memory",
         max_active_context_tokens=100_000,
     )
 

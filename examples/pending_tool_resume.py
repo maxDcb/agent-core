@@ -43,17 +43,13 @@ class FakeProvider:
     def complete_text(self, *, messages, model, temperature, options=None):
         return json.dumps(
             {
-                "run_id": "run-0000",
-                "objective": "Demonstrate pending tool resume",
-                "scope": [],
-                "source_code_locations": [],
-                "open_questions": [],
-                "next_action": None,
-                "stop_conditions": [],
-                "constraints": [],
-                "relevant_artifacts": [],
-                "status": "active",
-                "domain_extensions": {},
+                "turn_summary": "The external job completed successfully.",
+                "next_handoff": (
+                    "Current objective:\n"
+                    "Demonstrate pending tool resume.\n\n"
+                    "Latest outcome:\n"
+                    "The external job completed successfully; no follow-up action remains."
+                ),
             }
         )
 
@@ -93,9 +89,7 @@ def build_orchestrator(session_file: Path) -> AgentOrchestrator:
         memory_model="fake-model",
         session_file=session_file,
         base_system_prompt="You demonstrate pending tool result resume.",
-        task_state_synthesis_prompt="Return JSON.",
-        session_summary_synthesis_prompt="Return JSON.",
-        session_summary_merge_prompt="Return JSON.",
+        turn_memory_synthesis_prompt="Return JSON.",
     )
     registry = ToolRegistry()
     registry.register(ExternalJobTool())

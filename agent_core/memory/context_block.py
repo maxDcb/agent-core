@@ -9,8 +9,7 @@ from agent_core.llm.base import LLMMessage
 ContextBlockKind = Literal[
     "conversation_turn",
     "tool_exchange",
-    "summary",
-    "task_state",
+    "memory_view",
     "retrieved_memory",
 ]
 
@@ -40,8 +39,8 @@ class ContextBlock:
     """Atomic persisted unit used to rebuild the prompt stack later.
 
     A block is richer than a flat chat message: one block can represent a full
-    user/assistant turn, a tool-exchange phase, or synthesized memory injected
-    back into the prompt as a system message.
+    user/assistant turn, a tool-exchange phase, or a materialized memory view
+    injected back into the prompt as a system message.
     """
 
     block_id: str
@@ -71,7 +70,7 @@ class ContextBlock:
             return None
 
         kind = payload.get("kind")
-        if kind not in {"conversation_turn", "tool_exchange", "summary", "task_state", "retrieved_memory"}:
+        if kind not in {"conversation_turn", "tool_exchange", "memory_view", "retrieved_memory"}:
             return None
 
         content = payload.get("content")
@@ -94,17 +93,15 @@ class ContextBlock:
         )
 
     def render_system_text(self) -> str:
-        if self.kind == "summary":
-            from agent_core.memory.session_summary import SessionSummary
+        if self.kind == "memory_view":
+            from agent_core.memory.journal import SessionView
 
-            summary = SessionSummary.from_any(self.content.get("summary"))
-            return summary.render_text() if summary is not None else ""
-
-        if self.kind == "task_state":
-            from agent_core.memory.task_state import TaskState
-
-            task_state = TaskState.from_any(self.content.get("task_state"))
-            return task_state.render_text() if task_state is not None else ""
+            thread_id = self.metadata.get("thread_id")
+            session_view = SessionView.from_any(
+                self.content.get("session_view"),
+                thread_id=thread_id if isinstance(thread_id, str) else "",
+            )
+            return session_view.render_text() if session_view is not None else ""
 
         if self.kind == "retrieved_memory":
             return self._render_retrieved_memory_text()
@@ -157,9 +154,7 @@ class ContextBlock:
         tool_payloads = self.content.get("tool_messages", [])
         if isinstance(tool_payloads, list):
             rendered.extend(
-                LLMMessage.from_history_dict(payload)
-                for payload in tool_payloads
-                if isinstance(payload, dict)
+                LLMMessage.from_history_dict(payload) for payload in tool_payloads if isinstance(payload, dict)
             )
         return rendered
 

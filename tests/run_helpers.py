@@ -14,6 +14,30 @@ from agent_core.types import AgentTurnResult
 _ACTIVE_CONTEXTS: WeakKeyDictionary[AgentOrchestrator, RunContext] = WeakKeyDictionary()
 
 
+def turn_memory_payload(
+    *,
+    objective: str = "Test objective",
+    user_intent: str = "Test request",
+    assistant_outcome: str = "Test outcome",
+    confirmed_facts: list[str] | None = None,
+    next_actions: list[str] | None = None,
+) -> dict:
+    fact_lines = "\n".join(f"- {fact}" for fact in (confirmed_facts or []))
+    action_lines = "\n".join(f"- {action}" for action in (next_actions or []))
+    return {
+        "turn_summary": f"Request: {user_intent}\nOutcome: {assistant_outcome}",
+        "next_handoff": "\n\n".join(
+            section
+            for section in (
+                f"Current objective:\n{objective}",
+                f"Grounded observations:\n{fact_lines}" if fact_lines else "",
+                f"Next useful action:\n{action_lines}" if action_lines else "",
+            )
+            if section
+        ),
+    }
+
+
 def execution_context(
     settings: CoreSettings,
     *,

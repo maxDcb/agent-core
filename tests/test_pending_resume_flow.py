@@ -11,7 +11,7 @@ from agent_core.settings import CoreSettings
 from agent_core.tool_registry import ToolRegistry
 from agent_core.tools import build_tool_definition
 from agent_core.types import ToolResult
-from tests.run_helpers import resume_turn, run_turn
+from tests.run_helpers import resume_turn, run_turn, turn_memory_payload
 
 
 class FakeProvider:
@@ -34,21 +34,7 @@ class FakeProvider:
         return self.responses.pop(0)
 
     def complete_text(self, *, messages, model, temperature, options=None):
-        return json.dumps(
-            {
-                "run_id": "run-0000",
-                "objective": "Use delayed tool",
-                "scope": [],
-                "source_code_locations": [],
-                "domain_extensions": {},
-                "open_questions": [],
-                "next_action": None,
-                "stop_conditions": [],
-                "constraints": [],
-                "relevant_artifacts": [],
-                "status": "active",
-            }
-        )
+        return json.dumps(turn_memory_payload(objective="Use delayed tool"))
 
 
 class DelayedTool:
@@ -116,9 +102,7 @@ def build_orchestrator(tmp_path) -> AgentOrchestrator:
         memory_model="test-model",
         session_file=tmp_path / "session.json",
         base_system_prompt="system",
-        task_state_synthesis_prompt="task",
-        session_summary_synthesis_prompt="summary",
-        session_summary_merge_prompt="merge",
+        turn_memory_synthesis_prompt="memory",
     )
     registry = ToolRegistry()
     registry.register(DelayedTool())
@@ -142,7 +126,8 @@ def test_agent_core_can_resume_pending_tool_result(tmp_path) -> None:
     assert pending.metadata["value"] == "whoami"
     assert pending.metadata["run_trace_id"].startswith("test-run-")
 
-    completed = resume_turn(orchestrator,
+    completed = resume_turn(
+        orchestrator,
         pending_id=pending.pending_id,
         tool_content="tool output",
     )
@@ -156,7 +141,8 @@ def test_agent_core_can_resume_pending_tool_result(tmp_path) -> None:
 
     tool_history_count = len(orchestrator.session_manager.get_state()["tool_history"])
     block_count = len(orchestrator.session_manager.get_context_blocks())
-    repeated = resume_turn(orchestrator,
+    repeated = resume_turn(
+        orchestrator,
         pending_id=pending.pending_id,
         tool_content="different duplicate output",
     )
@@ -166,7 +152,8 @@ def test_agent_core_can_resume_pending_tool_result(tmp_path) -> None:
     assert len(orchestrator.session_manager.get_context_blocks()) == block_count
 
     reloaded_orchestrator = build_orchestrator(tmp_path)
-    repeated_after_restart = resume_turn(reloaded_orchestrator,
+    repeated_after_restart = resume_turn(
+        reloaded_orchestrator,
         pending_id=pending.pending_id,
         tool_content="another duplicate output",
     )
@@ -180,9 +167,7 @@ def test_pending_multi_tool_exchange_resumes_remaining_calls_before_model_call(t
         memory_model="test-model",
         session_file=tmp_path / "session.json",
         base_system_prompt="system",
-        task_state_synthesis_prompt="task",
-        session_summary_synthesis_prompt="summary",
-        session_summary_merge_prompt="merge",
+        turn_memory_synthesis_prompt="memory",
     )
     provider = MultiToolProvider()
     registry = ToolRegistry()
@@ -199,7 +184,8 @@ def test_pending_multi_tool_exchange_resumes_remaining_calls_before_model_call(t
     pending = run_turn(orchestrator, "run all three tools")
     assert pending.status == "pending_tool_result"
 
-    completed = resume_turn(orchestrator,
+    completed = resume_turn(
+        orchestrator,
         pending_id=pending.pending_id or "",
         tool_content="resolved",
     )

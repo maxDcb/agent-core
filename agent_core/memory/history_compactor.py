@@ -12,51 +12,40 @@ class CompactionPolicy:
 
 
 class HistoryCompactor:
-    """Deterministically split history into active and overflow windows.
+    """Split history into a chronological overflow prefix and active suffix.
 
     The compactor works on whole turn groups, never on individual messages. That
-    keeps block boundaries stable and makes the same input state always produce
-    the same active window.
+    keeps block boundaries stable and guarantees that replayed raw history never
+    contains holes. Important facts from older turns belong in the session view
+    or explicit retrieved context, not in isolated pinned history groups.
     """
 
     def __init__(self, policy: CompactionPolicy) -> None:
         self.policy = policy
 
     def compact(self, thread_state: ThreadState) -> ThreadState:
-        history_blocks = [block for block in thread_state.context_blocks if block.kind in {"conversation_turn", "tool_exchange"}]
+        history_blocks = [
+            block for block in thread_state.context_blocks if block.kind in {"conversation_turn", "tool_exchange"}
+        ]
         groups = group_context_blocks(history_blocks)
         if not groups:
             thread_state.active_blocks = []
             thread_state.overflow_blocks = []
             return thread_state
 
-        selected_indices: set[int] = set()
+        active_start = len(groups) - 1
         used_tokens = 0
-        latest_index = len(groups) - 1
-
-        for index, group in enumerate(groups):
-            if not any(block.pinned for block in group):
-                continue
-            selected_indices.add(index)
-            used_tokens += self._token_count(group)
 
         for index in range(len(groups) - 1, -1, -1):
-            if index in selected_indices:
-                continue
             group = groups[index]
             group_tokens = self._token_count(group)
-            if index == latest_index or not selected_indices or used_tokens + group_tokens <= self.policy.max_active_tokens:
-                selected_indices.add(index)
-                used_tokens += group_tokens
+            if index != len(groups) - 1 and used_tokens + group_tokens > self.policy.max_active_tokens:
+                break
+            active_start = index
+            used_tokens += group_tokens
 
-        active_blocks: list[ContextBlock] = []
-        overflow_blocks: list[ContextBlock] = []
-        for index, group in enumerate(groups):
-            target = active_blocks if index in selected_indices else overflow_blocks
-            target.extend(group)
-
-        thread_state.active_blocks = active_blocks
-        thread_state.overflow_blocks = overflow_blocks
+        thread_state.overflow_blocks = [block for group in groups[:active_start] for block in group]
+        thread_state.active_blocks = [block for group in groups[active_start:] for block in group]
         return thread_state
 
     def _token_count(self, blocks: list[ContextBlock]) -> int:

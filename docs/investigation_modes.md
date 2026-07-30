@@ -11,6 +11,14 @@ Investigation state is domain-agnostic. It stores concise, auditable artifacts o
 Domain-specific behavior still belongs in `DomainHooks`, tools, or an external domain package. Core investigation prompts intentionally avoid domain-specific assumptions.
 
 The final answer from `investigate` and `deep_investigate` is text by default.
+Once the loop stops, a dedicated no-tool model call receives the original
+request, candidate draft, completion status, stop reason, and auditable state.
+It renders the conversational answer in the user's language without exposing
+the controller format. A tool call, empty response, raw JSON document, or model
+failure activates the bounded deterministic state renderer as a fail-safe.
+Completed text runs expose `final_response_origin=model|fallback`; fallback
+results also expose the exception class in `final_response_error_type`.
+
 Internal planning, reflection, decision and critique phases synthesize JSON
 state, but this does not make JSON a public output mode. Use
 `final_output_mode="json_schema"` with a `StructuredOutputContract` when a

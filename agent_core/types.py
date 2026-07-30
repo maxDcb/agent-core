@@ -21,15 +21,14 @@ class SessionState(TypedDict):
     context_blocks: list[dict[str, Any]]
     active_block_ids: list[str]
     overflow_block_ids: list[str]
-    summary: object | None
-    task_state: object | None
+    memory: dict[str, Any]
     tool_history: list[dict[str, Any]]
     domain_state: dict[str, Any]
     meta: dict[str, Any]
     execution_scope: NotRequired[dict[str, Any]]
 
 
-SESSION_SCHEMA_VERSION = 4
+SESSION_SCHEMA_VERSION = 5
 
 
 def utc_now_iso() -> str:
@@ -41,8 +40,27 @@ def build_empty_session_state(*, session_id: str = "default", storage_backend: s
         "context_blocks": [],
         "active_block_ids": [],
         "overflow_block_ids": [],
-        "summary": None,
-        "task_state": None,
+        "memory": {
+            "schema_version": "2",
+            "thread_id": session_id,
+            "exchanges": [],
+            "turns": [],
+            "view_policy": {
+                "max_handoff_chars": 6000,
+                "max_turn_summary_chars": 4000,
+            },
+            "session_view": {
+                "thread_id": session_id,
+                "generation": 0,
+                "through_turn_index": -1,
+                "through_turn_memory_id": None,
+                "updated_at": utc_now_iso(),
+                "content": "",
+                "origin": "runtime",
+                "degraded": False,
+                "schema_version": "2",
+            },
+        },
         "tool_history": [],
         "domain_state": {},
         "meta": {

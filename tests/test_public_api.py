@@ -118,6 +118,7 @@ def test_extension_conversation_and_observability_facades_are_explicit() -> None
         "SessionRepository",
         "SessionState",
         "SessionStore",
+        "TurnMemoryContextView",
     }
     assert set(observability.__all__) == {
         "ContextBudget",
