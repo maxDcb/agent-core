@@ -30,7 +30,7 @@ class TurnMemoryContextView:
     thread_id: str
     turn_index: int
     meta: Mapping[str, Any]
-    previous_active_task: Mapping[str, Any] | None
+    previous_handoff: str
     exchange_memories: tuple[Mapping[str, Any], ...]
 
 
@@ -60,10 +60,6 @@ def build_turn_memory_context_view(
         thread_id=thread_state.thread_id,
         turn_index=turn_index,
         meta=deepcopy(thread_state.meta),
-        previous_active_task=(
-            deepcopy(thread_state.session_view.active_task.to_dict())
-            if thread_state.session_view.active_task is not None
-            else None
-        ),
+        previous_handoff=thread_state.session_view.content,
         exchange_memories=deepcopy(exchange_memories),
     )

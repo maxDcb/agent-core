@@ -130,11 +130,13 @@ Conversation memory has three layers:
    records are written atomically with their context block; investigation
    reflections add grounded facts, gaps and next actions without another model
    call.
-2. `TurnMemory` is one bounded delta synthesized only from the completed
-   current turn. It never reads the full thread or a historical overflow.
-3. `SessionView` is a bounded materialized projection merged
-   deterministically from committed turn deltas. Its generation and terminal
-   turn id make it rebuildable from the append-only journal.
+2. `TurnMemory` stores one immutable turn summary and the complete replacement
+   operational handoff synthesized from the previous bounded handoff and the
+   completed current turn. It never reads the full thread or a historical
+   overflow.
+3. `SessionView` is the latest valid bounded handoff. Its generation and
+   terminal turn id make it rebuildable deterministically from the append-only
+   journal without a semantic merge.
 
 The raw transcript remains the recovery source until a turn memory is
 committed. Invalid model JSON, provider failure or budget exhaustion produces a

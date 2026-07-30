@@ -43,32 +43,13 @@ class FakeProvider:
     def complete_text(self, *, messages, model, temperature, options=None):
         return json.dumps(
             {
-                "memory_id": "turn-0000-memory",
-                "thread_id": "demo",
-                "turn_index": 0,
-                "user_intent": "Run the external job.",
-                "assistant_outcome": "The external job completed successfully.",
-                "active_task": {
-                    "objective": "Demonstrate pending tool resume",
-                    "status": "completed",
-                    "next_action": None,
-                    "open_questions": [],
-                    "constraints": [],
-                },
-                "exchange_memory_ids": [],
-                "source_block_ids": [],
-                "confirmed_facts": [],
-                "superseded_facts": [],
-                "open_hypotheses": [],
-                "rejected_hypotheses": [],
-                "open_questions": [],
-                "resolved_questions": [],
-                "decisions": [],
-                "completed_actions": ["External job completed."],
-                "next_actions": [],
-                "relevant_artifacts": [],
-                "risk_notes": [],
-                "domain_extensions": {},
+                "turn_summary": "The external job completed successfully.",
+                "next_handoff": (
+                    "Current objective:\n"
+                    "Demonstrate pending tool resume.\n\n"
+                    "Latest outcome:\n"
+                    "The external job completed successfully; no follow-up action remains."
+                ),
             }
         )
 

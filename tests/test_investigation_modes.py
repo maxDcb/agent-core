@@ -519,9 +519,10 @@ def test_investigation_tool_result_updates_state_and_returns_state_answer(tmp_pa
         "reflection",
         "final_response",
     ]
-    assert journal.turns[0].confirmed_facts == ["echo returned fact"]
+    assert journal.exchanges[1].confirmed_facts == ["echo returned fact"]
+    assert journal.turns[0].turn_summary
     assert journal.session_view is not None
-    assert journal.session_view.confirmed_facts == ["echo returned fact"]
+    assert "Test objective" in journal.session_view.content
 
 
 def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) -> None:

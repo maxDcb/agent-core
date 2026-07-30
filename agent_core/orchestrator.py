@@ -126,6 +126,8 @@ class AgentOrchestrator:
             synthesizer=self.structured_synthesizer,
             instructions=settings.turn_memory_synthesis_prompt,
             max_input_chars=settings.memory_max_turn_input_chars,
+            max_handoff_chars=settings.memory_max_handoff_chars,
+            max_turn_summary_chars=settings.memory_max_turn_summary_chars,
         )
 
     def _build_tool_history_item(
@@ -281,7 +283,7 @@ class AgentOrchestrator:
         turn_index: int,
         controller_state: dict[str, Any] | None = None,
     ) -> None:
-        """Commit one bounded turn delta; fall back deterministically on failure."""
+        """Commit one bounded turn record and replacement handoff."""
 
         thread_state = self.session_manager.get_thread_state()
         journal = thread_state.memory_journal
@@ -307,7 +309,7 @@ class AgentOrchestrator:
         user_intent = self._message_content(conversation_block.content.get("user_message"))
         assistant_outcome = self._message_content(conversation_block.content.get("assistant_message"))
         exchanges = journal.exchanges_for_turn(turn_index)
-        previous_active_task = journal.session_view.active_task if journal.session_view is not None else None
+        previous_handoff = journal.session_view.content if journal.session_view is not None else ""
         memory_context = build_turn_memory_context_view(
             thread_state,
             turn_index=turn_index,
@@ -322,13 +324,13 @@ class AgentOrchestrator:
                     assistant_outcome=assistant_outcome,
                     exchange_memories=exchanges,
                     source_block_ids=[block.block_id for block in turn_blocks],
-                    previous_active_task=previous_active_task,
+                    previous_handoff=previous_handoff,
                     runtime_context=self._memory_runtime_context_payload(context=self._active_run_context()),
                     controller_state=controller_state,
                     domain_payload=self.domain_hooks.extend_turn_memory_payload(
                         memory_context=memory_context,
                     ),
-                    domain_extensions_template=self.domain_hooks.turn_memory_extensions_template(
+                    domain_guidance=self.domain_hooks.turn_memory_guidance(
                         memory_context=memory_context,
                     ),
                 )
@@ -349,14 +351,17 @@ class AgentOrchestrator:
                 assistant_outcome=assistant_outcome,
                 exchanges=exchanges,
                 source_block_ids=[block.block_id for block in turn_blocks],
-                previous_active_task=previous_active_task,
+                previous_handoff=previous_handoff,
+                controller_state=controller_state,
+                max_handoff_chars=self.settings.memory_max_handoff_chars,
+                max_turn_summary_chars=self.settings.memory_max_turn_summary_chars,
             )
 
         try:
             self.session_manager.commit_turn_memory(
                 turn_memory,
-                max_session_items=self.settings.memory_max_session_items,
-                max_recent_outcomes=self.settings.memory_max_recent_outcomes,
+                max_handoff_chars=self.settings.memory_max_handoff_chars,
+                max_turn_summary_chars=self.settings.memory_max_turn_summary_chars,
             )
         except Exception as exc:
             logger.warning(

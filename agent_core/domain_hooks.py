@@ -28,12 +28,12 @@ class DomainHooks:
     ) -> dict[str, Any]:
         return {}
 
-    def turn_memory_extensions_template(
+    def turn_memory_guidance(
         self,
         *,
         memory_context: TurnMemoryContextView,
-    ) -> dict[str, Any]:
-        return {}
+    ) -> str:
+        return ""
 
     def customize_investigation_prompts(
         self,

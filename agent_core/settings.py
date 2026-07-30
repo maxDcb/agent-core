@@ -48,8 +48,8 @@ class CoreSettings:
     tool_artifact_policy: ToolArtifactPolicy | None = None
     log_synthesis_payloads: bool = False
     memory_max_turn_input_chars: int = 64_000
-    memory_max_session_items: int = 100
-    memory_max_recent_outcomes: int = 12
+    memory_max_handoff_chars: int = 6_000
+    memory_max_turn_summary_chars: int = 4_000
 
     debug: bool = False
     log_level: str | None = None
@@ -81,8 +81,8 @@ class CoreSettings:
         self.allowed_http_methods = [method.strip().upper() for method in self.allowed_http_methods if method.strip()]
         for field_name in (
             "memory_max_turn_input_chars",
-            "memory_max_session_items",
-            "memory_max_recent_outcomes",
+            "memory_max_handoff_chars",
+            "memory_max_turn_summary_chars",
         ):
             value = getattr(self, field_name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:

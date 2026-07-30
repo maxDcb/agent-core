@@ -250,14 +250,14 @@ class SessionManager:
         self,
         memory: TurnMemory,
         *,
-        max_session_items: int,
-        max_recent_outcomes: int,
+        max_handoff_chars: int,
+        max_turn_summary_chars: int,
     ) -> bool:
         journal = self.get_memory_journal()
         changed = journal.commit_turn(
             memory,
-            max_session_items=max_session_items,
-            max_recent_outcomes=max_recent_outcomes,
+            max_handoff_chars=max_handoff_chars,
+            max_turn_summary_chars=max_turn_summary_chars,
         )
         if not changed:
             return False
@@ -268,6 +268,9 @@ class SessionManager:
                 "memory_id": memory.memory_id,
                 "turn_index": memory.turn_index,
                 "origin": memory.origin,
+                "degraded": memory.degraded,
+                "turn_summary_chars": len(memory.turn_summary),
+                "handoff_chars": len(memory.handoff_after_turn),
             },
         )
         return True
@@ -275,22 +278,23 @@ class SessionManager:
     def reconcile_memory(
         self,
         *,
-        max_session_items: int,
-        max_recent_outcomes: int,
+        max_handoff_chars: int,
+        max_turn_summary_chars: int,
     ) -> bool:
         """Recover journal entries after interruption without calling an LLM."""
 
         journal = self.get_memory_journal()
         context_blocks = self.get_context_blocks()
         policy_changed = (
-            journal.max_session_items != max_session_items or journal.max_recent_outcomes != max_recent_outcomes
+            journal.max_handoff_chars != max_handoff_chars
+            or journal.max_turn_summary_chars != max_turn_summary_chars
         )
         changed = policy_changed
         recovered = False
         if policy_changed:
+            journal.max_turn_summary_chars = max_turn_summary_chars
             journal.rebuild_session_view(
-                max_session_items=max_session_items,
-                max_recent_outcomes=max_recent_outcomes,
+                max_handoff_chars=max_handoff_chars,
             )
 
         for block in context_blocks:
@@ -370,7 +374,6 @@ class SessionManager:
             if journal.turn_for_index(turn_index) is not None:
                 continue
             exchanges = journal.exchanges_for_turn(turn_index)
-            previous_view = journal.session_view
             fallback = build_fallback_turn_memory(
                 thread_id=self.session_id,
                 turn_index=turn_index,
@@ -382,13 +385,15 @@ class SessionManager:
                     for candidate in context_blocks
                     if candidate.metadata.get("turn_index") == turn_index
                 ],
-                previous_active_task=previous_view.active_task if previous_view is not None else None,
+                previous_handoff=journal.handoff_before_turn(turn_index),
+                max_handoff_chars=max_handoff_chars,
+                max_turn_summary_chars=max_turn_summary_chars,
                 origin="recovery",
             )
             committed = journal.commit_turn(
                 fallback,
-                max_session_items=max_session_items,
-                max_recent_outcomes=max_recent_outcomes,
+                max_handoff_chars=max_handoff_chars,
+                max_turn_summary_chars=max_turn_summary_chars,
             )
             changed = committed or changed
             recovered = committed or recovered

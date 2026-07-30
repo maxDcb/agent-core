@@ -125,10 +125,12 @@ re-summarized from the full thread:
 
 - every completed assistant/tool exchange produces an `ExchangeMemory`;
 - investigation reflections are reused as structured exchange-memory events;
-- one bounded `TurnMemory` delta is synthesized from the current turn's ordered
+- one bounded `TurnMemory` is synthesized from the current turn's ordered
   events after the final answer;
-- `SessionView` is a deterministic, bounded projection of committed turn
-  deltas and is rebuilt from the journal when its generation is inconsistent.
+- each turn stores an immutable turn summary and a complete replacement
+  operational handoff;
+- `SessionView` is the latest valid handoff and is rebuilt deterministically
+  from the append-only turn journal.
 
 The turn-memory synthesizer never receives the complete conversation or an
 overflow backlog. A synthesis failure commits a deterministic fallback, so it
@@ -138,15 +140,15 @@ saved but before its memory commit, the next prompt build reconstructs the
 missing exchange and turn records without an LLM call.
 
 `CoreSettings.turn_memory_synthesis_prompt` customizes the single post-turn
-memory call. `memory_max_turn_input_chars`, `memory_max_session_items`, and
-`memory_max_recent_outcomes` bound the synthesis projection and materialized
-view. The complete turn journal remains persisted even when older items leave
-the bounded `SessionView`.
+memory call. `memory_max_turn_input_chars`, `memory_max_handoff_chars`, and
+`memory_max_turn_summary_chars` bound its input and prose outputs. The complete
+turn journal remains persisted even though only the latest compact handoff is
+injected into later prompts.
 
 Domain packages can implement `DomainHooks.extend_turn_memory_payload()` and
-`DomainHooks.turn_memory_extensions_template()` to add grounded, typed fields
-to each turn delta. Headless structured tasks and application pipelines do not
-use this conversation journal.
+`DomainHooks.turn_memory_guidance()` to add bounded context and prose guidance
+without introducing a second memory schema. Headless structured tasks and
+application pipelines do not use this conversation journal.
 
 ## Run Modes
 

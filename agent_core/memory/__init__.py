@@ -1,7 +1,6 @@
 from agent_core.memory.context_block import ContextBlock, ContextBlockKind, estimate_token_count
 from agent_core.memory.history_compactor import CompactionPolicy, HistoryCompactor
 from agent_core.memory.journal import (
-    ActiveTask,
     ExchangeMemory,
     IncrementalMemoryJournal,
     SessionView,
@@ -19,7 +18,6 @@ __all__ = [
     "ContextBlock",
     "ContextBlockKind",
     "CompactionPolicy",
-    "ActiveTask",
     "ExchangeMemory",
     "HistoryCompactor",
     "IncrementalMemoryJournal",

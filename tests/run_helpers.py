@@ -22,35 +22,19 @@ def turn_memory_payload(
     confirmed_facts: list[str] | None = None,
     next_actions: list[str] | None = None,
 ) -> dict:
+    fact_lines = "\n".join(f"- {fact}" for fact in (confirmed_facts or []))
+    action_lines = "\n".join(f"- {action}" for action in (next_actions or []))
     return {
-        "memory_id": "turn-0000-memory",
-        "thread_id": "default",
-        "turn_index": 0,
-        "user_intent": user_intent,
-        "assistant_outcome": assistant_outcome,
-        "active_task": {
-            "objective": objective,
-            "status": "active",
-            "next_action": next_actions[0] if next_actions else None,
-            "open_questions": [],
-            "constraints": [],
-        },
-        "exchange_memory_ids": [],
-        "source_block_ids": [],
-        "confirmed_facts": confirmed_facts or [],
-        "superseded_facts": [],
-        "open_hypotheses": [],
-        "rejected_hypotheses": [],
-        "open_questions": [],
-        "resolved_questions": [],
-        "decisions": [],
-        "completed_actions": [],
-        "next_actions": next_actions or [],
-        "relevant_artifacts": [],
-        "risk_notes": [],
-        "domain_extensions": {},
-        "origin": "model",
-        "schema_version": "1",
+        "turn_summary": f"Request: {user_intent}\nOutcome: {assistant_outcome}",
+        "next_handoff": "\n\n".join(
+            section
+            for section in (
+                f"Current objective:\n{objective}",
+                f"Grounded observations:\n{fact_lines}" if fact_lines else "",
+                f"Next useful action:\n{action_lines}" if action_lines else "",
+            )
+            if section
+        ),
     }
 
 
