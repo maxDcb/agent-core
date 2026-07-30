@@ -37,6 +37,7 @@ from agent_core.settings import CoreSettings
 from agent_core.structured_tasks import StructuredTaskResult, StructuredTaskRunner, StructuredTaskSpec
 from agent_core.tool_artifacts import (
     ArtifactChunk,
+    ArtifactResultEnvelope,
     ArtifactStore,
     JsonFileArtifactStore,
     ToolArtifactDescriptor,
@@ -54,6 +55,7 @@ __all__ = [
     "AgentRunService",
     "AgentRunState",
     "ArtifactChunk",
+    "ArtifactResultEnvelope",
     "ArtifactStore",
     "CoreSettings",
     "ExecutionContext",

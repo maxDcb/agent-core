@@ -319,11 +319,12 @@ the provider supports `LLMCallOptions.max_output_tokens`.
 
 ## Lossless Tool-Result Artifacts
 
-`ToolArtifactPolicy` optionally stores every completed application-tool result
-outside the transcript. Recent bounded results remain hot for immediate model
-continuity; older or individually large results are represented by an opaque
-artifact descriptor. The runtime exposes `agent_core_read_artifact` whenever
-the policy is active so the model can read bounded chunks on demand.
+Every completed application-tool result is stored outside the transcript.
+The model always receives an `artifact_result` envelope: a small result is
+`complete`, a large result is a bounded `preview`, and an older result that has
+left the hot context is a `reference`. The runtime exposes
+`agent_core_read_artifact` so the model can continue reading bounded chunks on
+demand.
 
 ```python
 from pathlib import Path
@@ -334,7 +335,8 @@ settings = CoreSettings(
     artifacts_directory=Path("./artifacts"),
     tool_artifact_policy=ToolArtifactPolicy(
         hot_context_bytes=64 * 1024,
-        max_inline_result_bytes=32 * 1024,
+        max_complete_result_bytes=32 * 1024,
+        preview_bytes=4 * 1024,
         max_read_bytes=16 * 1024,
         max_reads_per_run=20,
         max_total_read_bytes=256 * 1024,
@@ -347,11 +349,11 @@ The policy can also be overridden with `RunOptions.tool_artifact_policy` or
 default; hosts may inject an `ArtifactStore` into `AgentRunService` for remote
 or transactional storage. Artifact reads are namespace-scoped, never accept a
 filesystem path, have their own call/byte limits, and do not consume the
-application tool-call budget. Pending conversation state and structured
-checkpoint schema version 5 persist descriptors and artifact usage rather than
-copying the full result.
+application tool-call budget. Pending conversation state schema version 2 and
+structured checkpoint schema version 6 persist `artifact_result` references
+and artifact usage rather than copying the full result.
 
-The feature is disabled by default. `JsonFileArtifactStore` stores plaintext
+Artifact storage is always enabled. `JsonFileArtifactStore` stores plaintext
 UTF-8 files and is intended for trusted local deployments; production hosts
 handling credentials or browser session data should inject an encrypted store
 with explicit access control and retention.

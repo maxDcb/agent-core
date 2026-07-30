@@ -194,7 +194,10 @@ def test_resume_continues_after_completed_tool_without_replaying_it(tmp_path) ->
     assert json.loads(resumed.raw_content) == {"summary": "resumed"}
     assert resumed.tool_calls_used == 1
     assert tool.calls == 1
-    assert any(message.role == "tool" and message.content == "count:1" for message in final_provider.messages)
+    assert any(
+        message.role == "tool" and json.loads(message.content).get("content") == "count:1"
+        for message in final_provider.messages
+    )
     state = first_service.get(namespace_id="assessment", run_id="run-1")
     assert state is not None
     assert [attempt.status for attempt in state.attempts] == ["interrupted", "completed"]
@@ -235,7 +238,10 @@ def test_resume_blocks_when_tool_effect_is_ambiguous(tmp_path) -> None:
 
     assert completed.ok is True
     assert tool.calls == 1
-    assert any(message.role == "tool" and message.content == "count:1" for message in reconciled_provider.messages)
+    assert any(
+        message.role == "tool" and json.loads(message.content).get("content") == "count:1"
+        for message in reconciled_provider.messages
+    )
     state = service.get(namespace_id="assessment", run_id="run-ambiguous")
     assert state is not None
     assert [attempt.status for attempt in state.attempts] == ["interrupted", "blocked", "completed"]

@@ -45,7 +45,7 @@ class CoreSettings:
     llm_max_output_tokens: int | None = None
     llm_budget: LLMBudget | None = None
     llm_context_policy: LLMContextPolicy | None = None
-    tool_artifact_policy: ToolArtifactPolicy | None = None
+    tool_artifact_policy: ToolArtifactPolicy = field(default_factory=ToolArtifactPolicy)
     log_synthesis_payloads: bool = False
     memory_max_turn_input_chars: int = 64_000
     memory_max_handoff_chars: int = 6_000

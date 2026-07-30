@@ -225,7 +225,8 @@ class StructuredTaskSpec:
         self.output_contract = StructuredOutputContract.from_any(self.output_contract)
         self.llm_budget = LLMBudget.from_any(self.llm_budget)
         self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
-        self.tool_artifact_policy = ToolArtifactPolicy.from_any(self.tool_artifact_policy)
+        if self.tool_artifact_policy is not None:
+            self.tool_artifact_policy = ToolArtifactPolicy.from_any(self.tool_artifact_policy)
         if not isinstance(self.metadata, dict):
             self.metadata = {}
         self.model = _clean_string(self.model) or None
@@ -376,12 +377,12 @@ class StructuredTaskCheckpoint:
     llm_budget_usage: LLMBudgetUsage = field(default_factory=LLMBudgetUsage)
     llm_context_policy: LLMContextPolicy | None = None
     llm_context_usage: LLMContextUsage = field(default_factory=LLMContextUsage)
-    tool_artifact_policy: ToolArtifactPolicy | None = None
+    tool_artifact_policy: ToolArtifactPolicy = field(default_factory=ToolArtifactPolicy)
     tool_artifact_usage: ToolArtifactUsage = field(default_factory=ToolArtifactUsage)
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": 5,
+            "schema_version": 6,
             "spec_fingerprint": self.spec_fingerprint,
             "phase": self.phase,
             "messages": [message_to_persistence_dict(message) for message in self.messages],
@@ -402,15 +403,13 @@ class StructuredTaskCheckpoint:
                 self.llm_context_policy.to_dict() if self.llm_context_policy is not None else None
             ),
             "llm_context_usage": self.llm_context_usage.to_dict(),
-            "tool_artifact_policy": (
-                self.tool_artifact_policy.to_dict() if self.tool_artifact_policy is not None else None
-            ),
+            "tool_artifact_policy": self.tool_artifact_policy.to_dict(),
             "tool_artifact_usage": self.tool_artifact_usage.to_dict(),
         }
 
     @classmethod
     def from_dict(cls, payload: object) -> StructuredTaskCheckpoint | None:
-        if not isinstance(payload, dict) or payload.get("schema_version") not in {1, 2, 3, 4, 5}:
+        if not isinstance(payload, dict) or payload.get("schema_version") != 6:
             return None
         spec_fingerprint = payload.get("spec_fingerprint")
         phase = payload.get("phase")
@@ -441,6 +440,10 @@ class StructuredTaskCheckpoint:
         normalized_result_kind: StructuredResultKind | None = (
             result_kind if result_kind in {"direct", "contract", "budget"} else None
         )
+        try:
+            tool_artifact_policy = ToolArtifactPolicy.from_any(payload.get("tool_artifact_policy"))
+        except ValueError:
+            return None
         return cls(
             spec_fingerprint=spec_fingerprint,
             phase=phase,
@@ -464,7 +467,7 @@ class StructuredTaskCheckpoint:
             llm_budget_usage=LLMBudgetUsage.from_any(payload.get("llm_budget_usage")),
             llm_context_policy=LLMContextPolicy.from_any(payload.get("llm_context_policy")),
             llm_context_usage=LLMContextUsage.from_any(payload.get("llm_context_usage")),
-            tool_artifact_policy=ToolArtifactPolicy.from_any(payload.get("tool_artifact_policy")),
+            tool_artifact_policy=tool_artifact_policy,
             tool_artifact_usage=ToolArtifactUsage.from_any(payload.get("tool_artifact_usage")),
         )
 
@@ -745,7 +748,9 @@ class StructuredTaskRunner:
         while checkpoint.next_tool_call_index < len(checkpoint.pending_tool_calls):
             tool_call = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index]
             artifact_runtime = active_tool_artifact_runtime()
-            is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tool_call.tool_name)
+            if artifact_runtime is None:
+                raise RuntimeError("Tool artifact runtime is required during tool execution")
+            is_internal = artifact_runtime.is_internal_tool(tool_call.tool_name)
             if not is_internal and checkpoint.tool_calls_used >= spec.max_tool_calls:
                 self._append_budget_exhausted_tool_responses(
                     messages=checkpoint.messages,
@@ -953,12 +958,10 @@ class StructuredTaskRunner:
     def _build_artifact_runtime(
         self,
         *,
-        policy: ToolArtifactPolicy | None,
+        policy: ToolArtifactPolicy,
         context: ExecutionContext,
         usage: ToolArtifactUsage | dict[str, Any] | None,
-    ) -> ToolArtifactRuntime | None:
-        if policy is None:
-            return None
+    ) -> ToolArtifactRuntime:
         return ToolArtifactRuntime(
             policy=policy,
             store=self.artifact_store,
@@ -1010,17 +1013,29 @@ class StructuredTaskRunner:
         tool_calls: list[LLMToolCall],
         tool_history: list[dict[str, Any]],
     ) -> None:
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during tool execution")
         for tool_call in tool_calls:
             content = f"Tool call skipped: maximum tool-call budget reached before executing {tool_call.name}."
-            messages.append(LLMMessage(role="tool", tool_call_id=tool_call.id, content=content))
-            tool_history.append(
-                {
-                    "tool_name": tool_call.name,
-                    "arguments": {},
-                    "status": "budget_exhausted",
-                    "content_preview": content,
-                }
+            tool_message = artifact_runtime.externalize(
+                tool_name=tool_call.name,
+                content=content,
+                tool_call_id=tool_call.id,
+                status="budget_exhausted",
+                metadata={"status": "budget_exhausted", "synthetic": True},
             )
+            messages.append(tool_message)
+            history_item = {
+                "tool_name": tool_call.name,
+                "arguments": {},
+                "status": "budget_exhausted",
+                "content_preview": content,
+            }
+            descriptor = artifact_descriptor_from_message(tool_message)
+            if descriptor is not None:
+                history_item["artifact_id"] = descriptor.artifact_id
+            tool_history.append(history_item)
 
     def _call_model_once(
         self,
@@ -1043,18 +1058,18 @@ class StructuredTaskRunner:
         )
         tool_specs = registry.get_tool_specs()
         artifact_runtime = active_tool_artifact_runtime()
-        if artifact_runtime is not None:
-            if registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
-                raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
-            if artifact_runtime.has_readable_artifacts(messages):
-                tool_specs.extend(artifact_runtime.tool_specs())
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during model execution")
+        if registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
+            raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
+        if artifact_runtime.has_readable_artifacts(messages):
+            tool_specs.extend(artifact_runtime.tool_specs())
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tool_specs,
             "model": spec.model or self.settings.model,
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
-
         def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             logger.info(
                 "Structured task LLM request prepared",
@@ -1135,6 +1150,7 @@ class StructuredTaskRunner:
             "model": spec.model or self.settings.model,
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
+
         def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             logger.info(
                 "Structured task finalization LLM request prepared",
@@ -1261,6 +1277,9 @@ class StructuredTaskRunner:
         tool_call_id: str,
         context: ExecutionContext,
     ) -> tuple[LLMMessage, dict[str, Any]]:
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during tool execution")
         arguments: dict[str, Any]
         try:
             loaded_arguments = json.loads(arguments_json or "{}")
@@ -1280,8 +1299,7 @@ class StructuredTaskRunner:
                     "arguments_summary": _safe_tool_argument_summary(arguments),
                 },
             )
-            artifact_runtime = active_tool_artifact_runtime()
-            is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tool_name)
+            is_internal = artifact_runtime.is_internal_tool(tool_name)
             authz = None if is_internal else self.policy_engine.authorize(tool_name, arguments, context)
             if authz is not None and not authz.allowed:
                 tool_content = f"Tool denied by policy: {authz.reason}"
@@ -1299,7 +1317,7 @@ class StructuredTaskRunner:
                 try:
                     result = (
                         artifact_runtime.execute(tool_name=tool_name, arguments=arguments, context=context)
-                        if is_internal and artifact_runtime is not None
+                        if is_internal
                         else registry.execute(tool_name, arguments, context)
                     )
                     tool_content = result.content
@@ -1319,16 +1337,16 @@ class StructuredTaskRunner:
                     tool_content = f"Tool execution failed: {exc}"
                     tool_status = "execution_failed"
 
-        artifact_runtime = active_tool_artifact_runtime()
-        is_internal = artifact_runtime is not None and artifact_runtime.is_internal_tool(tool_name)
+        is_internal = artifact_runtime.is_internal_tool(tool_name)
         tool_message = (
             artifact_runtime.externalize(
                 tool_name=tool_name,
                 content=tool_content,
                 tool_call_id=tool_call_id,
+                status=tool_status,
                 metadata={"status": tool_status},
             )
-            if artifact_runtime is not None and not is_internal
+            if not is_internal
             else LLMMessage(role="tool", tool_call_id=tool_call_id, content=tool_content)
         )
         history_item = {

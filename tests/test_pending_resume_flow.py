@@ -160,6 +160,29 @@ def test_agent_core_can_resume_pending_tool_result(tmp_path) -> None:
     assert repeated_after_restart == completed
 
 
+def test_pending_resume_rejects_previous_artifact_contract(tmp_path) -> None:
+    orchestrator = build_orchestrator(tmp_path)
+    pending = run_turn(orchestrator, "call the delayed tool")
+    pending_payload = orchestrator.session_manager.get_state()["meta"][
+        AgentOrchestrator.PENDING_TURN_META_KEY
+    ]
+    pending_payload["schema_version"] = "1"
+    orchestrator.session_manager.set_meta_value(
+        AgentOrchestrator.PENDING_TURN_META_KEY,
+        pending_payload,
+    )
+
+    completed = resume_turn(
+        orchestrator,
+        pending_id=pending.pending_id or "",
+        tool_content="must not be injected",
+    )
+
+    assert completed.status == "completed"
+    assert completed.content == "Pending agent turn is incompatible with the current artifact contract."
+    assert orchestrator.session_manager.get_context_blocks() == []
+
+
 def test_pending_multi_tool_exchange_resumes_remaining_calls_before_model_call(tmp_path) -> None:
     settings = CoreSettings(
         openai_api_key="test",
@@ -193,7 +216,7 @@ def test_pending_multi_tool_exchange_resumes_remaining_calls_before_model_call(t
     assert completed.content == "final after all tool outputs"
     resumed_messages = provider.seen_messages[1]
     tool_messages = [message for message in resumed_messages if message.role == "tool"]
-    assert [(message.tool_call_id, message.content) for message in tool_messages] == [
+    assert [(message.tool_call_id, json.loads(message.content)["content"]) for message in tool_messages] == [
         ("call-1", "before"),
         ("call-2", "resolved"),
         ("call-3", "after"),

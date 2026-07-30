@@ -10,18 +10,29 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast
 from uuid import uuid4
 
 from agent_core.llm.base import LLMMessage, LLMToolDefinition
-from agent_core.types import ToolResult
+from agent_core.types import ToolExecutionStatus, ToolResult
 
 if TYPE_CHECKING:
     from agent_core.execution_context import ExecutionContext
 
 READ_ARTIFACT_TOOL_NAME = "agent_core_read_artifact"
 _ARTIFACT_ID_PATTERN = re.compile(r"^art_[0-9a-f]{32}$")
-_ARTIFACT_METADATA_KEY = "tool_artifact"
+_ARTIFACT_METADATA_KEY = "artifact_result"
+_TOOL_EXECUTION_STATUSES = {
+    "ok",
+    "pending",
+    "tool_error",
+    "policy_denied",
+    "invalid_arguments",
+    "execution_failed",
+    "budget_exhausted",
+}
+
+ArtifactMaterialization: TypeAlias = Literal["complete", "preview", "reference"]
 
 
 def _positive_int(value: object, *, field_name: str) -> int:
@@ -35,7 +46,8 @@ class ToolArtifactPolicy:
     """Lossless storage and bounded context projection for tool results."""
 
     hot_context_bytes: int = 64 * 1024
-    max_inline_result_bytes: int = 32 * 1024
+    max_complete_result_bytes: int = 32 * 1024
+    preview_bytes: int = 4 * 1024
     max_read_bytes: int = 16 * 1024
     max_reads_per_run: int = 20
     max_total_read_bytes: int = 256 * 1024
@@ -43,33 +55,39 @@ class ToolArtifactPolicy:
     def __post_init__(self) -> None:
         for name in (
             "hot_context_bytes",
-            "max_inline_result_bytes",
+            "max_complete_result_bytes",
+            "preview_bytes",
             "max_read_bytes",
             "max_reads_per_run",
             "max_total_read_bytes",
         ):
             object.__setattr__(self, name, _positive_int(getattr(self, name), field_name=name))
+        if self.preview_bytes > self.hot_context_bytes:
+            raise ValueError("preview_bytes must not exceed hot_context_bytes")
 
     def to_dict(self) -> dict[str, int]:
         return {
             "hot_context_bytes": self.hot_context_bytes,
-            "max_inline_result_bytes": self.max_inline_result_bytes,
+            "max_complete_result_bytes": self.max_complete_result_bytes,
+            "preview_bytes": self.preview_bytes,
             "max_read_bytes": self.max_read_bytes,
             "max_reads_per_run": self.max_reads_per_run,
             "max_total_read_bytes": self.max_total_read_bytes,
         }
 
     @classmethod
-    def from_any(cls, payload: object) -> ToolArtifactPolicy | None:
-        if payload is None:
-            return None
+    def from_any(cls, payload: object) -> ToolArtifactPolicy:
         if isinstance(payload, cls):
             return payload
         if not isinstance(payload, dict):
-            raise ValueError("Tool artifact policy must be a ToolArtifactPolicy, dictionary, or None")
+            raise ValueError("Tool artifact policy must be a ToolArtifactPolicy or dictionary")
         return cls(
             hot_context_bytes=cast(int, payload.get("hot_context_bytes", 64 * 1024)),
-            max_inline_result_bytes=cast(int, payload.get("max_inline_result_bytes", 32 * 1024)),
+            max_complete_result_bytes=cast(
+                int,
+                payload.get("max_complete_result_bytes", 32 * 1024),
+            ),
+            preview_bytes=cast(int, payload.get("preview_bytes", 4 * 1024)),
             max_read_bytes=cast(int, payload.get("max_read_bytes", 16 * 1024)),
             max_reads_per_run=cast(int, payload.get("max_reads_per_run", 20)),
             max_total_read_bytes=cast(int, payload.get("max_total_read_bytes", 256 * 1024)),
@@ -123,16 +141,118 @@ class ToolArtifactDescriptor:
             content_type=content_type,
         )
 
-    def reference_content(self) -> str:
+
+@dataclass(frozen=True, slots=True)
+class ArtifactResultEnvelope:
+    """Stable provider-facing contract for one stored application-tool result."""
+
+    status: ToolExecutionStatus
+    artifact: ToolArtifactDescriptor
+    materialization: ArtifactMaterialization
+    content: str | None
+    returned_bytes: int
+    complete: bool
+    next_offset: int | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema_version": "1",
+            "kind": "artifact_result",
+            "status": self.status,
+            "artifact": self.artifact.to_dict(),
+            "materialization": self.materialization,
+            "content": self.content,
+            "returned_bytes": self.returned_bytes,
+            "complete": self.complete,
+            "next_offset": self.next_offset,
+            "read_tool": READ_ARTIFACT_TOOL_NAME,
+        }
+
+    def to_content(self) -> str:
         return json.dumps(
-            {
-                **self.to_dict(),
-                "externalized": True,
-                "fully_loaded": False,
-                "read_tool": READ_ARTIFACT_TOOL_NAME,
-            },
+            self.to_dict(),
             ensure_ascii=False,
             separators=(",", ":"),
+        )
+
+    def as_reference(self) -> ArtifactResultEnvelope:
+        return ArtifactResultEnvelope.reference(status=self.status, artifact=self.artifact)
+
+    @classmethod
+    def reference(
+        cls,
+        *,
+        status: ToolExecutionStatus,
+        artifact: ToolArtifactDescriptor,
+    ) -> ArtifactResultEnvelope:
+        return cls(
+            status=status,
+            artifact=artifact,
+            materialization="reference",
+            content=None,
+            returned_bytes=0,
+            complete=False,
+            next_offset=0,
+        )
+
+    @classmethod
+    def from_any(cls, payload: object) -> ArtifactResultEnvelope | None:
+        if isinstance(payload, cls):
+            return payload
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("schema_version") != "1" or payload.get("kind") != "artifact_result":
+            return None
+        status = payload.get("status")
+        artifact = ToolArtifactDescriptor.from_any(payload.get("artifact"))
+        materialization = payload.get("materialization")
+        content = payload.get("content")
+        returned_bytes = payload.get("returned_bytes")
+        complete = payload.get("complete")
+        next_offset = payload.get("next_offset")
+        if (
+            status not in _TOOL_EXECUTION_STATUSES
+            or artifact is None
+            or materialization not in {"complete", "preview", "reference"}
+            or (content is not None and not isinstance(content, str))
+            or not isinstance(returned_bytes, int)
+            or isinstance(returned_bytes, bool)
+            or returned_bytes < 0
+            or not isinstance(complete, bool)
+            or (
+                next_offset is not None
+                and (not isinstance(next_offset, int) or isinstance(next_offset, bool) or next_offset < 0)
+            )
+        ):
+            return None
+        if materialization == "complete" and (
+            content is None
+            or not complete
+            or next_offset is not None
+            or returned_bytes != artifact.size_bytes
+            or len(content.encode("utf-8")) != returned_bytes
+        ):
+            return None
+        if materialization == "preview" and (
+            content is None
+            or complete
+            or next_offset != returned_bytes
+            or returned_bytes >= artifact.size_bytes
+            or len(content.encode("utf-8")) != returned_bytes
+        ):
+            return None
+        if materialization == "reference" and (
+            content is not None or complete or returned_bytes != 0 or next_offset != 0
+        ):
+            return None
+        return cls(
+            status=cast(ToolExecutionStatus, status),
+            artifact=artifact,
+            materialization=cast(ArtifactMaterialization, materialization),
+            content=content,
+            returned_bytes=returned_bytes,
+            complete=complete,
+            next_offset=next_offset,
         )
 
 
@@ -148,6 +268,8 @@ class ArtifactChunk:
     def to_content(self) -> str:
         return json.dumps(
             {
+                "schema_version": "1",
+                "kind": "artifact_chunk",
                 "artifact_id": self.artifact_id,
                 "offset": self.offset,
                 "next_offset": self.next_offset,
@@ -170,8 +292,7 @@ class ArtifactStore(Protocol):
         tool_name: str,
         content: str,
         metadata: dict[str, Any] | None = None,
-    ) -> ToolArtifactDescriptor:
-        ...
+    ) -> ToolArtifactDescriptor: ...
 
     def read_text(
         self,
@@ -180,11 +301,9 @@ class ArtifactStore(Protocol):
         artifact_id: str,
         offset: int,
         limit: int,
-    ) -> ArtifactChunk:
-        ...
+    ) -> ArtifactChunk: ...
 
-    def read_all_text(self, *, namespace_id: str, artifact_id: str) -> str:
-        ...
+    def read_all_text(self, *, namespace_id: str, artifact_id: str) -> str: ...
 
 
 class JsonFileArtifactStore:
@@ -388,6 +507,7 @@ class ToolArtifactRuntime:
         tool_name: str,
         content: str,
         tool_call_id: str,
+        status: ToolExecutionStatus,
         metadata: dict[str, Any] | None = None,
     ) -> LLMMessage:
         descriptor = self.store.put_text(
@@ -399,33 +519,36 @@ class ToolArtifactRuntime:
         )
         self.usage.artifacts_written += 1
         self.usage.artifact_bytes_written += descriptor.size_bytes
-        visible_content = content if descriptor.size_bytes <= self.policy.max_inline_result_bytes else descriptor.reference_content()
+        envelope = self._materialize_new(
+            descriptor=descriptor,
+            status=status,
+            content=content,
+        )
         return LLMMessage(
             role="tool",
             tool_call_id=tool_call_id,
-            content=visible_content,
-            metadata={_ARTIFACT_METADATA_KEY: descriptor.to_dict()},
+            content=envelope.to_content(),
+            metadata={_ARTIFACT_METADATA_KEY: envelope.as_reference().to_dict()},
         )
 
     def project_messages(self, messages: list[LLMMessage]) -> list[LLMMessage]:
-        projected = [replace(message, tool_calls=list(message.tool_calls), metadata=dict(message.metadata)) for message in messages]
+        projected = [
+            replace(message, tool_calls=list(message.tool_calls), metadata=dict(message.metadata))
+            for message in messages
+        ]
         remaining = self.policy.hot_context_bytes
         for message in reversed(projected):
-            descriptor = artifact_descriptor_from_message(message)
-            if descriptor is None:
+            stored_envelope = artifact_envelope_from_message(message)
+            if stored_envelope is None:
                 continue
-            if descriptor.size_bytes <= remaining and descriptor.size_bytes <= self.policy.max_inline_result_bytes:
-                try:
-                    message.content = self.store.read_all_text(
-                        namespace_id=self.namespace_id,
-                        artifact_id=descriptor.artifact_id,
-                    )
-                except (FileNotFoundError, PermissionError, ValueError, OSError):
-                    message.content = descriptor.reference_content()
-                else:
-                    remaining -= descriptor.size_bytes
+            materialization_bytes = self._materialization_bytes(stored_envelope.artifact)
+            if materialization_bytes <= remaining:
+                envelope = self._materialize_stored(stored_envelope)
+                if envelope.materialization != "reference":
+                    remaining -= envelope.returned_bytes
             else:
-                message.content = descriptor.reference_content()
+                envelope = stored_envelope.as_reference()
+            message.content = envelope.to_content()
         return projected
 
     def prepare_messages(self, messages: list[LLMMessage]) -> None:
@@ -436,8 +559,10 @@ class ToolArtifactRuntime:
             LLMToolDefinition(
                 name=READ_ARTIFACT_TOOL_NAME,
                 description=(
-                    "Read a bounded UTF-8 chunk from a tool-result artifact previously externalized by agent-core. "
-                    "Use next_offset to continue; the artifact is not fully reviewed until eof is true."
+                    "Application tool results are artifact_result envelopes. If complete is true, content contains "
+                    "the full result and no read is needed. If materialization is preview or reference, use this "
+                    "tool only when missing details are needed. Start at the envelope next_offset after a preview, "
+                    "then follow each chunk next_offset until eof is true."
                 ),
                 parameters={
                     "type": "object",
@@ -510,16 +635,97 @@ class ToolArtifactRuntime:
             "tool_artifact_usage": self.usage.to_dict(),
         }
 
+    def _materialize_new(
+        self,
+        *,
+        descriptor: ToolArtifactDescriptor,
+        status: ToolExecutionStatus,
+        content: str,
+    ) -> ArtifactResultEnvelope:
+        if descriptor.size_bytes <= self.policy.max_complete_result_bytes:
+            return ArtifactResultEnvelope(
+                status=status,
+                artifact=descriptor,
+                materialization="complete",
+                content=content,
+                returned_bytes=descriptor.size_bytes,
+                complete=True,
+                next_offset=None,
+            )
+        try:
+            return self._read_preview(descriptor=descriptor, status=status)
+        except (FileNotFoundError, PermissionError, ValueError, OSError):
+            return ArtifactResultEnvelope.reference(status=status, artifact=descriptor)
+
+    def _materialize_stored(
+        self,
+        envelope: ArtifactResultEnvelope,
+    ) -> ArtifactResultEnvelope:
+        descriptor = envelope.artifact
+        try:
+            if descriptor.size_bytes <= self.policy.max_complete_result_bytes:
+                content = self.store.read_all_text(
+                    namespace_id=self.namespace_id,
+                    artifact_id=descriptor.artifact_id,
+                )
+                return ArtifactResultEnvelope(
+                    status=envelope.status,
+                    artifact=descriptor,
+                    materialization="complete",
+                    content=content,
+                    returned_bytes=descriptor.size_bytes,
+                    complete=True,
+                    next_offset=None,
+                )
+            return self._read_preview(descriptor=descriptor, status=envelope.status)
+        except (FileNotFoundError, PermissionError, ValueError, OSError):
+            return envelope.as_reference()
+
+    def _read_preview(
+        self,
+        *,
+        descriptor: ToolArtifactDescriptor,
+        status: ToolExecutionStatus,
+    ) -> ArtifactResultEnvelope:
+        limit = min(self.policy.preview_bytes, descriptor.size_bytes - 1)
+        chunk = self.store.read_text(
+            namespace_id=self.namespace_id,
+            artifact_id=descriptor.artifact_id,
+            offset=0,
+            limit=limit,
+        )
+        if chunk.eof:
+            return ArtifactResultEnvelope.reference(status=status, artifact=descriptor)
+        return ArtifactResultEnvelope(
+            status=status,
+            artifact=descriptor,
+            materialization="preview",
+            content=chunk.content,
+            returned_bytes=chunk.next_offset,
+            complete=False,
+            next_offset=chunk.next_offset,
+        )
+
+    def _materialization_bytes(self, descriptor: ToolArtifactDescriptor) -> int:
+        if descriptor.size_bytes <= self.policy.max_complete_result_bytes:
+            return descriptor.size_bytes
+        return min(self.policy.preview_bytes, descriptor.size_bytes - 1)
+
 
 def artifact_descriptor_from_message(message: LLMMessage) -> ToolArtifactDescriptor | None:
-    return ToolArtifactDescriptor.from_any(message.metadata.get(_ARTIFACT_METADATA_KEY))
+    envelope = artifact_envelope_from_message(message)
+    return envelope.artifact if envelope is not None else None
+
+
+def artifact_envelope_from_message(message: LLMMessage) -> ArtifactResultEnvelope | None:
+    return ArtifactResultEnvelope.from_any(message.metadata.get(_ARTIFACT_METADATA_KEY))
 
 
 def message_to_persistence_dict(message: LLMMessage) -> dict[str, Any]:
     payload = message.to_history_dict()
-    descriptor = artifact_descriptor_from_message(message)
-    if descriptor is not None:
-        payload["content"] = descriptor.reference_content()
+    envelope = artifact_envelope_from_message(message)
+    if envelope is not None:
+        payload["content"] = envelope.as_reference().to_content()
     if message.metadata:
         payload["_agent_core"] = dict(message.metadata)
     return payload

@@ -5,7 +5,7 @@ from collections.abc import Callable
 from uuid import uuid4
 
 from agent_core.execution_context import ExecutionContext
-from agent_core.llm.base import BaseLLMProvider, LLMMessage
+from agent_core.llm.base import BaseLLMProvider
 from agent_core.logging_utils import safe_preview
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_context import RunContext
@@ -25,9 +25,14 @@ from agent_core.structured_tasks import (
     StructuredTaskRunner,
     StructuredTaskSpec,
 )
-from agent_core.tool_artifacts import ArtifactStore
+from agent_core.tool_artifacts import (
+    ArtifactStore,
+    ToolArtifactRuntime,
+    ToolArtifactUsage,
+    artifact_descriptor_from_message,
+)
 from agent_core.tool_registry import ToolRegistry
-from agent_core.types import ToolResult
+from agent_core.types import ToolExecutionStatus, ToolResult
 
 
 class AgentRunService:
@@ -197,18 +202,37 @@ class AgentRunService:
                 arguments = loaded_arguments if isinstance(loaded_arguments, dict) else {}
             except json.JSONDecodeError:
                 arguments = {}
-            checkpoint.messages.append(
-                self._reconciled_tool_message(tool_call_id=tool_call_id, content=result.content)
+            status: ToolExecutionStatus = "ok" if result.ok else "tool_error"
+            artifact_runtime = ToolArtifactRuntime(
+                policy=checkpoint.tool_artifact_policy,
+                store=self.executor.artifact_store,
+                namespace_id=bound_context.namespace_id,
+                run_id=resolved_run_id,
+                usage=checkpoint.tool_artifact_usage,
             )
-            checkpoint.tool_history.append(
-                {
-                    "tool_name": pending.tool_name,
-                    "arguments": arguments,
-                    "status": "ok" if result.ok else "tool_error",
-                    "content_preview": safe_preview(result.content, limit=500),
+            tool_message = artifact_runtime.externalize(
+                tool_name=pending.tool_name,
+                content=result.content,
+                tool_call_id=tool_call_id,
+                status=status,
+                metadata={
+                    "status": status,
                     "reconciled_after_interruption": True,
-                }
+                },
             )
+            checkpoint.messages.append(tool_message)
+            checkpoint.tool_artifact_usage = ToolArtifactUsage.from_any(artifact_runtime.usage)
+            history_item = {
+                "tool_name": pending.tool_name,
+                "arguments": arguments,
+                "status": status,
+                "content_preview": safe_preview(result.content, limit=500),
+                "reconciled_after_interruption": True,
+            }
+            descriptor = artifact_descriptor_from_message(tool_message)
+            if descriptor is not None:
+                history_item["artifact_id"] = descriptor.artifact_id
+            checkpoint.tool_history.append(history_item)
             pending.status = "completed"
             checkpoint.next_tool_call_index += 1
             checkpoint.sequence += 1
@@ -386,7 +410,3 @@ class AgentRunService:
             persisted = StructuredTaskCheckpoint.from_dict(checkpoint.payload)
             return persisted is None or persisted.spec_fingerprint == spec.fingerprint()
         return True
-
-    @staticmethod
-    def _reconciled_tool_message(*, tool_call_id: str, content: str) -> LLMMessage:
-        return LLMMessage(role="tool", tool_call_id=tool_call_id, content=content)
