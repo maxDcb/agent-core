@@ -151,6 +151,12 @@ memory call. `memory_max_turn_input_chars`, `memory_max_handoff_chars`, and
 turn journal remains persisted even though only the latest compact handoff is
 injected into later prompts.
 
+For long turns, cumulative controller state and runtime/domain JSON are
+projected first. The serialized fixed payload is then measured and its exact
+remaining character budget is used for ordered exchange memories, prioritizing
+facts, evidence and artifact references, tested actions, hypotheses, risks and
+next actions.
+
 Raw history compaction keeps a contiguous suffix of complete turn groups. It
 stops at the first older group that does not fit instead of creating holes or
 retaining isolated pinned groups. The newest group is always kept, even when it

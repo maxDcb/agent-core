@@ -12,6 +12,10 @@
   the obsolete summary marker, delta/merge prompts, and legacy memory models.
 - Made replacement handoff synthesis conservatively retain still-relevant prior
   facts, constraints, failed approaches and unresolved contradictions.
+- Made the complete TurnMemory synthesis request respect its configured
+  character bound by projecting cumulative controller/runtime/domain context
+  before assigning the exact remaining budget to prioritized current-turn
+  exchanges.
 - Changed raw-history compaction to keep a contiguous suffix of complete turn
   groups, always retaining the newest group without isolated pinned history.
 - Added optional run-level `LLMBudget` enforcement and observation across

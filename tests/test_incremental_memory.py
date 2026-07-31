@@ -6,10 +6,16 @@ import pytest
 
 from agent_core.context_assembler import ContextAssembler
 from agent_core.llm.base import LLMCompletionResult, LLMMessage
-from agent_core.memory.committer import DEFAULT_TURN_MEMORY_SYNTHESIS_PROMPT
+from agent_core.memory.committer import (
+    DEFAULT_TURN_MEMORY_SYNTHESIS_PROMPT,
+    MemorySynthesisResult,
+    TurnMemoryCommitter,
+    TurnMemorySynthesisInput,
+)
 from agent_core.memory.context_block import estimate_token_count
 from agent_core.memory.derivation import derive_final_response_memory
 from agent_core.memory.journal import (
+    ExchangeMemory,
     IncrementalMemoryJournal,
     SessionView,
     TurnMemory,
@@ -284,6 +290,95 @@ def test_oversized_turn_memory_payload_falls_back_before_provider_call(tmp_path)
     assert provider.memory_payloads == []
     journal = orchestrator.session_manager.get_memory_journal()
     assert journal.turns[0].origin == "fallback"
+
+
+def test_turn_memory_projects_long_controller_state_and_exchanges_before_provider_call() -> None:
+    class CapturingSynthesizer:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] | None = None
+
+        def synthesize(self, *, request):
+            self.payload = request.payload
+            return MemorySynthesisResult(
+                turn_summary="Completed a long investigation turn.",
+                next_handoff="Continue with the retained HTTP evidence and next hypothesis.",
+            )
+
+    synthesizer = CapturingSynthesizer()
+    committer = TurnMemoryCommitter(
+        synthesizer=synthesizer,  # type: ignore[arg-type]
+        max_input_chars=64_000,
+    )
+    exchanges = [
+        ExchangeMemory(
+            memory_id=f"turn-0000-exchange-{index:02d}",
+            thread_id="thread",
+            turn_index=0,
+            exchange_index=index,
+            kind="reflection" if index % 2 else "tool_exchange",
+            summary=(
+                f"HTTP 200 evidence for payload {index}: "
+                + ("response-body " * 180)
+            ),
+            confirmed_facts=[f"Constraint {index}: " + ("fact " * 180)],
+            open_hypotheses=[f"Next payload hypothesis {index}: " + ("candidate " * 120)],
+            completed_actions=[f"Tested payload {index}: " + ("tested " * 100)],
+            next_actions=[f"Try follow-up {index}: " + ("next " * 100)],
+            relevant_artifacts=[f"http-response-{index:03d}"],
+        )
+        for index in range(61)
+    ]
+    controller_state = {
+        "objective": "Retrieve /flag.txt through the confirmed file-read endpoint.",
+        "facts": [f"Established constraint {index}: " + ("detail " * 180) for index in range(40)],
+        "hypotheses": [
+            {"statement": f"Payload family {index}: " + ("candidate " * 160), "status": "open"}
+            for index in range(40)
+        ],
+        "completed_actions": [f"Already tested {index}: " + ("payload " * 180) for index in range(40)],
+        "next_actions": ["Preserve and test the strongest remaining payload family."],
+    }
+    raw_variable_chars = len(
+        json.dumps(
+            {
+                "controller_state": controller_state,
+                "exchange_memories": [exchange.to_dict() for exchange in exchanges],
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+    )
+
+    result = committer.synthesize(
+        TurnMemorySynthesisInput(
+            thread_id="thread",
+            turn_index=0,
+            user_intent="Continue the authorized file-read investigation.",
+            assistant_outcome="The turn tested many payloads and retained live HTTP evidence.",
+            exchange_memories=exchanges,
+            source_block_ids=["turn-0000-conversation"],
+            previous_handoff="Keep the established parser and path-normalization constraints.",
+            runtime_context={"source_code_locations": ["/data/workspace/nextpath/app"]},
+            controller_state=controller_state,
+            domain_payload={"domain": "authorized_pentest"},
+            domain_guidance="Keep evidence, tested payloads, constraints, and next hypotheses.",
+        )
+    )
+
+    assert raw_variable_chars > 64_000
+    assert result.origin == "model"
+    assert synthesizer.payload is not None
+    serialized_payload = json.dumps(
+        synthesizer.payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    assert len(serialized_payload) <= 64_000
+    assert len(synthesizer.payload["exchange_memories"]) == 61  # type: ignore[arg-type]
+    assert "Retrieve /flag.txt" in serialized_payload
+    assert "HTTP 200 evidence" in serialized_payload
+    assert "http-response-060" in serialized_payload
+    assert "Next payload hypothesis 60" in serialized_payload
 
 
 def test_oversized_model_handoff_is_rejected_and_falls_back(tmp_path) -> None:

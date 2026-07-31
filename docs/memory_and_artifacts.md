@@ -42,6 +42,15 @@ It never receives the complete conversation or the raw historical overflow.
 - `memory_max_turn_summary_chars` to `turn_summary`;
 - `memory_max_handoff_chars` to both the previous and replacement handoff.
 
+The committer first projects cumulative controller state and optional
+runtime/domain JSON into bounded representations. It then measures the
+serialized fixed payload and assigns the exact remaining input budget to
+current-turn exchanges. Exchange projection favors grounded facts, evidence
+and artifact references, completed tests, active or rejected hypotheses, risk
+notes and next actions. Long investigation turns therefore remain eligible for
+model synthesis instead of falling back merely because independently estimated
+sub-budgets add up beyond `memory_max_turn_input_chars`.
+
 `turn_memory_synthesis_prompt` can replace the built-in instructions. An empty
 value uses the built-in prompt.
 
