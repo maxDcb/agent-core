@@ -125,6 +125,32 @@ implementation separately as `model_backend="native"` or `"langchain"` in
 completion records, run results, structured-task checkpoints, and conversation
 trace response events.
 
+### Optional LangGraph direct-agent kernel
+
+The conversation orchestrator can use LangGraph for the internal control flow
+of `direct` turns. This switch is independent from the model backend: native or
+LangChain model invocation can be used with either agent kernel.
+
+```bash
+AGENT_CORE_AGENT_KERNEL_BACKEND=langgraph
+```
+
+The default remains `native`. In the current incremental scope, LangGraph owns
+the `call_model -> execute_tools -> call_model` transitions and terminal routes
+for direct turns. `investigate` and `deep_investigate` still use the existing
+controller. Session persistence, pending-tool payloads, resume idempotence,
+budgets, artifacts, traces, and memory commits remain owned by agent-core; the
+LangGraph graph is intentionally compiled without a checkpointer to avoid two
+competing durable state stores.
+
+The same explicit LangSmith privacy boundary applies to graph execution:
+tracing stays disabled unless `AGENT_CORE_LANGCHAIN_TRACING_ENABLED=true`, even
+if the process inherits `LANGSMITH_TRACING=true`.
+
+See [docs/langgraph_migration.md](docs/langgraph_migration.md) for the state and
+transition map, current ownership boundaries, and the remaining full-graph
+migration work.
+
 Paid Azure integration tests are excluded from normal test runs. To execute the
 same behavioral matrix against both backends:
 
@@ -139,6 +165,9 @@ AZURE_OPENAI_API_KEY=... \
 Use `AGENT_CORE_LIVE_LLM_BACKENDS=native` or `langchain` to test only one
 implementation. The live suite covers reasoning and usage metadata, strict JSON
 Schema output, a complete tool-result roundtrip, and `StructuredTaskRunner`.
+When the LangChain model backend is selected, it also compares native and
+LangGraph direct-agent kernels through the full conversation tool loop and
+validates a real LangGraph pending/resume cycle.
 
 See [examples/README.md](examples/README.md) for the pending tool result and
 resume example.

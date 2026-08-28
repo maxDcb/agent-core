@@ -112,6 +112,7 @@ def build_settings(*, model: str, memory_model: str, session_file: Path) -> Core
     return CoreSettings(
         llm_provider=os.getenv("LLM_PROVIDER", "openai"),
         llm_model_backend=os.getenv("AGENT_CORE_MODEL_BACKEND", "native"),
+        agent_kernel_backend=os.getenv("AGENT_CORE_AGENT_KERNEL_BACKEND", "native"),
         langchain_tracing_enabled=_env_flag("AGENT_CORE_LANGCHAIN_TRACING_ENABLED"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -392,6 +393,9 @@ def run_compatibility_checks(settings: CoreSettings) -> int:
 def missing_provider_config(settings: CoreSettings) -> list[str]:
     provider_name = normalize_provider_name(settings.llm_provider)
     model_backend = normalize_model_backend(settings.llm_model_backend)
+    agent_kernel_backend = settings.agent_kernel_backend.strip().lower().replace("-", "_")
+    if agent_kernel_backend not in {"native", "langgraph"}:
+        return [f"unsupported AGENT_CORE_AGENT_KERNEL_BACKEND={settings.agent_kernel_backend!r}"]
     if model_backend not in {"native", "langchain"}:
         return [f"unsupported AGENT_CORE_MODEL_BACKEND={settings.llm_model_backend!r}"]
     if model_backend == "langchain" and provider_name != "azure_openai":

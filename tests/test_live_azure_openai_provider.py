@@ -9,12 +9,18 @@ import pytest
 from agent_core.execution_context import ExecutionContext
 from agent_core.llm.base import LLMCallOptions, LLMMessage, LLMToolDefinition
 from agent_core.llm.provider_factory import LLMProviderConfig, build_provider_from_config
+from agent_core.orchestrator import AgentOrchestrator
 from agent_core.output_contracts import StructuredOutputContract
 from agent_core.policy_engine import PolicyEngine
 from agent_core.run_context import RunContext
+from agent_core.session_manager import SessionManager
+from agent_core.session_repo import SessionRepository
 from agent_core.settings import CoreSettings
 from agent_core.structured_tasks import StructuredTaskRunner, StructuredTaskSpec
 from agent_core.tool_registry import ToolRegistry
+from agent_core.tools import build_tool_definition
+from agent_core.types import ToolResult
+from tests.run_helpers import resume_turn, run_turn, turn_memory_payload
 
 pytestmark = pytest.mark.live_llm
 
@@ -26,6 +32,44 @@ class LiveAzureConfig:
     api_version: str
     model: str
     enabled_backends: frozenset[str]
+
+
+class DeterministicMemoryProvider:
+    """Keep live kernel checks focused on the agent model and graph flow."""
+
+    def complete_text(self, *, messages, model, temperature, options=None):
+        return json.dumps(turn_memory_payload(objective="Live LangGraph kernel validation"))
+
+    def complete_with_tools(self, *, messages, tools, model, temperature, options=None):
+        raise AssertionError("The deterministic memory provider must not run the agent tool loop")
+
+
+class LiveEchoTool:
+    name = "live_echo"
+    description = "Return the supplied text unchanged. Always use this when the user asks for live_echo."
+
+    def schema(self):
+        return build_tool_definition(
+            name=self.name,
+            description=self.description,
+            parameters={
+                "type": "object",
+                "properties": {"text": {"type": "string"}},
+                "required": ["text"],
+                "additionalProperties": False,
+            },
+        )
+
+    def execute(self, arguments, context):
+        return ToolResult(ok=True, content=str(arguments["text"]))
+
+
+class LivePendingTool(LiveEchoTool):
+    name = "live_pending"
+    description = "Start external work and wait for its result. Always use this when the user asks for live_pending."
+
+    def execute(self, arguments, context):
+        return ToolResult.pending_result("live-pending-wait", metadata={"requested_text": arguments["text"]})
 
 
 @pytest.fixture(scope="session")
@@ -234,6 +278,126 @@ def test_live_structured_task_runner(live_provider, live_azure_config: LiveAzure
     assert result.output == {"ok": True, "component": "structured_task"}
     assert result.llm_calls
     assert all(call.model_backend == backend for call in result.llm_calls)
+
+
+def _build_live_conversation_orchestrator(
+    *,
+    live_azure_config: LiveAzureConfig,
+    tmp_path,
+    agent_kernel_backend: str,
+    tool: LiveEchoTool,
+) -> AgentOrchestrator:
+    provider = build_provider_from_config(
+        LLMProviderConfig(
+            provider="azure_openai",
+            model_backend="langchain",
+            azure_openai_endpoint=live_azure_config.endpoint,
+            azure_openai_api_key=live_azure_config.api_key,
+            azure_openai_api_version=live_azure_config.api_version,
+            timeout_seconds=120.0,
+            langchain_tracing_enabled=False,
+        )
+    )
+    settings = CoreSettings(
+        llm_provider="azure_openai",
+        llm_model_backend="langchain",
+        agent_kernel_backend=agent_kernel_backend,
+        azure_openai_endpoint=live_azure_config.endpoint,
+        azure_openai_api_key=live_azure_config.api_key,
+        azure_openai_api_version=live_azure_config.api_version,
+        model=live_azure_config.model,
+        memory_model=live_azure_config.model,
+        llm_max_output_tokens=512,
+        session_file=tmp_path / "session.json",
+        base_system_prompt=(
+            "You are a deterministic integration-test assistant. Follow the user's explicit tool instruction exactly, "
+            "then return the exact requested marker without commentary."
+        ),
+        turn_memory_synthesis_prompt="unused by the deterministic memory provider",
+    )
+    registry = ToolRegistry()
+    registry.register(tool)
+    return AgentOrchestrator(
+        settings=settings,
+        provider=provider,
+        memory_provider=DeterministicMemoryProvider(),
+        registry=registry,
+        session_manager=SessionManager(SessionRepository(settings.session_file)),
+        policy_engine=PolicyEngine(),
+    )
+
+
+@pytest.mark.parametrize("agent_kernel_backend", ["native", "langgraph"])
+def test_live_conversation_tool_loop_kernel_parity(
+    live_azure_config: LiveAzureConfig,
+    tmp_path,
+    agent_kernel_backend: str,
+) -> None:
+    if "langchain" not in live_azure_config.enabled_backends:
+        pytest.skip("The live agent-kernel matrix requires the LangChain model backend")
+    orchestrator = _build_live_conversation_orchestrator(
+        live_azure_config=live_azure_config,
+        tmp_path=tmp_path,
+        agent_kernel_backend=agent_kernel_backend,
+        tool=LiveEchoTool(),
+    )
+
+    result = run_turn(
+        orchestrator,
+        "Call live_echo exactly once with text live-kernel-result. Then answer exactly: live-kernel-result",
+    )
+
+    assert result.status == "completed"
+    assert result.content.strip().strip("\"'").rstrip(".") == "live-kernel-result"
+    assert [item["status"] for item in orchestrator.session_manager.get_state()["tool_history"]] == ["ok"]
+    assert [block.kind for block in orchestrator.session_manager.get_context_blocks()] == [
+        "tool_exchange",
+        "conversation_turn",
+    ]
+    trace_id = result.metadata["run_trace_id"]
+    trace = orchestrator.session_manager.load_run_trace(str(trace_id))
+    assert trace is not None
+    assert trace["options"]["agent_kernel_backend"] == agent_kernel_backend
+    assistant_events = [event for event in trace["events"] if event["type"] == "assistant_response_received"]
+    assert len(assistant_events) == 2
+    assert all(event["payload"]["model_backend"] == "langchain" for event in assistant_events)
+
+
+def test_live_langgraph_pending_resume(live_azure_config: LiveAzureConfig, tmp_path) -> None:
+    if "langchain" not in live_azure_config.enabled_backends:
+        pytest.skip("The live agent-kernel matrix requires the LangChain model backend")
+    orchestrator = _build_live_conversation_orchestrator(
+        live_azure_config=live_azure_config,
+        tmp_path=tmp_path,
+        agent_kernel_backend="langgraph",
+        tool=LivePendingTool(),
+    )
+
+    pending = run_turn(
+        orchestrator,
+        "Call live_pending exactly once with text live-resume-result. Wait for its result before answering.",
+    )
+
+    assert pending.status == "pending_tool_result"
+    assert pending.pending_id
+    assert pending.tool_name == "live_pending"
+
+    completed = resume_turn(
+        orchestrator,
+        pending_id=pending.pending_id,
+        tool_content="live-resume-result",
+    )
+
+    assert completed.status == "completed"
+    assert "live-resume-result" in completed.content
+    assert [item["status"] for item in orchestrator.session_manager.get_state()["tool_history"]] == [
+        "pending",
+        "ok",
+    ]
+    assert [block.kind for block in orchestrator.session_manager.get_context_blocks()] == [
+        "tool_exchange",
+        "conversation_turn",
+    ]
 
 
 def _env_flag(name: str) -> bool:

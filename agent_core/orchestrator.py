@@ -7,6 +7,7 @@ from inspect import Parameter, signature
 from typing import Any
 from uuid import uuid4
 
+from agent_core.agent_graph.direct import build_direct_turn_kernel
 from agent_core.context_planner import (
     LLMContextPlanner,
     LLMContextPolicy,
@@ -129,6 +130,10 @@ class AgentOrchestrator:
             max_handoff_chars=settings.memory_max_handoff_chars,
             max_turn_summary_chars=settings.memory_max_turn_summary_chars,
         )
+        self._direct_turn_nodes, self._direct_turn_kernel = build_direct_turn_kernel(
+            backend=settings.agent_kernel_backend,
+            operations=self,
+        )
 
     def _build_tool_history_item(
         self,
@@ -192,6 +197,9 @@ class AgentOrchestrator:
             turn_index=turn_index,
             options={
                 "run_options": asdict(run_options),
+                "agent_kernel_backend": (
+                    self._direct_turn_kernel.backend if run_options.mode == "direct" else "native"
+                ),
                 "model": self.settings.model,
                 "max_active_context_tokens": self.settings.max_active_context_tokens,
                 "max_tool_calls_per_turn": self.settings.max_tool_calls_per_turn,
@@ -729,6 +737,9 @@ class AgentOrchestrator:
                 "thread_id": context.thread_id,
                 "user_input_length": len(user_input),
                 "mode": run_options.mode,
+                "agent_kernel_backend": (
+                    self._direct_turn_kernel.backend if run_options.mode == "direct" else "native"
+                ),
             },
         )
         state = self.session_manager.get_state()
@@ -1604,154 +1615,14 @@ class AgentOrchestrator:
         exchange_index: int,
         trace: RunTrace | None = None,
     ) -> AgentTurnResult:
-        start_prompt_tokens = self._estimate_prompt_tokens(messages=messages)
-        tool_loop_reserve_tokens = max(1, self.settings.max_active_context_tokens)
-        prompt_reserve_warning_emitted = False
-        model_call_index = 0
-
-        while True:
-            model_call_index += 1
-            prompt_tokens = self._estimate_prompt_tokens(messages=messages)
-            prompt_growth_tokens = max(0, prompt_tokens - start_prompt_tokens)
-            logger.debug(
-                "Calling LLM",
-                extra={
-                    "model": self.settings.model,
-                    "message_count": len(messages),
-                    "estimated_prompt_tokens": prompt_tokens,
-                    "start_turn_prompt_tokens": start_prompt_tokens,
-                    "tool_loop_reserve_tokens": tool_loop_reserve_tokens,
-                    "prompt_growth_tokens": prompt_growth_tokens,
-                },
-            )
-            if (
-                tool_calls_used > 0
-                and prompt_growth_tokens >= tool_loop_reserve_tokens
-                and not prompt_reserve_warning_emitted
-            ):
-                logger.warning(
-                    "Tool loop consumed the start-turn prompt reserve",
-                    extra={
-                        "estimated_prompt_tokens": prompt_tokens,
-                        "start_turn_prompt_tokens": start_prompt_tokens,
-                        "prompt_growth_tokens": prompt_growth_tokens,
-                        "tool_loop_reserve_tokens": tool_loop_reserve_tokens,
-                        "tool_calls_used": tool_calls_used,
-                    },
-                )
-                prompt_reserve_warning_emitted = True
-            self._record_trace_event(
-                trace,
-                event_type="llm_call_started",
-                summary="LLM call started",
-                iteration=model_call_index,
-                payload={
-                    "message_count": len(messages),
-                    "estimated_prompt_tokens": prompt_tokens,
-                    "tool_calls_used": tool_calls_used,
-                    "exchange_index": exchange_index,
-                },
-            )
-            try:
-                llm_response = self._call_model_once(messages=messages)
-            except LLMProviderError as exc:
-                self._record_trace_event(
-                    trace,
-                    event_type="llm_provider_failure",
-                    summary="LLM provider failure handled",
-                    iteration=model_call_index,
-                    payload={
-                        "kind": exc.kind,
-                        "detail_preview": safe_preview(exc.detail or exc.user_message, limit=200),
-                    },
-                )
-                return self._handle_provider_failure(
-                    error=exc,
-                    user_input=user_input,
-                    turn_index=turn_index,
-                )
-
-            logger.debug(
-                "Received LLM response",
-                extra={
-                    "content_length": len(llm_response.content),
-                    "tool_call_count": len(llm_response.tool_calls),
-                    "provider": llm_response.provider,
-                    "model_backend": llm_response.model_backend,
-                    "model": llm_response.model,
-                    "provider_attempts": llm_response.provider_attempts,
-                },
-            )
-
-            assistant_message = LLMMessage(
-                role="assistant",
-                content=llm_response.content,
-                tool_calls=list(llm_response.tool_calls),
-            )
-            messages.append(assistant_message)
-            self._record_trace_event(
-                trace,
-                event_type="assistant_response_received",
-                summary="Assistant response received",
-                iteration=model_call_index,
-                payload={
-                    "content_length": len(llm_response.content),
-                    "tool_call_count": len(llm_response.tool_calls),
-                    "tool_calls": [
-                        {"id": tool_call.id, "name": tool_call.name} for tool_call in llm_response.tool_calls
-                    ],
-                    "provider": llm_response.provider,
-                    "model_backend": llm_response.model_backend,
-                    "model": llm_response.model,
-                    "provider_request_id": llm_response.provider_request_id,
-                    "provider_attempts": llm_response.provider_attempts,
-                    "usage": llm_response.usage.to_dict() if llm_response.usage is not None else None,
-                },
-            )
-
-            if not llm_response.tool_calls:
-                self._persist_conversation_turn(
-                    turn_index=turn_index,
-                    user_input=user_input,
-                    assistant_content=llm_response.content,
-                )
-                self._refresh_memory_after_turn(turn_index=turn_index)
-                logger.info("Completing run_turn without additional tool calls")
-                return AgentTurnResult(status="completed", content=llm_response.content)
-
-            tool_step = self._execute_tool_calls_once(
-                user_input=user_input,
-                session_id=session_id,
-                context=context,
-                messages=messages,
-                turn_index=turn_index,
-                exchange_index=exchange_index,
-                tool_calls_used=tool_calls_used,
-                assistant_message=assistant_message,
-                max_tool_calls=self.settings.max_tool_calls_per_turn,
-                trace=trace,
-            )
-            messages = tool_step.messages
-            exchange_index = tool_step.exchange_index
-            tool_calls_used = tool_step.tool_calls_used
-
-            if tool_step.pending_result is not None:
-                return tool_step.pending_result
-
-            if tool_step.budget_exhausted:
-                msg = "Maximum number of tool calls reached for this turn."
-                logger.error(msg)
-                self._record_trace_event(
-                    trace,
-                    event_type="tool_budget_exhausted",
-                    summary=msg,
-                    iteration=model_call_index,
-                    payload={"tool_calls_used": tool_calls_used},
-                )
-                self._persist_conversation_turn(
-                    turn_index=turn_index,
-                    user_input=user_input,
-                    assistant_content=msg,
-                )
-                self._refresh_memory_after_turn(turn_index=turn_index)
-                return AgentTurnResult(status="completed", content=msg)
+        state = self._direct_turn_nodes.initial_state(
+            user_input=user_input,
+            session_id=session_id,
+            context=context,
+            messages=messages,
+            turn_index=turn_index,
+            tool_calls_used=tool_calls_used,
+            exchange_index=exchange_index,
+            trace=trace,
+        )
+        return self._direct_turn_kernel.run(state)

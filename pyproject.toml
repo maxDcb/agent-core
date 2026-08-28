@@ -28,6 +28,7 @@ dependencies = [
     "jsonschema[format]>=4.23.0,<5",
     "langchain-core>=1.6.0,<2.0.0",
     "langchain-openai>=1.6.0,<2.0.0",
+    "langgraph>=1.2.10,<2.0.0",
     "langsmith>=0.11.0,<1.0.0",
     "openai>=2.45.0,<4.0.0",
     "requests>=2.31.0",

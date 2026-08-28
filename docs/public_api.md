@@ -55,6 +55,12 @@ LangSmith tracing is disabled for LangChain model calls unless
 override takes precedence over an inherited `LANGSMITH_TRACING` environment
 setting so host applications do not export prompts or tool results by accident.
 
+`CoreSettings.agent_kernel_backend` independently selects `native` or
+`langgraph` control flow for direct conversation turns. LangGraph state, nodes,
+and compiled graphs are internal implementation details and are not exported
+from a supported facade. Investigation modes and headless structured runs are
+unchanged by this setting.
+
 ## Optional conversation API: `agent_core.conversation`
 
 Conversation support is an adapter over runs. It contains the orchestrator,

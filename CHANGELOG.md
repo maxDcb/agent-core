@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Added an opt-in LangGraph kernel for direct conversation turns behind
+  `CoreSettings.agent_kernel_backend`, using a typed internal state and shared
+  native/LangGraph node behavior while preserving agent-core persistence,
+  pending resume, budgets, artifacts, traces, and memory contracts, plus an
+  opt-in real-model kernel parity and pending/resume test matrix.
 - Added an opt-in LangChain model backend for Azure OpenAI behind the existing
   `BaseLLMProvider` contract, with shared request normalization, adaptive retry,
   token usage, tool-call, request-id, and primary/memory provider semantics.

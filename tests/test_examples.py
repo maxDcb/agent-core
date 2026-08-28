@@ -89,6 +89,7 @@ def test_quickstart_build_settings_reads_langchain_model_backends(tmp_path, monk
     monkeypatch.setenv("LLM_PROVIDER", "azure_openai")
     monkeypatch.setenv("AGENT_CORE_MODEL_BACKEND", "langchain")
     monkeypatch.setenv("AGENT_CORE_MEMORY_MODEL_BACKEND", "native")
+    monkeypatch.setenv("AGENT_CORE_AGENT_KERNEL_BACKEND", "langgraph")
     monkeypatch.setenv("AGENT_CORE_LANGCHAIN_TRACING_ENABLED", "true")
     monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
     monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test-key")
@@ -101,6 +102,7 @@ def test_quickstart_build_settings_reads_langchain_model_backends(tmp_path, monk
 
     assert settings.llm_model_backend == "langchain"
     assert settings.memory_llm_model_backend == "native"
+    assert settings.agent_kernel_backend == "langgraph"
     assert settings.langchain_tracing_enabled is True
     assert quickstart.missing_provider_config(settings) == []
 
