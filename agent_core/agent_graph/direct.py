@@ -2,7 +2,12 @@ from __future__ import annotations
 
 from typing import Any, Literal, Protocol, cast
 
-from agent_core.agent_graph.state import AgentGraphState, AgentGraphUpdate
+from agent_core.agent_graph.state import (
+    AgentGraphState,
+    AgentGraphUpdate,
+    build_graph_checkpoint,
+    normalize_agent_kernel_backend,
+)
 from agent_core.execution_context import ExecutionContext
 from agent_core.llm.base import LLMCompletionResult, LLMMessage
 from agent_core.llm.errors import LLMProviderError
@@ -81,10 +86,6 @@ class DirectTurnOperations(Protocol):
     ) -> ToolExecutionStepResult: ...
 
 
-def normalize_agent_kernel_backend(value: str) -> str:
-    return value.strip().lower().replace("-", "_")
-
-
 class DirectTurnNodes:
     """Behavior shared by the native loop and LangGraph transitions."""
 
@@ -102,6 +103,7 @@ class DirectTurnNodes:
         tool_calls_used: int,
         exchange_index: int,
         trace: RunTrace | None,
+        resume_tool_step: ToolExecutionStepResult | None = None,
     ) -> AgentGraphState:
         return AgentGraphState(
             user_input=user_input,
@@ -117,9 +119,16 @@ class DirectTurnNodes:
             prompt_reserve_warning_emitted=False,
             model_call_index=0,
             assistant_message=None,
-            tool_step=None,
-            result=None,
+            tool_step=resume_tool_step,
+            result=resume_tool_step.pending_result if resume_tool_step is not None else None,
+            entrypoint="after_tools" if resume_tool_step is not None else "model",
         )
+
+    @staticmethod
+    def route_entry(state: AgentGraphState) -> AfterToolsRoute:
+        if state["entrypoint"] == "model":
+            return "call_model"
+        return DirectTurnNodes.route_after_tools(state)
 
     def call_model(self, state: AgentGraphState) -> AgentGraphUpdate:
         messages = list(state["messages"])
@@ -273,6 +282,13 @@ class DirectTurnNodes:
             tool_calls_used=state["tool_calls_used"],
             assistant_message=assistant_message,
             max_tool_calls=self.operations.settings.max_tool_calls_per_turn,
+            pending_metadata_extra={
+                "agent_graph_checkpoint": build_graph_checkpoint(
+                    graph="direct",
+                    backend=normalize_agent_kernel_backend(self.operations.settings.agent_kernel_backend),
+                    resume_node="resume_tool_exchange",
+                )
+            },
             trace=state["trace"],
         )
         return {
@@ -327,6 +343,19 @@ class NativeDirectTurnKernel:
 
     def run(self, initial_state: AgentGraphState) -> AgentTurnResult:
         state = initial_state
+        entry_route = self.nodes.route_entry(state)
+        if entry_route == "end":
+            result = state["result"]
+            if result is None:
+                raise RuntimeError("Native direct agent kernel resumed without a result")
+            return result
+        if entry_route == "complete_budget":
+            state.update(self.nodes.complete_budget(state))
+            result = state["result"]
+            if result is None:
+                raise RuntimeError("Native direct agent kernel budget completion produced no result")
+            return result
+
         while True:
             state.update(self.nodes.call_model(state))
             model_route = self.nodes.route_after_model(state)
@@ -362,7 +391,15 @@ class LangGraphDirectTurnKernel:
         builder.add_node("complete_response", nodes.complete_response)
         builder.add_node("execute_tools", nodes.execute_tools)
         builder.add_node("complete_budget", nodes.complete_budget)
-        builder.add_edge(START, "call_model")
+        builder.add_conditional_edges(
+            START,
+            nodes.route_entry,
+            {
+                "call_model": "call_model",
+                "complete_budget": "complete_budget",
+                "end": END,
+            },
+        )
         builder.add_conditional_edges(
             "call_model",
             nodes.route_after_model,

@@ -205,6 +205,7 @@ def build_orchestrator(
     policy_engine: PolicyEngine | None = None,
     pending: bool = False,
     domain_hooks: DomainHooks | None = None,
+    agent_kernel_backend: str = "native",
 ):
     settings = CoreSettings(
         openai_api_key="test",
@@ -214,6 +215,7 @@ def build_orchestrator(
         base_system_prompt="system",
         turn_memory_synthesis_prompt="memory",
         max_active_context_tokens=100000,
+        agent_kernel_backend=agent_kernel_backend,
     )
     registry = ToolRegistry()
     registry.register(PendingTool() if pending else EchoTool())

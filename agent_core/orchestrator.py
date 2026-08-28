@@ -197,9 +197,7 @@ class AgentOrchestrator:
             turn_index=turn_index,
             options={
                 "run_options": asdict(run_options),
-                "agent_kernel_backend": (
-                    self._direct_turn_kernel.backend if run_options.mode == "direct" else "native"
-                ),
+                "agent_kernel_backend": self._direct_turn_kernel.backend,
                 "model": self.settings.model,
                 "max_active_context_tokens": self.settings.max_active_context_tokens,
                 "max_tool_calls_per_turn": self.settings.max_tool_calls_per_turn,
@@ -737,9 +735,7 @@ class AgentOrchestrator:
                 "thread_id": context.thread_id,
                 "user_input_length": len(user_input),
                 "mode": run_options.mode,
-                "agent_kernel_backend": (
-                    self._direct_turn_kernel.backend if run_options.mode == "direct" else "native"
-                ),
+                "agent_kernel_backend": self._direct_turn_kernel.backend,
             },
         )
         state = self.session_manager.get_state()
@@ -840,6 +836,9 @@ class AgentOrchestrator:
                         status="completed",
                         content="Pending agent turn is incompatible with the current artifact contract.",
                     )
+                graph_checkpoint_error = self._validate_pending_graph_checkpoint(pending)
+                if graph_checkpoint_error is not None:
+                    return AgentTurnResult(status="completed", content=graph_checkpoint_error)
 
                 pending_run_id = pending.get("run_trace_id")
                 bound_context = context.with_run_id(
@@ -945,6 +944,18 @@ class AgentOrchestrator:
             return AgentTurnResult(status="completed", content="Pending agent turn disappeared before resume.")
 
         trace = self._load_run_trace_from_pending(pending)
+        graph_checkpoint = pending.get("agent_graph_checkpoint")
+        if isinstance(graph_checkpoint, dict):
+            self._record_trace_event(
+                trace,
+                event_type="agent_graph_checkpoint_restored",
+                summary="Agent graph checkpoint restored",
+                payload={
+                    "graph": graph_checkpoint.get("graph"),
+                    "backend": graph_checkpoint.get("backend"),
+                    "resume_node": graph_checkpoint.get("resume_node"),
+                },
+            )
         self._record_trace_event(
             trace,
             event_type="pending_tool_result_received",
@@ -1006,31 +1017,41 @@ class AgentOrchestrator:
                 else result
             )
 
-        if tool_step.budget_exhausted:
-            msg = "Maximum number of tool calls reached for this turn."
-            self._persist_conversation_turn(
-                turn_index=resumed.turn_index,
-                user_input=resumed.user_input,
-                assistant_content=msg,
-            )
-            self._refresh_memory_after_turn(turn_index=resumed.turn_index)
-            result = AgentTurnResult(status="completed", content=msg)
-        else:
-            result = self._continue_turn(
-                user_input=resumed.user_input,
-                session_id=context.namespace_id,
-                context=execution_context,
-                messages=tool_step.messages,
-                turn_index=resumed.turn_index,
-                tool_calls_used=tool_step.tool_calls_used,
-                exchange_index=tool_step.exchange_index,
-                trace=trace,
-            )
+        result = self._continue_turn(
+            user_input=resumed.user_input,
+            session_id=context.namespace_id,
+            context=execution_context,
+            messages=tool_step.messages,
+            turn_index=resumed.turn_index,
+            tool_calls_used=tool_step.tool_calls_used,
+            exchange_index=tool_step.exchange_index,
+            trace=trace,
+            resume_tool_step=tool_step,
+        )
         return (
             self._finalize_run_trace_result(trace=trace, result=result, expose_trace_id=bool(result.metadata))
             if trace is not None
             else result
         )
+
+    @staticmethod
+    def _validate_pending_graph_checkpoint(pending: dict[str, Any]) -> str | None:
+        raw_checkpoint = pending.get("agent_graph_checkpoint")
+        if raw_checkpoint is None:
+            return None
+        if not isinstance(raw_checkpoint, dict):
+            return "Pending agent graph checkpoint is corrupt."
+        expected_graph = (
+            "investigation" if pending.get("mode") in {"investigate", "deep_investigate"} else "direct"
+        )
+        if (
+            raw_checkpoint.get("schema_version") != "1"
+            or raw_checkpoint.get("graph") != expected_graph
+            or raw_checkpoint.get("backend") not in {"native", "langgraph"}
+            or raw_checkpoint.get("resume_node") != "resume_tool_exchange"
+        ):
+            return "Pending agent graph checkpoint is incompatible with the current graph contract."
+        return None
 
     def _build_investigation_prompt_set(self, *, options: RunOptions) -> InvestigationPromptSet:
         return self.domain_hooks.customize_investigation_prompts(
@@ -1614,6 +1635,7 @@ class AgentOrchestrator:
         tool_calls_used: int,
         exchange_index: int,
         trace: RunTrace | None = None,
+        resume_tool_step: ToolExecutionStepResult | None = None,
     ) -> AgentTurnResult:
         state = self._direct_turn_nodes.initial_state(
             user_input=user_input,
@@ -1624,5 +1646,6 @@ class AgentOrchestrator:
             tool_calls_used=tool_calls_used,
             exchange_index=exchange_index,
             trace=trace,
+            resume_tool_step=resume_tool_step,
         )
         return self._direct_turn_kernel.run(state)

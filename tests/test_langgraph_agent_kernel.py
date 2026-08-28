@@ -202,6 +202,13 @@ def test_langgraph_direct_pending_resume_uses_existing_persistence_contract(tmp_
     assert pending.pending_id
     persisted = orchestrator.session_manager.get_state()["meta"][AgentOrchestrator.PENDING_TURN_META_KEY]
     assert persisted["pending_id"] == pending.pending_id
+    assert persisted["agent_graph_checkpoint"] == {
+        "schema_version": "1",
+        "graph": "direct",
+        "backend": "langgraph",
+        "resume_node": "resume_tool_exchange",
+    }
+    trace_id = str(persisted["run_trace_id"])
 
     completed = resume_turn(orchestrator, pending_id=pending.pending_id, tool_content="external result")
 
@@ -212,6 +219,30 @@ def test_langgraph_direct_pending_resume_uses_existing_persistence_contract(tmp_
         "tool_exchange",
         "conversation_turn",
     ]
+    assert "agent_graph_checkpoint_restored" in _trace_event_types(orchestrator, trace_id)
+
+
+def test_langgraph_direct_rejects_corrupt_pending_checkpoint(tmp_path: Path) -> None:
+    provider = ScriptedProvider([tool_call("pending", value="job-1"), LLMCompletionResult(content="unused")])
+    orchestrator = build_orchestrator(
+        tmp_path,
+        backend="langgraph",
+        provider=provider,
+        tool=PendingTool(),
+    )
+
+    pending = run_turn(orchestrator, "start external work")
+    assert pending.pending_id
+    persisted = orchestrator.session_manager.get_state()["meta"][AgentOrchestrator.PENDING_TURN_META_KEY]
+    persisted["agent_graph_checkpoint"]["graph"] = "investigation"
+    orchestrator.session_manager.set_meta_value(AgentOrchestrator.PENDING_TURN_META_KEY, persisted)
+
+    completed = resume_turn(orchestrator, pending_id=pending.pending_id, tool_content="must not be injected")
+
+    assert completed.status == "completed"
+    assert completed.content == "Pending agent graph checkpoint is incompatible with the current graph contract."
+    assert provider.chat_calls == 1
+    assert orchestrator.session_manager.get_context_blocks() == []
 
 
 def test_langgraph_direct_preserves_provider_failure_handling(tmp_path: Path) -> None:

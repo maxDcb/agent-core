@@ -4,6 +4,7 @@ import json
 from dataclasses import asdict
 from typing import Any, Protocol
 
+from agent_core.agent_graph.state import build_graph_checkpoint, normalize_agent_kernel_backend
 from agent_core.execution_context import ExecutionContext
 from agent_core.investigation_models import FinalCritique, InvestigationDecision, StepReflection
 from agent_core.investigation_prompts import (
@@ -209,6 +210,17 @@ class InvestigationController:
         turn_index: int,
         options: RunOptions,
     ) -> AgentTurnResult:
+        from agent_core.agent_graph.investigation import LangGraphInvestigationKernel
+        if normalize_agent_kernel_backend(self.settings.agent_kernel_backend) == "langgraph":
+            return LangGraphInvestigationKernel(self).run(
+                user_input=user_input,
+                session_id=session_id,
+                context=context,
+                messages=messages,
+                turn_index=turn_index,
+                options=options,
+            )
+
         state = InvestigationState.create_template(objective=user_input)
         if options.require_initial_plan:
             self._record_event(
@@ -282,6 +294,19 @@ class InvestigationController:
         no_progress_iterations: int,
         tool_step: ToolExecutionStepResult | None = None,
     ) -> AgentTurnResult:
+        from agent_core.agent_graph.investigation import LangGraphInvestigationKernel
+        if normalize_agent_kernel_backend(self.settings.agent_kernel_backend) == "langgraph":
+            return LangGraphInvestigationKernel(self).resume_after_pending(
+                pending=pending,
+                session_id=session_id,
+                context=context,
+                options=options,
+                state=state,
+                iterations_used=iterations_used,
+                no_progress_iterations=no_progress_iterations,
+                tool_step=tool_step,
+            )
+
         completed_tool_step = tool_step or ToolExecutionStepResult(
             messages=pending.messages,
             tool_messages=pending.tool_messages,
@@ -446,6 +471,11 @@ class InvestigationController:
                     "investigation_state": state.to_dict(),
                     "iterations_used": iterations_used,
                     "no_progress_iterations": no_progress_iterations,
+                    "agent_graph_checkpoint": build_graph_checkpoint(
+                        graph="investigation",
+                        backend=normalize_agent_kernel_backend(self.settings.agent_kernel_backend),
+                        resume_node="resume_tool_exchange",
+                    ),
                 },
             )
             messages = tool_step.messages
@@ -812,6 +842,44 @@ class InvestigationController:
         exchange_index: int,
         no_progress_iterations: int,
     ) -> AgentTurnResult:
+        result = self._evaluate_final_draft(
+            user_input=user_input,
+            messages=messages,
+            turn_index=turn_index,
+            options=options,
+            state=state,
+            final_draft=final_draft,
+            iterations_used=iterations_used,
+            tool_calls_used=tool_calls_used,
+        )
+        if result is not None:
+            return result
+        return self._run_loop(
+            user_input=user_input,
+            session_id=session_id,
+            context=context,
+            messages=messages,
+            turn_index=turn_index,
+            options=options,
+            state=state,
+            iterations_used=iterations_used,
+            tool_calls_used=tool_calls_used,
+            exchange_index=exchange_index,
+            no_progress_iterations=no_progress_iterations,
+        )
+
+    def _evaluate_final_draft(
+        self,
+        *,
+        user_input: str,
+        messages: list[LLMMessage],
+        turn_index: int,
+        options: RunOptions,
+        state: InvestigationState,
+        final_draft: str,
+        iterations_used: int,
+        tool_calls_used: int,
+    ) -> AgentTurnResult | None:
         if not options.require_final_critique:
             return self._complete_turn(
                 user_input=user_input,
@@ -914,19 +982,7 @@ class InvestigationController:
             "Final critique rejected the draft; continuing investigation",
             extra={"unsupported_claim_count": len(critique.unsupported_claims)},
         )
-        return self._run_loop(
-            user_input=user_input,
-            session_id=session_id,
-            context=context,
-            messages=messages,
-            turn_index=turn_index,
-            options=options,
-            state=state,
-            iterations_used=iterations_used,
-            tool_calls_used=tool_calls_used,
-            exchange_index=exchange_index,
-            no_progress_iterations=no_progress_iterations,
-        )
+        return None
 
     def _complete_turn(
         self,
