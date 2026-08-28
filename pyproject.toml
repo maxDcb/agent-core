@@ -26,7 +26,9 @@ classifiers = [
 dependencies = [
     "anthropic>=0.111.0",
     "jsonschema[format]>=4.23.0,<5",
-    "openai>=1.30.0",
+    "langchain-core>=1.6.0,<2.0.0",
+    "langchain-openai>=1.6.0,<2.0.0",
+    "openai>=2.45.0,<4.0.0",
     "requests>=2.31.0",
 ]
 

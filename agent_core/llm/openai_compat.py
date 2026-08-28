@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import random
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from email.utils import parsedate_to_datetime
 from typing import Any
@@ -67,6 +68,39 @@ def create_chat_completion_with_adaptive_retry(
     random_fn: Any = random.random,
     on_attempt: Any = None,
 ) -> Any:
+    return invoke_openai_request_with_adaptive_retry(
+        invoke=lambda current_request: completions.create(**current_request),
+        request=request,
+        provider_name=provider_name,
+        logger=logger,
+        capability_resolver=capability_resolver,
+        rate_limit_policy=rate_limit_policy,
+        response_format_fallback=response_format_fallback,
+        sleeper=sleeper,
+        random_fn=random_fn,
+        on_attempt=on_attempt,
+    )
+
+
+def invoke_openai_request_with_adaptive_retry(
+    *,
+    invoke: Callable[[dict[str, Any]], Any],
+    request: dict[str, Any],
+    provider_name: str,
+    logger: Any,
+    capability_resolver: OpenAIModelCapabilityResolver | None = None,
+    rate_limit_policy: OpenAIRateLimitRetryPolicy | None = None,
+    response_format_fallback: dict[str, Any] | None = None,
+    sleeper: Any = time.sleep,
+    random_fn: Any = random.random,
+    on_attempt: Any = None,
+) -> Any:
+    """Invoke an OpenAI-compatible request while preserving agent-core retry semantics.
+
+    The callback boundary lets SDK adapters such as LangChain share the same
+    capability learning, structured-output safeguards, and transient retry policy
+    as the native OpenAI clients.
+    """
     fallback_request = dict(request)
     retried_without: set[str] = set()
     policy = rate_limit_policy or OpenAIRateLimitRetryPolicy.from_env()
@@ -77,7 +111,7 @@ def create_chat_completion_with_adaptive_retry(
             on_attempt()
         attempt_started_at = time.monotonic()
         try:
-            return completions.create(**fallback_request)
+            return invoke(dict(fallback_request))
         except RateLimitError as exc:
             attempt = _retry_after_transient_error(
                 exc=exc,

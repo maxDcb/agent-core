@@ -19,6 +19,7 @@ from agent_core.llm.provider_factory import (
     build_memory_provider,
     build_provider,
     build_provider_from_config,
+    normalize_model_backend,
     normalize_provider_name,
 )
 from agent_core.policy_engine import PolicyEngine
@@ -54,5 +55,6 @@ __all__ = [
     "build_provider_from_config",
     "build_tool_definition",
     "load_prompt",
+    "normalize_model_backend",
     "normalize_provider_name",
 ]

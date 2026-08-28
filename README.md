@@ -91,6 +91,30 @@ Or run a small REPL:
 .venv/bin/python examples/quickstart.py --interactive
 ```
 
+### Optional LangChain model backend for Azure OpenAI
+
+Azure OpenAI can use LangChain for model invocation while the agent loop,
+tools, policies, checkpoints, memory lifecycle, and public provider contract
+remain owned by agent-core. The native SDK backend remains the default.
+
+```bash
+LLM_PROVIDER=azure_openai
+AGENT_CORE_MODEL_BACKEND=langchain
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+AGENT_CORE_MODEL=<deployment-name>
+AGENT_CORE_MEMORY_MODEL=<deployment-name>
+
+.venv/bin/python examples/quickstart.py --compat-check
+```
+
+`AGENT_CORE_MEMORY_MODEL_BACKEND` can override the backend for a dedicated
+memory provider. If it is omitted, memory synthesis uses the primary backend;
+`native` and `langchain` can therefore be compared without changing the agent
+or memory contracts. The LangChain backend currently supports Azure OpenAI
+only.
+
 See [examples/README.md](examples/README.md) for the pending tool result and
 resume example.
 

@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Added an opt-in LangChain model backend for Azure OpenAI behind the existing
+  `BaseLLMProvider` contract, with shared request normalization, adaptive retry,
+  token usage, tool-call, request-id, and primary/memory provider semantics.
+- Fixed the provider compatibility quickstart to consume typed
+  `LLMCompletionResult` values for plain-text and JSON Schema checks.
+
 - Replaced overflow-driven conversation summaries and separately synthesized
   task state with append-only `ExchangeMemory` and `TurnMemory` journals plus a
   deterministic, rebuildable `SessionView`.

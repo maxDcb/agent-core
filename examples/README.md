@@ -36,6 +36,23 @@ JSON Schema enforcement, and `StructuredTaskRunner` final output:
 .venv/bin/python examples/quickstart.py --compat-check
 ```
 
+To run the same checks through LangChain's Azure OpenAI model integration:
+
+```bash
+LLM_PROVIDER=azure_openai
+AGENT_CORE_MODEL_BACKEND=langchain
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+AGENT_CORE_MODEL=<deployment-name>
+AGENT_CORE_MEMORY_MODEL=<deployment-name>
+
+.venv/bin/python examples/quickstart.py --compat-check
+```
+
+Only model invocation changes. The agent loop, tool execution, structured
+tasks, persistence, and memory lifecycle remain implemented by agent-core.
+
 For Azure Anthropic / Claude on Azure Foundry, use the `/anthropic` endpoint:
 
 ```bash

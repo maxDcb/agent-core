@@ -38,6 +38,13 @@ usage through checkpoints and run results. Custom providers leave `usage`
 unset when the upstream service does not report it; local estimates must not be
 presented as provider usage.
 
+`LLMProviderConfig.model_backend` and `CoreSettings.llm_model_backend` select
+the implementation behind the stable provider contract. `native` is the
+default. `langchain` currently selects the Azure OpenAI LangChain adapter;
+provider classes and LangChain message types remain internal implementation
+details. A dedicated memory provider may override this with
+`CoreSettings.memory_llm_model_backend`.
+
 ## Optional conversation API: `agent_core.conversation`
 
 Conversation support is an adapter over runs. It contains the orchestrator,

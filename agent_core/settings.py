@@ -70,6 +70,10 @@ class CoreSettings:
     base_system_prompt: str = ""
     turn_memory_synthesis_prompt: str = ""
 
+    # Appended to preserve the positional layout of the pre-existing dataclass fields.
+    llm_model_backend: str = "native"
+    memory_llm_model_backend: str | None = None
+
     def __post_init__(self) -> None:
         self.llm_budget = LLMBudget.from_any(self.llm_budget)
         self.llm_context_policy = LLMContextPolicy.from_any(self.llm_context_policy)
