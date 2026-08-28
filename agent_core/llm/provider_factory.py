@@ -23,6 +23,7 @@ class LLMProviderConfig:
     azure_anthropic_version: str | None = None
     timeout_seconds: float = 120.0
     model_backend: str = "native"
+    langchain_tracing_enabled: bool = False
 
 
 _MEMORY_PROVIDER_FIELDS = (
@@ -79,6 +80,7 @@ def build_provider_from_config(config: LLMProviderConfig) -> BaseLLMProvider:
             api_key=config.azure_openai_api_key,
             api_version=config.azure_openai_api_version,
             timeout_seconds=config.timeout_seconds,
+            tracing_enabled=config.langchain_tracing_enabled,
         )
 
     if provider_name == "openai":
@@ -123,6 +125,7 @@ def _primary_provider_config(settings: CoreSettings) -> LLMProviderConfig:
         azure_anthropic_api_version=settings.azure_anthropic_api_version,
         azure_anthropic_version=settings.azure_anthropic_version,
         timeout_seconds=settings.llm_timeout_seconds,
+        langchain_tracing_enabled=settings.langchain_tracing_enabled,
     )
 
 
@@ -144,6 +147,7 @@ def _memory_provider_config(settings: CoreSettings) -> LLMProviderConfig | None:
         azure_anthropic_api_version=_prefer_override(settings.memory_azure_anthropic_api_version, settings.azure_anthropic_api_version),
         azure_anthropic_version=_prefer_override(settings.memory_azure_anthropic_version, settings.azure_anthropic_version),
         timeout_seconds=settings.llm_timeout_seconds,
+        langchain_tracing_enabled=settings.langchain_tracing_enabled,
     )
 
 

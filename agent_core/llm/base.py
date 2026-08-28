@@ -103,6 +103,7 @@ class LLMCompletionResult:
     provider_request_id: str | None = None
     duration_seconds: float | None = None
     provider_attempts: int = 1
+    model_backend: str | None = None
 
 
 @dataclass(slots=True)
@@ -156,6 +157,7 @@ class LLMCallRecord:
     provider_request_id: str | None = None
     duration_seconds: float | None = None
     provider_attempts: int = 1
+    model_backend: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         usage = self.usage
@@ -164,6 +166,7 @@ class LLMCallRecord:
             "call_index": self.call_index,
             "purpose": self.purpose,
             "provider": self.provider,
+            "model_backend": self.model_backend,
             "model": self.model,
             "input_tokens": usage.input_tokens if usage is not None else None,
             "output_tokens": usage.output_tokens if usage is not None else None,
@@ -189,6 +192,7 @@ class LLMCallRecord:
             call_index=call_index,
             purpose=str(payload.get("purpose") or "unspecified"),
             provider=_optional_text(payload.get("provider")),
+            model_backend=_optional_text(payload.get("model_backend")),
             model=_optional_text(payload.get("model")),
             usage=LLMTokenUsage.from_dict(payload.get("usage") or payload),
             provider_request_id=_optional_text(payload.get("provider_request_id")),
@@ -209,6 +213,7 @@ class LLMCallRecord:
             call_index=call_index,
             purpose=purpose,
             provider=completion.provider,
+            model_backend=completion.model_backend,
             model=completion.model,
             usage=completion.usage,
             provider_request_id=completion.provider_request_id,

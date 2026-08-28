@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any
@@ -8,8 +9,9 @@ import httpx
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import AzureChatOpenAI
-from openai import BadRequestError
+from openai import APITimeoutError, AuthenticationError, BadRequestError, RateLimitError
 
+import agent_core.llm.langchain_azure_openai_provider as langchain_provider_module
 from agent_core.llm.azure_openai_provider import AzureOpenAIProvider
 from agent_core.llm.base import LLMCallOptions, LLMMessage, LLMToolCall, LLMToolDefinition
 from agent_core.llm.errors import LLMProviderError
@@ -78,6 +80,10 @@ class FakeLangChainOpenAIClient:
         self.with_raw_response = self
 
     def create(self, **kwargs: Any) -> RawLangChainResponse:
+        self.requests.append(kwargs)
+        return RawLangChainResponse(payload=self.payload, headers={})
+
+    def parse(self, **kwargs: Any) -> RawLangChainResponse:
         self.requests.append(kwargs)
         return RawLangChainResponse(payload=self.payload, headers={})
 
@@ -170,6 +176,46 @@ def _tool_response(backend: str) -> object:
     )
 
 
+def _multiple_tool_response(backend: str) -> object:
+    calls = [
+        ("call-valid", "shell", '{"command":"pwd"}'),
+        ("call-invalid", "shell", '{"command":'),
+    ]
+    if backend == "native":
+        return SimpleNamespace(
+            id="chatcmpl-multiple-tools",
+            usage=None,
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(
+                        content="",
+                        tool_calls=[
+                            SimpleNamespace(
+                                id=call_id,
+                                function=SimpleNamespace(name=name, arguments=arguments),
+                            )
+                            for call_id, name, arguments in calls
+                        ],
+                    )
+                )
+            ],
+        )
+    return AIMessage(
+        content="",
+        additional_kwargs={
+            "tool_calls": [
+                {
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": name, "arguments": arguments},
+                }
+                for call_id, name, arguments in calls
+            ]
+        },
+        response_metadata={"id": "chatcmpl-multiple-tools"},
+    )
+
+
 def _unsupported_reasoning_effort_error() -> BadRequestError:
     return BadRequestError(
         "Unrecognized request argument supplied: reasoning_effort",
@@ -178,6 +224,34 @@ def _unsupported_reasoning_effort_error() -> BadRequestError:
             request=httpx.Request("POST", "https://example.openai.azure.com/openai/deployments/test/chat/completions"),
         ),
         body={"error": {"message": "Unrecognized request argument supplied: reasoning_effort"}},
+    )
+
+
+def _authentication_error() -> AuthenticationError:
+    return AuthenticationError(
+        "Invalid API key",
+        response=httpx.Response(
+            401,
+            request=httpx.Request("POST", "https://example.openai.azure.com/chat/completions"),
+        ),
+        body={"error": {"message": "Invalid API key"}},
+    )
+
+
+def _timeout_error() -> APITimeoutError:
+    return APITimeoutError(
+        request=httpx.Request("POST", "https://example.openai.azure.com/chat/completions")
+    )
+
+
+def _rate_limit_error() -> RateLimitError:
+    return RateLimitError(
+        "Rate limit reached",
+        response=httpx.Response(
+            429,
+            request=httpx.Request("POST", "https://example.openai.azure.com/chat/completions"),
+        ),
+        body={"error": {"message": "Rate limit reached"}},
     )
 
 
@@ -194,6 +268,7 @@ def test_azure_provider_contract_preserves_text_usage_and_request_id(backend: st
     assert result.content == "same answer"
     assert result.tool_calls == []
     assert result.provider == "azure_openai"
+    assert result.model_backend == backend
     assert result.model == "deployment-name"
     assert result.provider_request_id == "chatcmpl-contract"
     assert result.provider_attempts == 1
@@ -263,6 +338,64 @@ def test_azure_provider_contract_preserves_tool_history_schema_and_result(backen
 
 
 @pytest.mark.parametrize("backend", ["native", "langchain"])
+def test_azure_provider_contract_preserves_multiple_and_invalid_tool_calls(backend: str) -> None:
+    harness = _provider_harness(backend, [_multiple_tool_response(backend)])
+
+    result = harness.provider.complete_with_tools(
+        messages=[LLMMessage(role="user", content="run both")],
+        tools=[
+            LLMToolDefinition(
+                name="shell",
+                description="Run a shell command",
+                parameters={"type": "object", "properties": {"command": {"type": "string"}}},
+            )
+        ],
+        model="deployment-name",
+        temperature=0.0,
+    )
+
+    assert result.tool_calls == [
+        LLMToolCall(id="call-valid", name="shell", arguments_json='{"command":"pwd"}'),
+        LLMToolCall(id="call-invalid", name="shell", arguments_json='{"command":'),
+    ]
+
+
+@pytest.mark.parametrize("backend", ["native", "langchain"])
+def test_azure_provider_contract_combines_tools_and_structured_response_format(backend: str) -> None:
+    harness = _provider_harness(backend, [_tool_response(backend)])
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "tool_result",
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    harness.provider.complete_with_tools(
+        messages=[LLMMessage(role="user", content="check")],
+        tools=[
+            LLMToolDefinition(
+                name="shell",
+                description="Run a shell command",
+                parameters={"type": "object", "properties": {"command": {"type": "string"}}},
+            )
+        ],
+        model="deployment-name",
+        temperature=0.0,
+        options=LLMCallOptions(response_format=response_format),
+    )
+
+    assert harness.requests[0]["tools"]
+    assert harness.requests[0]["response_format"] == response_format
+
+
+@pytest.mark.parametrize("backend", ["native", "langchain"])
 def test_azure_provider_contract_learns_rejected_reasoning_parameter(backend: str) -> None:
     harness = _provider_harness(
         backend,
@@ -316,6 +449,119 @@ def test_azure_provider_contract_rejects_missing_configuration(
     assert expected_detail in exc_info.value.detail
 
 
+@pytest.mark.parametrize("backend", ["native", "langchain"])
+@pytest.mark.parametrize(
+    ("error", "expected_kind"),
+    [(_authentication_error(), "configuration_error"), (_timeout_error(), "request_error")],
+)
+def test_azure_provider_contract_maps_common_sdk_errors(
+    backend: str,
+    error: Exception,
+    expected_kind: str,
+    monkeypatch,
+) -> None:
+    monkeypatch.setenv("AGENT_CORE_LLM_RETRY_MAX_ATTEMPTS", "1")
+    harness = _provider_harness(backend, [error])
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        harness.provider.complete_text(
+            messages=[LLMMessage(role="user", content="hello")],
+            model="deployment-name",
+            temperature=0.0,
+        )
+
+    assert exc_info.value.kind == expected_kind
+
+
+@pytest.mark.parametrize("backend", ["native", "langchain"])
+def test_azure_provider_contract_maps_exhausted_rate_limit(backend: str, monkeypatch) -> None:
+    monkeypatch.setenv("AGENT_CORE_LLM_RETRY_MAX_ATTEMPTS", "1")
+    harness = _provider_harness(backend, [_rate_limit_error()])
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        harness.provider.complete_text(
+            messages=[LLMMessage(role="user", content="hello")],
+            model="deployment-name",
+            temperature=0.0,
+        )
+
+    assert exc_info.value.kind == "rate_limit_error"
+    assert len(harness.requests) == 1
+
+
+@pytest.mark.parametrize("backend", ["native", "langchain"])
+def test_azure_provider_contract_rejects_unusable_response(backend: str) -> None:
+    response: object = (
+        SimpleNamespace(choices=[])
+        if backend == "native"
+        else HumanMessage(content="not an assistant response")
+    )
+    harness = _provider_harness(backend, [response])
+
+    with pytest.raises(LLMProviderError) as exc_info:
+        harness.provider.complete_text(
+            messages=[LLMMessage(role="user", content="hello")],
+            model="deployment-name",
+            temperature=0.0,
+        )
+
+    assert exc_info.value.kind == "response_error"
+
+
+def test_langchain_adapter_flattens_text_content_blocks() -> None:
+    model = ScriptedLangChainModel(
+        [
+            AIMessage(
+                content=[
+                    {"type": "text", "text": "hello "},
+                    {"type": "text", "text": "world"},
+                    {"type": "reasoning", "reasoning": "hidden"},
+                ]
+            )
+        ]
+    )
+    provider = LangChainAzureOpenAIProvider(
+        azure_endpoint="https://example.openai.azure.com",
+        api_key="test-key",
+        chat_model_factory=lambda deployment: model,
+    )
+
+    result = provider.complete_text(
+        messages=[LLMMessage(role="user", content="hello")],
+        model="deployment-name",
+        temperature=0.0,
+    )
+
+    assert result.content == "hello world"
+
+
+@pytest.mark.parametrize("tracing_enabled", [False, True])
+def test_langchain_adapter_scopes_langsmith_tracing(monkeypatch, tracing_enabled: bool) -> None:
+    observed: list[bool | None] = []
+
+    @contextmanager
+    def fake_tracing_context(*, enabled=None, **kwargs):
+        observed.append(enabled)
+        yield
+
+    monkeypatch.setattr(langchain_provider_module.ls, "tracing_context", fake_tracing_context)
+    model = ScriptedLangChainModel([AIMessage(content="ok")])
+    provider = LangChainAzureOpenAIProvider(
+        azure_endpoint="https://example.openai.azure.com",
+        api_key="test-key",
+        chat_model_factory=lambda deployment: model,
+        tracing_enabled=tracing_enabled,
+    )
+
+    provider.complete_text(
+        messages=[LLMMessage(role="user", content="hello")],
+        model="deployment-name",
+        temperature=0.0,
+    )
+
+    assert observed == [tracing_enabled]
+
+
 def test_langchain_adapter_integrates_with_real_azure_chat_model_conversion() -> None:
     client = FakeLangChainOpenAIClient(
         {
@@ -355,12 +601,21 @@ def test_langchain_adapter_integrates_with_real_azure_chat_model_conversion() ->
         max_retries=0,
     )
     chat_model.client = client
+    chat_model.root_client = SimpleNamespace(chat=SimpleNamespace(completions=client))
     provider = LangChainAzureOpenAIProvider(
         azure_endpoint="https://example.openai.azure.com",
         api_key="test-key",
         chat_model_factory=lambda deployment: chat_model,
     )
 
+    response_format = {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "result",
+            "strict": True,
+            "schema": {"type": "object", "properties": {}, "additionalProperties": False},
+        },
+    }
     result = provider.complete_with_tools(
         messages=[LLMMessage(role="user", content="where am I?")],
         tools=[
@@ -372,7 +627,7 @@ def test_langchain_adapter_integrates_with_real_azure_chat_model_conversion() ->
         ],
         model="deployment-name",
         temperature=0.0,
-        options=LLMCallOptions(max_output_tokens=120),
+        options=LLMCallOptions(max_output_tokens=120, response_format=response_format),
     )
 
     assert result.content == "checking"
@@ -386,6 +641,7 @@ def test_langchain_adapter_integrates_with_real_azure_chat_model_conversion() ->
     assert client.requests[0]["messages"] == [{"content": "where am I?", "role": "user"}]
     assert client.requests[0]["parallel_tool_calls"] is True
     assert client.requests[0]["max_tokens"] == 120
+    assert client.requests[0]["response_format"] == response_format
 
 
 def _langchain_message_to_history(message: object) -> dict[str, Any]:

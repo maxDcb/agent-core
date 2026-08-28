@@ -45,6 +45,16 @@ provider classes and LangChain message types remain internal implementation
 details. A dedicated memory provider may override this with
 `CoreSettings.memory_llm_model_backend`.
 
+Every built-in completion sets `LLMCompletionResult.model_backend` to `native`
+or `langchain`. `LLMCallRecord` persists the same additive field through run
+results and structured-task checkpoints; older payloads without the field
+continue to load with `model_backend=None`.
+
+LangSmith tracing is disabled for LangChain model calls unless
+`CoreSettings.langchain_tracing_enabled` is explicitly enabled. This scoped
+override takes precedence over an inherited `LANGSMITH_TRACING` environment
+setting so host applications do not export prompts or tool results by accident.
+
 ## Optional conversation API: `agent_core.conversation`
 
 Conversation support is an adapter over runs. It contains the orchestrator,

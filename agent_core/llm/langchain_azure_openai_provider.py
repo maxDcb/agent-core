@@ -5,6 +5,7 @@ import time
 from collections.abc import Callable
 from typing import Any, cast
 
+import langsmith as ls
 from langchain_core.messages import AIMessage, ChatMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import AzureChatOpenAI
 from openai import (
@@ -58,6 +59,7 @@ class LangChainAzureOpenAIProvider:
         capability_resolver: OpenAIModelCapabilityResolver | None = None,
         timeout_seconds: float = 120.0,
         chat_model_factory: ChatModelFactory | None = None,
+        tracing_enabled: bool = False,
     ) -> None:
         self.azure_endpoint_configured = bool(azure_endpoint)
         self.api_key_configured = bool(api_key)
@@ -65,6 +67,7 @@ class LangChainAzureOpenAIProvider:
         self.azure_endpoint = azure_endpoint
         self.api_key = api_key
         self.timeout_seconds = max(1.0, float(timeout_seconds))
+        self.tracing_enabled = bool(tracing_enabled)
         self.capability_resolver = capability_resolver or OpenAIModelCapabilityResolver()
         self.request_normalizer = OpenAIChatRequestNormalizer(self.capability_resolver)
         self._chat_model_factory = chat_model_factory or self._build_chat_model
@@ -77,6 +80,7 @@ class LangChainAzureOpenAIProvider:
                 "api_key_configured": self.api_key_configured,
                 "api_version": self.api_version,
                 "timeout_seconds": self.timeout_seconds,
+                "tracing_enabled": self.tracing_enabled,
             },
         )
 
@@ -139,6 +143,7 @@ class LangChainAzureOpenAIProvider:
             tool_calls=tool_calls,
             usage=self._token_usage_from_message(response),
             provider="azure_openai",
+            model_backend="langchain",
             model=model,
             provider_request_id=self._provider_request_id(response),
             duration_seconds=round(time.monotonic() - started_at, 3),
@@ -276,7 +281,11 @@ class LangChainAzureOpenAIProvider:
             if parallel_tool_calls is not None:
                 binding_options["parallel_tool_calls"] = parallel_tool_calls
             runnable = runnable.bind_tools(tools, **binding_options)
-        return cast(AIMessage, runnable.invoke(messages, **request))
+        # Model prompts and tool results can contain sensitive application data.
+        # Disable LangSmith export unless the host explicitly opts in, even if
+        # LANGSMITH_TRACING=true is inherited from the process environment.
+        with ls.tracing_context(enabled=self.tracing_enabled):
+            return cast(AIMessage, runnable.invoke(messages, **request))
 
     def _validate_configuration(self) -> None:
         if not self.azure_endpoint_configured:

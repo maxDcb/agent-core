@@ -53,6 +53,20 @@ AGENT_CORE_MEMORY_MODEL=<deployment-name>
 Only model invocation changes. The agent loop, tool execution, structured
 tasks, persistence, and memory lifecycle remain implemented by agent-core.
 
+## Optional paid Azure provider tests
+
+The `live_llm` suite is skipped during normal development. With Azure OpenAI
+credentials supplied explicitly, it exercises both native and LangChain
+backends without reading an application-specific `.env` file:
+
+```bash
+AGENT_CORE_RUN_LIVE_LLM_TESTS=1 \
+AGENT_CORE_LIVE_LLM_MODEL=gpt-5.4-mini \
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com \
+AZURE_OPENAI_API_KEY=... \
+.venv/bin/python -m pytest -m live_llm -q
+```
+
 For Azure Anthropic / Claude on Azure Foundry, use the `/anthropic` endpoint:
 
 ```bash

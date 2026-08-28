@@ -7,6 +7,9 @@
   token usage, tool-call, request-id, and primary/memory provider semantics.
 - Fixed the provider compatibility quickstart to consume typed
   `LLMCompletionResult` values for plain-text and JSON Schema checks.
+- Added persisted `model_backend` telemetry, explicit opt-in LangSmith tracing,
+  broader Azure provider contract coverage, and an opt-in paid `live_llm` test
+  matrix for native and LangChain model invocation.
 
 - Replaced overflow-driven conversation summaries and separately synthesized
   task state with append-only `ExchangeMemory` and `TurnMemory` journals plus a

@@ -115,6 +115,31 @@ memory provider. If it is omitted, memory synthesis uses the primary backend;
 or memory contracts. The LangChain backend currently supports Azure OpenAI
 only.
 
+LangSmith tracing is forcibly disabled around LangChain model calls by default,
+including when the process inherits `LANGSMITH_TRACING=true`. A host that has
+reviewed its data-handling requirements can explicitly opt in with
+`AGENT_CORE_LANGCHAIN_TRACING_ENABLED=true`.
+
+Provider telemetry keeps `provider="azure_openai"` stable and records the
+implementation separately as `model_backend="native"` or `"langchain"` in
+completion records, run results, structured-task checkpoints, and conversation
+trace response events.
+
+Paid Azure integration tests are excluded from normal test runs. To execute the
+same behavioral matrix against both backends:
+
+```bash
+AGENT_CORE_RUN_LIVE_LLM_TESTS=1 \
+AGENT_CORE_LIVE_LLM_MODEL=gpt-5.4-mini \
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com \
+AZURE_OPENAI_API_KEY=... \
+.venv/bin/python -m pytest -m live_llm -q
+```
+
+Use `AGENT_CORE_LIVE_LLM_BACKENDS=native` or `langchain` to test only one
+implementation. The live suite covers reasoning and usage metadata, strict JSON
+Schema output, a complete tool-result roundtrip, and `StructuredTaskRunner`.
+
 See [examples/README.md](examples/README.md) for the pending tool result and
 resume example.
 

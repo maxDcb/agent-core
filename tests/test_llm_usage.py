@@ -94,6 +94,7 @@ def test_completion_capture_records_conversation_provider_calls() -> None:
         content="done",
         usage=LLMTokenUsage(input_tokens=7, output_tokens=3, total_tokens=10),
         provider="azure_openai",
+        model_backend="langchain",
         model="deployment",
         provider_request_id="request-1",
     )
@@ -106,3 +107,20 @@ def test_completion_capture_records_conversation_provider_calls() -> None:
     assert calls[0].usage is not None
     assert calls[0].usage.total_tokens == 10
     assert calls[0].provider_request_id == "request-1"
+    assert calls[0].model_backend == "langchain"
+    assert LLMCallRecord.from_dict(calls[0].to_dict()) == calls[0]
+
+
+def test_call_record_loads_legacy_payload_without_model_backend() -> None:
+    record = LLMCallRecord.from_dict(
+        {
+            "call_id": "llm-0001",
+            "call_index": 1,
+            "purpose": "tool_loop",
+            "provider": "azure_openai",
+            "model": "deployment",
+        }
+    )
+
+    assert record is not None
+    assert record.model_backend is None

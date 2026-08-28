@@ -112,6 +112,7 @@ def build_settings(*, model: str, memory_model: str, session_file: Path) -> Core
     return CoreSettings(
         llm_provider=os.getenv("LLM_PROVIDER", "openai"),
         llm_model_backend=os.getenv("AGENT_CORE_MODEL_BACKEND", "native"),
+        langchain_tracing_enabled=_env_flag("AGENT_CORE_LANGCHAIN_TRACING_ENABLED"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -362,6 +363,10 @@ def _optional_positive_int(value: str | None) -> int | None:
     except ValueError:
         return None
     return parsed if parsed > 0 else None
+
+
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def run_compatibility_checks(settings: CoreSettings) -> int:

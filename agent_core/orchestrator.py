@@ -1676,6 +1676,10 @@ class AgentOrchestrator:
                 extra={
                     "content_length": len(llm_response.content),
                     "tool_call_count": len(llm_response.tool_calls),
+                    "provider": llm_response.provider,
+                    "model_backend": llm_response.model_backend,
+                    "model": llm_response.model,
+                    "provider_attempts": llm_response.provider_attempts,
                 },
             )
 
@@ -1696,6 +1700,12 @@ class AgentOrchestrator:
                     "tool_calls": [
                         {"id": tool_call.id, "name": tool_call.name} for tool_call in llm_response.tool_calls
                     ],
+                    "provider": llm_response.provider,
+                    "model_backend": llm_response.model_backend,
+                    "model": llm_response.model,
+                    "provider_request_id": llm_response.provider_request_id,
+                    "provider_attempts": llm_response.provider_attempts,
+                    "usage": llm_response.usage.to_dict() if llm_response.usage is not None else None,
                 },
             )
 

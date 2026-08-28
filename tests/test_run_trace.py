@@ -92,6 +92,10 @@ def tool_call(*, value: str = "hello") -> LLMCompletionResult:
                 arguments_json=json.dumps({"value": value}),
             )
         ],
+        provider="azure_openai",
+        model_backend="langchain",
+        model="deployment",
+        provider_request_id="request-tool",
     )
 
 
@@ -215,6 +219,12 @@ def test_direct_run_persists_tool_audit_trace_and_exposes_run_id(tmp_path) -> No
         "tool_exchange_completed",
         "run_completed",
     }.issubset(event_types(trace_payload))
+    events = trace_payload["events"]
+    assistant_event = next(event for event in events if event["type"] == "assistant_response_received")
+    assert assistant_event["payload"]["provider"] == "azure_openai"
+    assert assistant_event["payload"]["model_backend"] == "langchain"
+    assert assistant_event["payload"]["model"] == "deployment"
+    assert assistant_event["payload"]["provider_request_id"] == "request-tool"
 
 
 def test_investigation_run_persists_process_events_and_trace_id(tmp_path) -> None:

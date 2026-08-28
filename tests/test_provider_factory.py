@@ -65,6 +65,22 @@ def test_build_provider_selects_langchain_azure_openai_backend() -> None:
     assert isinstance(provider, LangChainAzureOpenAIProvider)
     assert provider.azure_endpoint == "https://primary.openai.azure.com"
     assert provider.api_key == "shared-key"
+    assert provider.tracing_enabled is False
+
+
+def test_build_provider_explicitly_enables_langchain_tracing() -> None:
+    settings = CoreSettings(
+        llm_provider="azure_openai",
+        llm_model_backend="langchain",
+        azure_openai_endpoint="https://primary.openai.azure.com",
+        azure_openai_api_key="shared-key",
+        langchain_tracing_enabled=True,
+    )
+
+    provider = build_provider(settings)
+
+    assert isinstance(provider, LangChainAzureOpenAIProvider)
+    assert provider.tracing_enabled is True
 
 
 def test_build_memory_provider_inherits_langchain_backend_from_primary() -> None:
