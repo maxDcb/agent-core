@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
-from typing import Any, Literal
+from typing import Any, Literal, Protocol, TypedDict, cast
 
+from agent_core.agent_graph.state import normalize_agent_kernel_backend
 from agent_core.context_planner import (
     LLMContextPlanner,
     LLMContextPolicy,
@@ -496,6 +497,10 @@ class StructuredTaskRunner:
         self.tool_registry = tool_registry
         self.policy_engine = policy_engine
         self.artifact_store = artifact_store or JsonFileArtifactStore(settings.artifacts_directory)
+        self._kernel_nodes, self._kernel = build_structured_task_kernel(
+            backend=settings.agent_kernel_backend,
+            operations=self,
+        )
 
     def run(
         self,
@@ -627,114 +632,122 @@ class StructuredTaskRunner:
                 task_id=spec.task_id,
                 failure_reason=str(exc),
             )
+        initial_state = self._kernel_nodes.initial_state(
+            spec=spec,
+            context=context,
+            registry=registry,
+            checkpoint=checkpoint,
+            on_checkpoint=on_checkpoint,
+        )
+        return self._kernel.run(initial_state)
 
-        while True:
-            if checkpoint.phase == "result":
-                return self._continue_persisted_result(spec=spec, checkpoint=checkpoint)
-
-            if checkpoint.phase == "finalization":
-                finalized = self._continue_finalization(
-                    spec=spec,
-                    checkpoint=checkpoint,
-                    on_checkpoint=on_checkpoint,
-                )
-                if finalized is not None:
-                    return finalized
-                continue
-
-            if checkpoint.phase == "tools":
-                blocked = next(
-                    (item for item in checkpoint.pending_tool_calls if item.status == "running"),
-                    None,
-                )
-                if blocked is not None:
-                    raise StructuredTaskRecoveryError(
-                        kind="ambiguous_tool_execution",
-                        message=(
-                            "A tool call was running when execution stopped; automatic replay is blocked "
-                            f"because its external effect is unknown: {blocked.tool_name} ({blocked.tool_call_id})."
-                        ),
-                        tool_call_id=blocked.tool_call_id,
-                    )
-                finalized = self._continue_tool_batch(
-                    spec=spec,
-                    context=context,
-                    registry=registry,
-                    checkpoint=checkpoint,
-                    on_checkpoint=on_checkpoint,
-                )
-                if finalized is not None:
-                    return finalized
-                continue
-
-            logger.debug(
-                "Calling structured task LLM",
-                extra={
-                    "task_id": spec.task_id,
-                    "iteration": checkpoint.iterations,
-                    "tool_count": len(registry.list_tool_names()),
-                },
+    def _continue_model_request(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        registry: ToolRegistry,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskResult | None:
+        logger.debug(
+            "Calling structured task LLM",
+            extra={
+                "task_id": spec.task_id,
+                "iteration": checkpoint.iterations,
+                "tool_count": len(registry.list_tool_names()),
+            },
+        )
+        try:
+            llm_response = self._call_model_once(
+                spec=spec,
+                messages=checkpoint.messages,
+                registry=registry,
+                final_output=not registry.list_tool_names(),
+                on_budget_reserved=lambda: self._emit_checkpoint(checkpoint, on_checkpoint),
             )
-            try:
-                llm_response = self._call_model_once(
-                    spec=spec,
-                    messages=checkpoint.messages,
-                    registry=registry,
-                    final_output=not registry.list_tool_names(),
-                    on_budget_reserved=lambda: self._emit_checkpoint(checkpoint, on_checkpoint),
-                )
-            except LLMProviderError as exc:
-                logger.error(
-                    "Structured task provider failure",
-                    extra={"task_id": spec.task_id, "error_kind": exc.kind},
-                )
-                return StructuredTaskResult(
-                    ok=False,
-                    task_id=spec.task_id,
-                    failure_reason=exc.user_message,
-                    raw_content=exc.detail or exc.user_message,
-                    tool_history=checkpoint.tool_history,
-                    iterations=checkpoint.iterations,
-                    tool_calls_used=checkpoint.tool_calls_used,
-                    llm_calls=list(checkpoint.llm_calls),
-                )
-
-            self._record_llm_call(
-                checkpoint=checkpoint,
-                completion=llm_response,
-                purpose="structured_direct" if not registry.list_tool_names() else "structured_tool_loop",
+        except LLMProviderError as exc:
+            logger.error(
+                "Structured task provider failure",
+                extra={"task_id": spec.task_id, "error_kind": exc.kind},
             )
-            assistant_message = LLMMessage(
+            return StructuredTaskResult(
+                ok=False,
+                task_id=spec.task_id,
+                failure_reason=exc.user_message,
+                raw_content=exc.detail or exc.user_message,
+                tool_history=checkpoint.tool_history,
+                iterations=checkpoint.iterations,
+                tool_calls_used=checkpoint.tool_calls_used,
+                llm_calls=list(checkpoint.llm_calls),
+            )
+
+        self._record_llm_call(
+            checkpoint=checkpoint,
+            completion=llm_response,
+            purpose="structured_direct" if not registry.list_tool_names() else "structured_tool_loop",
+        )
+        checkpoint.messages.append(
+            LLMMessage(
                 role="assistant",
                 content=llm_response.content,
                 tool_calls=list(llm_response.tool_calls),
             )
-            checkpoint.messages.append(assistant_message)
+        )
 
-            if not llm_response.tool_calls:
-                if spec.output_contract is not None and registry.list_tool_names():
-                    checkpoint.phase = "finalization"
-                    checkpoint.finalization_kind = "contract"
-                    checkpoint.finalization_reason = "Investigation is complete."
-                    checkpoint.raw_failure_content = llm_response.content
-                    self._emit_checkpoint(checkpoint, on_checkpoint)
-                    continue
+        if not llm_response.tool_calls:
+            if spec.output_contract is not None and registry.list_tool_names():
+                checkpoint.phase = "finalization"
+                checkpoint.finalization_kind = "contract"
+                checkpoint.finalization_reason = "Investigation is complete."
+                checkpoint.raw_failure_content = llm_response.content
+            else:
                 checkpoint.phase = "result"
                 checkpoint.result_kind = "direct"
-                self._emit_checkpoint(checkpoint, on_checkpoint)
-                continue
-
-            checkpoint.phase = "tools"
-            checkpoint.pending_tool_calls = [
-                StructuredToolCallCheckpoint(
-                    tool_call_id=tool_call.id,
-                    tool_name=tool_call.name,
-                    arguments_json=tool_call.arguments_json,
-                )
-                for tool_call in llm_response.tool_calls
-            ]
-            checkpoint.next_tool_call_index = 0
             self._emit_checkpoint(checkpoint, on_checkpoint)
+            return None
+
+        checkpoint.phase = "tools"
+        checkpoint.pending_tool_calls = [
+            StructuredToolCallCheckpoint(
+                tool_call_id=tool_call.id,
+                tool_name=tool_call.name,
+                arguments_json=tool_call.arguments_json,
+            )
+            for tool_call in llm_response.tool_calls
+        ]
+        checkpoint.next_tool_call_index = 0
+        self._emit_checkpoint(checkpoint, on_checkpoint)
+        return None
+
+    def _continue_tools(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        context: ExecutionContext,
+        registry: ToolRegistry,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskResult | None:
+        blocked = next(
+            (item for item in checkpoint.pending_tool_calls if item.status == "running"),
+            None,
+        )
+        if blocked is not None:
+            raise StructuredTaskRecoveryError(
+                kind="ambiguous_tool_execution",
+                message=(
+                    "A tool call was running when execution stopped; automatic replay is blocked "
+                    f"because its external effect is unknown: {blocked.tool_name} ({blocked.tool_call_id})."
+                ),
+                tool_call_id=blocked.tool_call_id,
+            )
+        return self._continue_tool_batch(
+            spec=spec,
+            context=context,
+            registry=registry,
+            checkpoint=checkpoint,
+            on_checkpoint=on_checkpoint,
+        )
 
     def _continue_tool_batch(
         self,
@@ -1494,3 +1507,215 @@ class StructuredTaskRunner:
         except (TypeError, ValueError):
             return True
         return any(parameter.kind == Parameter.VAR_KEYWORD or parameter.name == "options" for parameter in parameters)
+
+
+StructuredTaskKernelBackend = Literal["native", "langgraph"]
+StructuredTaskKernelRoute = Literal["model_request", "tools", "finalization", "result", "end"]
+
+
+class StructuredTaskGraphState(TypedDict):
+    """Ephemeral orchestration state; durable state remains in the checkpoint."""
+
+    spec: StructuredTaskSpec
+    context: ExecutionContext
+    registry: ToolRegistry
+    checkpoint: StructuredTaskCheckpoint
+    on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None
+    result: StructuredTaskResult | None
+
+
+class StructuredTaskGraphUpdate(TypedDict, total=False):
+    checkpoint: StructuredTaskCheckpoint
+    result: StructuredTaskResult | None
+
+
+class StructuredTaskOperations(Protocol):
+    settings: CoreSettings
+
+    def _continue_model_request(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        registry: ToolRegistry,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskResult | None: ...
+
+    def _continue_tools(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        context: ExecutionContext,
+        registry: ToolRegistry,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskResult | None: ...
+
+    def _continue_finalization(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskResult | None: ...
+
+    def _continue_persisted_result(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        checkpoint: StructuredTaskCheckpoint,
+    ) -> StructuredTaskResult: ...
+
+
+class StructuredTaskNodes:
+    """Structured-task behavior shared by the native and LangGraph kernels."""
+
+    def __init__(self, operations: StructuredTaskOperations) -> None:
+        self.operations = operations
+
+    @staticmethod
+    def initial_state(
+        *,
+        spec: StructuredTaskSpec,
+        context: ExecutionContext,
+        registry: ToolRegistry,
+        checkpoint: StructuredTaskCheckpoint,
+        on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
+    ) -> StructuredTaskGraphState:
+        return StructuredTaskGraphState(
+            spec=spec,
+            context=context,
+            registry=registry,
+            checkpoint=checkpoint,
+            on_checkpoint=on_checkpoint,
+            result=None,
+        )
+
+    @staticmethod
+    def route(state: StructuredTaskGraphState) -> StructuredTaskKernelRoute:
+        if state["result"] is not None:
+            return "end"
+        return state["checkpoint"].phase
+
+    def model_request(self, state: StructuredTaskGraphState) -> StructuredTaskGraphUpdate:
+        checkpoint = state["checkpoint"]
+        result = self.operations._continue_model_request(
+            spec=state["spec"],
+            registry=state["registry"],
+            checkpoint=checkpoint,
+            on_checkpoint=state["on_checkpoint"],
+        )
+        return {"checkpoint": checkpoint, "result": result}
+
+    def tools(self, state: StructuredTaskGraphState) -> StructuredTaskGraphUpdate:
+        checkpoint = state["checkpoint"]
+        result = self.operations._continue_tools(
+            spec=state["spec"],
+            context=state["context"],
+            registry=state["registry"],
+            checkpoint=checkpoint,
+            on_checkpoint=state["on_checkpoint"],
+        )
+        return {"checkpoint": checkpoint, "result": result}
+
+    def finalization(self, state: StructuredTaskGraphState) -> StructuredTaskGraphUpdate:
+        checkpoint = state["checkpoint"]
+        result = self.operations._continue_finalization(
+            spec=state["spec"],
+            checkpoint=checkpoint,
+            on_checkpoint=state["on_checkpoint"],
+        )
+        return {"checkpoint": checkpoint, "result": result}
+
+    def result(self, state: StructuredTaskGraphState) -> StructuredTaskGraphUpdate:
+        return {
+            "result": self.operations._continue_persisted_result(
+                spec=state["spec"],
+                checkpoint=state["checkpoint"],
+            )
+        }
+
+
+class StructuredTaskKernel(Protocol):
+    backend: StructuredTaskKernelBackend
+
+    def run(self, initial_state: StructuredTaskGraphState) -> StructuredTaskResult: ...
+
+
+class NativeStructuredTaskKernel:
+    backend: StructuredTaskKernelBackend = "native"
+
+    def __init__(self, nodes: StructuredTaskNodes) -> None:
+        self.nodes = nodes
+
+    def run(self, initial_state: StructuredTaskGraphState) -> StructuredTaskResult:
+        state = initial_state
+        while True:
+            route = self.nodes.route(state)
+            if route == "end":
+                break
+            node = getattr(self.nodes, route)
+            state.update(node(state))
+
+        result = state["result"]
+        if result is None:
+            raise RuntimeError("Native structured task kernel completed without a result")
+        return result
+
+
+class LangGraphStructuredTaskKernel:
+    backend: StructuredTaskKernelBackend = "langgraph"
+
+    def __init__(self, nodes: StructuredTaskNodes) -> None:
+        from langgraph.graph import END, START, StateGraph
+
+        self.nodes = nodes
+        builder = StateGraph(StructuredTaskGraphState)
+        builder.add_node("model_request", nodes.model_request)
+        builder.add_node("tools", nodes.tools)
+        builder.add_node("finalization", nodes.finalization)
+        builder.add_node("result", nodes.result)
+        routes: dict[Hashable, str] = {
+            "model_request": "model_request",
+            "tools": "tools",
+            "finalization": "finalization",
+            "result": "result",
+            "end": END,
+        }
+        builder.add_conditional_edges(START, nodes.route, routes)
+        builder.add_conditional_edges("model_request", nodes.route, routes)
+        builder.add_conditional_edges("tools", nodes.route, routes)
+        builder.add_conditional_edges("finalization", nodes.route, routes)
+        builder.add_edge("result", END)
+        self.graph = builder.compile()
+
+    def run(self, initial_state: StructuredTaskGraphState) -> StructuredTaskResult:
+        import langsmith as ls
+
+        spec = initial_state["spec"]
+        recursion_limit = max(25, (spec.max_iterations * 2) + 8)
+        with ls.tracing_context(enabled=self.nodes.operations.settings.langchain_tracing_enabled):
+            final_state = cast(
+                StructuredTaskGraphState,
+                self.graph.invoke(initial_state, {"recursion_limit": recursion_limit}),
+            )
+        result = final_state["result"]
+        if result is None:
+            raise RuntimeError("LangGraph structured task kernel completed without a result")
+        return result
+
+
+def build_structured_task_kernel(
+    *,
+    backend: str,
+    operations: StructuredTaskOperations,
+) -> tuple[StructuredTaskNodes, StructuredTaskKernel]:
+    normalized = normalize_agent_kernel_backend(backend)
+    nodes = StructuredTaskNodes(operations)
+    if normalized == "native":
+        return nodes, NativeStructuredTaskKernel(nodes)
+    if normalized == "langgraph":
+        return nodes, LangGraphStructuredTaskKernel(nodes)
+    raise ValueError(
+        f"Unsupported agent kernel backend: {backend!r}. Expected 'native' or 'langgraph'."
+    )

@@ -364,6 +364,7 @@ def test_live_structured_task_runner(live_provider, live_azure_config: LiveAzure
     settings = CoreSettings(
         llm_provider="azure_openai",
         llm_model_backend=backend,
+        agent_kernel_backend="langgraph",
         azure_openai_endpoint=live_azure_config.endpoint,
         azure_openai_api_key=live_azure_config.api_key,
         azure_openai_api_version=live_azure_config.api_version,
@@ -412,6 +413,84 @@ def test_live_structured_task_runner(live_provider, live_azure_config: LiveAzure
     assert result.output == {"ok": True, "component": "structured_task"}
     assert result.llm_calls
     assert all(call.model_backend == backend for call in result.llm_calls)
+    assert all(call.model == live_azure_config.model for call in result.llm_calls)
+    assert runner._kernel.backend == "langgraph"
+
+
+def test_live_langgraph_structured_task_tool_loop(
+    live_provider,
+    live_azure_config: LiveAzureConfig,
+    tmp_path,
+) -> None:
+    backend, provider = live_provider
+    settings = CoreSettings(
+        llm_provider="azure_openai",
+        llm_model_backend=backend,
+        agent_kernel_backend="langgraph",
+        azure_openai_endpoint=live_azure_config.endpoint,
+        azure_openai_api_key=live_azure_config.api_key,
+        azure_openai_api_version=live_azure_config.api_version,
+        model=live_azure_config.model,
+        memory_model=live_azure_config.model,
+        llm_max_output_tokens=512,
+        session_file=tmp_path / "session.json",
+        base_system_prompt="live test",
+        turn_memory_synthesis_prompt="live test",
+    )
+    registry = ToolRegistry()
+    registry.register(LiveEchoTool())
+    runner = StructuredTaskRunner(
+        settings=settings,
+        provider=provider,
+        tool_registry=registry,
+        policy_engine=PolicyEngine(),
+    )
+    checkpoint_phases: list[str] = []
+
+    result = runner.run(
+        spec=StructuredTaskSpec(
+            task_id=f"live-langgraph-tool-{backend}",
+            system_prompt="Follow the requested tool workflow and return the strict contract without prose.",
+            objective=(
+                "Call live_echo exactly once with text structured-langgraph-live. "
+                'After receiving the tool result, return {"ok": true, "marker": "structured-langgraph-live"}.'
+            ),
+            constraints=["The live_echo tool call is mandatory."],
+            allowed_tools=["live_echo"],
+            output_contract=StructuredOutputContract(
+                name="live_langgraph_structured_tool",
+                strict=True,
+                schema={
+                    "type": "object",
+                    "properties": {
+                        "ok": {"type": "boolean"},
+                        "marker": {
+                            "type": "string",
+                            "enum": ["structured-langgraph-live"],
+                        },
+                    },
+                    "required": ["ok", "marker"],
+                    "additionalProperties": False,
+                },
+            ),
+            max_tool_calls=1,
+            max_iterations=3,
+        ),
+        context=ExecutionContext.from_run_context(
+            context=RunContext(namespace_id="live-tests", run_id=f"live-langgraph-tool-{backend}"),
+            settings=settings,
+        ),
+        on_checkpoint=lambda checkpoint: checkpoint_phases.append(checkpoint.phase),
+    )
+
+    assert result.ok
+    assert result.output == {"ok": True, "marker": "structured-langgraph-live"}
+    assert result.tool_calls_used == 1
+    assert [item["tool_name"] for item in result.tool_history] == ["live_echo"]
+    assert {"tools", "finalization", "result"}.issubset(checkpoint_phases)
+    assert all(call.model_backend == backend for call in result.llm_calls)
+    assert all(call.model == live_azure_config.model for call in result.llm_calls)
+    assert runner._kernel.backend == "langgraph"
 
 
 def _build_live_conversation_orchestrator(
