@@ -2,6 +2,22 @@
 
 ## Unreleased
 
+- Added opt-in LangGraph kernels for direct, investigate, and deep-investigate
+  conversation turns behind `CoreSettings.agent_kernel_backend`, using typed
+  internal state, versioned pending graph cursors, and shared native/LangGraph
+  operations while preserving agent-core persistence, budgets, artifacts,
+  traces, and memory contracts. Added deterministic contract parity and opt-in
+  paired real-model kernel evals for tools, pending resume, structured output,
+  investigation synthesis, critique, tokens, latency, persistence, and traces.
+- Added an opt-in LangChain model backend for Azure OpenAI behind the existing
+  `BaseLLMProvider` contract, with shared request normalization, adaptive retry,
+  token usage, tool-call, request-id, and primary/memory provider semantics.
+- Fixed the provider compatibility quickstart to consume typed
+  `LLMCompletionResult` values for plain-text and JSON Schema checks.
+- Added persisted `model_backend` telemetry, explicit opt-in LangSmith tracing,
+  broader Azure provider contract coverage, and an opt-in paid `live_llm` test
+  matrix for native and LangChain model invocation.
+
 - Replaced overflow-driven conversation summaries and separately synthesized
   task state with append-only `ExchangeMemory` and `TurnMemory` journals plus a
   deterministic, rebuildable `SessionView`.

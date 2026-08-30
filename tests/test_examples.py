@@ -3,7 +3,7 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
-from agent_core.llm.base import LLMCompletionResult
+from agent_core.llm.base import LLMCompletionResult, LLMTokenUsage
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -84,6 +84,29 @@ def test_quickstart_build_settings_reads_azure_anthropic_env(tmp_path, monkeypat
     assert quickstart.missing_provider_config(settings) == []
 
 
+def test_quickstart_build_settings_reads_langchain_model_backends(tmp_path, monkeypatch) -> None:
+    quickstart = load_example("quickstart")
+    monkeypatch.setenv("LLM_PROVIDER", "azure_openai")
+    monkeypatch.setenv("AGENT_CORE_MODEL_BACKEND", "langchain")
+    monkeypatch.setenv("AGENT_CORE_MEMORY_MODEL_BACKEND", "native")
+    monkeypatch.setenv("AGENT_CORE_AGENT_KERNEL_BACKEND", "langgraph")
+    monkeypatch.setenv("AGENT_CORE_LANGCHAIN_TRACING_ENABLED", "true")
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
+    monkeypatch.setenv("AZURE_OPENAI_API_KEY", "test-key")
+
+    settings = quickstart.build_settings(
+        model="deployment-name",
+        memory_model="memory-deployment",
+        session_file=tmp_path / "session.json",
+    )
+
+    assert settings.llm_model_backend == "langchain"
+    assert settings.memory_llm_model_backend == "native"
+    assert settings.agent_kernel_backend == "langgraph"
+    assert settings.langchain_tracing_enabled is True
+    assert quickstart.missing_provider_config(settings) == []
+
+
 def test_quickstart_structured_task_compat_check_returns_bool(tmp_path) -> None:
     quickstart = load_example("quickstart")
 
@@ -98,6 +121,29 @@ def test_quickstart_structured_task_compat_check_returns_bool(tmp_path) -> None:
     )
 
     assert quickstart._run_structured_task_check(settings, FakeProvider()) is True
+
+
+def test_quickstart_plain_chat_check_accepts_typed_completion_result() -> None:
+    quickstart = load_example("quickstart")
+
+    class FakeProvider:
+        def complete_text(self, **kwargs):
+            return LLMCompletionResult(
+                content="OK",
+                usage=LLMTokenUsage(input_tokens=3, output_tokens=1, total_tokens=4),
+            )
+
+    assert quickstart._run_plain_chat_check(FakeProvider(), model="fake-model") is True
+
+
+def test_quickstart_json_schema_check_accepts_typed_completion_result() -> None:
+    quickstart = load_example("quickstart")
+
+    class FakeProvider:
+        def complete_text(self, **kwargs):
+            return LLMCompletionResult(content='{"ok": true, "mode": "json_schema"}')
+
+    assert quickstart._run_json_schema_check(FakeProvider(), model="fake-model") is True
 
 
 def test_pending_tool_resume_example_runs(tmp_path) -> None:

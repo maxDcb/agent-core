@@ -26,7 +26,11 @@ classifiers = [
 dependencies = [
     "anthropic>=0.111.0",
     "jsonschema[format]>=4.23.0,<5",
-    "openai>=1.30.0",
+    "langchain-core>=1.6.0,<2.0.0",
+    "langchain-openai>=1.6.0,<2.0.0",
+    "langgraph>=1.2.10,<2.0.0",
+    "langsmith>=0.11.0,<1.0.0",
+    "openai>=2.45.0,<4.0.0",
     "requests>=2.31.0",
 ]
 
@@ -61,6 +65,7 @@ python_files = ["test_*.py"]
 addopts = "--strict-markers"
 markers = [
     "chaos: deterministic fault-injection and resilience tests",
+    "live_llm: paid Azure OpenAI integration tests, disabled unless explicitly enabled",
 ]
 
 [tool.mypy]

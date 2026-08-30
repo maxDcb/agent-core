@@ -20,6 +20,7 @@ from agent_core.conversation import AgentOrchestrator, SessionManager, SessionRe
 from agent_core.spi import (
     BaseLLMProvider,
     LLMCallOptions,
+    LLMCompletionResult,
     LLMMessage,
     LLMProviderError,
     LLMToolDefinition,
@@ -29,6 +30,7 @@ from agent_core.spi import (
     build_memory_provider,
     build_provider,
     build_tool_definition,
+    normalize_model_backend,
     normalize_provider_name,
 )
 
@@ -109,6 +111,9 @@ def load_dotenv(path: Path) -> None:
 def build_settings(*, model: str, memory_model: str, session_file: Path) -> CoreSettings:
     return CoreSettings(
         llm_provider=os.getenv("LLM_PROVIDER", "openai"),
+        llm_model_backend=os.getenv("AGENT_CORE_MODEL_BACKEND", "native"),
+        agent_kernel_backend=os.getenv("AGENT_CORE_AGENT_KERNEL_BACKEND", "native"),
+        langchain_tracing_enabled=_env_flag("AGENT_CORE_LANGCHAIN_TRACING_ENABLED"),
         openai_api_key=os.getenv("OPENAI_API_KEY"),
         azure_openai_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
         azure_openai_api_key=os.getenv("AZURE_OPENAI_API_KEY"),
@@ -118,6 +123,7 @@ def build_settings(*, model: str, memory_model: str, session_file: Path) -> Core
         azure_anthropic_api_version=os.getenv("AZURE_ANTHROPIC_API_VERSION"),
         azure_anthropic_version=os.getenv("AZURE_ANTHROPIC_VERSION"),
         memory_llm_provider=os.getenv("AGENT_CORE_MEMORY_LLM_PROVIDER"),
+        memory_llm_model_backend=os.getenv("AGENT_CORE_MEMORY_MODEL_BACKEND"),
         memory_openai_api_key=os.getenv("AGENT_CORE_MEMORY_OPENAI_API_KEY"),
         memory_azure_openai_endpoint=os.getenv("AGENT_CORE_MEMORY_AZURE_OPENAI_ENDPOINT"),
         memory_azure_openai_api_key=os.getenv("AGENT_CORE_MEMORY_AZURE_OPENAI_API_KEY"),
@@ -185,6 +191,10 @@ def _print_check(name: str, ok: bool, detail: str) -> bool:
     return ok
 
 
+def _completion_text(completion: LLMCompletionResult | str) -> str:
+    return completion.content if isinstance(completion, LLMCompletionResult) else completion
+
+
 def _json_object_matches(content: str, expected: dict[str, Any]) -> tuple[bool, str]:
     try:
         payload = json.loads(content)
@@ -205,7 +215,7 @@ def _json_object_matches(content: str, expected: dict[str, Any]) -> tuple[bool, 
 
 def _run_plain_chat_check(provider: BaseLLMProvider, *, model: str) -> bool:
     try:
-        content = provider.complete_text(
+        completion = provider.complete_text(
             messages=[
                 LLMMessage(role="system", content="You are a compatibility checker. Answer exactly as requested."),
                 LLMMessage(role="user", content="Return exactly: OK"),
@@ -215,6 +225,7 @@ def _run_plain_chat_check(provider: BaseLLMProvider, *, model: str) -> bool:
         )
     except LLMProviderError as exc:
         return _print_check("plain chat", False, f"{exc.kind}: {exc.user_message}")
+    content = _completion_text(completion)
     normalized = content.strip().strip("\"'").rstrip(".")
     if normalized == "OK":
         return _print_check("plain chat", True, f"content={content!r}")
@@ -278,7 +289,7 @@ def _run_json_schema_check(provider: BaseLLMProvider, *, model: str) -> bool:
         "additionalProperties": False,
     }
     try:
-        content = provider.complete_text(
+        completion = provider.complete_text(
             messages=[
                 LLMMessage(
                     role="user",
@@ -301,6 +312,7 @@ def _run_json_schema_check(provider: BaseLLMProvider, *, model: str) -> bool:
     except LLMProviderError as exc:
         return _print_check("response_format json_schema", False, f"{exc.kind}: {exc.user_message}")
 
+    content = _completion_text(completion)
     ok, detail = _json_object_matches(content, {"ok": True, "mode": "json_schema"})
     return _print_check("response_format json_schema", ok, detail)
 
@@ -354,9 +366,16 @@ def _optional_positive_int(value: str | None) -> int | None:
     return parsed if parsed > 0 else None
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def run_compatibility_checks(settings: CoreSettings) -> int:
     provider = build_provider(settings)
-    print(f"Running provider compatibility checks with provider={settings.llm_provider!r}, model={settings.model!r}")
+    print(
+        "Running provider compatibility checks with "
+        f"provider={settings.llm_provider!r}, backend={settings.llm_model_backend!r}, model={settings.model!r}"
+    )
     print("Checks cover plain chat, OpenAI-style tool calls, JSON Schema response_format, and StructuredTaskRunner.")
 
     checks = [
@@ -373,6 +392,14 @@ def run_compatibility_checks(settings: CoreSettings) -> int:
 
 def missing_provider_config(settings: CoreSettings) -> list[str]:
     provider_name = normalize_provider_name(settings.llm_provider)
+    model_backend = normalize_model_backend(settings.llm_model_backend)
+    agent_kernel_backend = settings.agent_kernel_backend.strip().lower().replace("-", "_")
+    if agent_kernel_backend not in {"native", "langgraph"}:
+        return [f"unsupported AGENT_CORE_AGENT_KERNEL_BACKEND={settings.agent_kernel_backend!r}"]
+    if model_backend not in {"native", "langchain"}:
+        return [f"unsupported AGENT_CORE_MODEL_BACKEND={settings.llm_model_backend!r}"]
+    if model_backend == "langchain" and provider_name != "azure_openai":
+        return ["AGENT_CORE_MODEL_BACKEND=langchain currently requires LLM_PROVIDER=azure_openai"]
     if provider_name == "openai":
         return [] if settings.openai_api_key else ["OPENAI_API_KEY"]
     if provider_name == "azure_openai":

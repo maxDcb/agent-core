@@ -91,6 +91,93 @@ Or run a small REPL:
 .venv/bin/python examples/quickstart.py --interactive
 ```
 
+### Optional LangChain model backend for Azure OpenAI
+
+Azure OpenAI can use LangChain for model invocation while the agent loop,
+tools, policies, checkpoints, memory lifecycle, and public provider contract
+remain owned by agent-core. The native SDK backend remains the default.
+
+```bash
+LLM_PROVIDER=azure_openai
+AGENT_CORE_MODEL_BACKEND=langchain
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com
+AZURE_OPENAI_API_KEY=...
+AZURE_OPENAI_API_VERSION=2025-01-01-preview
+AGENT_CORE_MODEL=<deployment-name>
+AGENT_CORE_MEMORY_MODEL=<deployment-name>
+
+.venv/bin/python examples/quickstart.py --compat-check
+```
+
+`AGENT_CORE_MEMORY_MODEL_BACKEND` can override the backend for a dedicated
+memory provider. If it is omitted, memory synthesis uses the primary backend;
+`native` and `langchain` can therefore be compared without changing the agent
+or memory contracts. The LangChain backend currently supports Azure OpenAI
+only.
+
+LangSmith tracing is forcibly disabled around LangChain model calls by default,
+including when the process inherits `LANGSMITH_TRACING=true`. A host that has
+reviewed its data-handling requirements can explicitly opt in with
+`AGENT_CORE_LANGCHAIN_TRACING_ENABLED=true`.
+
+Provider telemetry keeps `provider="azure_openai"` stable and records the
+implementation separately as `model_backend="native"` or `"langchain"` in
+completion records, run results, structured-task checkpoints, and conversation
+trace response events.
+
+### Optional LangGraph conversation-agent kernel
+
+The conversation orchestrator can use LangGraph for the internal control flow
+of `direct`, `investigate`, and `deep_investigate` turns. This switch is
+independent from the model backend: native or LangChain model invocation can be
+used with either agent kernel.
+
+```bash
+AGENT_CORE_AGENT_KERNEL_BACKEND=langgraph
+```
+
+The default remains `native`. LangGraph owns the direct model/tool loop plus the
+planning, assistant, tool, reflection/decision, critique, and terminal routes
+for investigation modes. The existing controller operations still implement
+the domain semantics shared by both kernels. Session persistence, pending-tool
+payloads, resume idempotence, budgets, artifacts, traces, and memory commits
+remain owned by agent-core. A versioned graph cursor is stored in pending
+payloads, while the LangGraph graphs are intentionally compiled without their
+own durable checkpointer to avoid two competing state stores.
+
+The same explicit LangSmith privacy boundary applies to graph execution:
+tracing stays disabled unless `AGENT_CORE_LANGCHAIN_TRACING_ENABLED=true`, even
+if the process inherits `LANGSMITH_TRACING=true`.
+
+See [docs/langgraph_migration.md](docs/langgraph_migration.md) for the state and
+transition map, current ownership boundaries, and the remaining full-graph
+migration work.
+
+Paid Azure integration tests are excluded from normal test runs. To execute the
+same behavioral matrix against both backends:
+
+```bash
+AGENT_CORE_RUN_LIVE_LLM_TESTS=1 \
+AGENT_CORE_LIVE_LLM_MODEL=gpt-5.4-mini \
+AZURE_OPENAI_ENDPOINT=https://<resource>.openai.azure.com \
+AZURE_OPENAI_API_KEY=... \
+.venv/bin/python -m pytest -m live_llm -q -s
+```
+
+Use `AGENT_CORE_LIVE_LLM_BACKENDS=native` or `langchain` to test only one
+implementation. The live suite covers reasoning and usage metadata, strict JSON
+Schema output, a complete tool-result roundtrip, and `StructuredTaskRunner`.
+When the LangChain model backend is selected, it also compares native and
+LangGraph direct-agent kernels through the full conversation tool loop,
+validates pending/resume for both kernels, and runs paired investigation and
+deep-investigation scenarios. The extended matrix covers competing-tool
+selection, structured final output, initial planning, reflection, decision,
+final critique, and final synthesis. Lines prefixed with
+`LIVE_KERNEL_EVAL` report per-kernel wall/provider latency, model-call count,
+token usage, selected tools, persistence projections, and trace-event paths.
+Latency and token deltas are observations rather than pass/fail thresholds;
+repeat the paid suite before drawing performance conclusions from them.
+
 See [examples/README.md](examples/README.md) for the pending tool result and
 resume example.
 

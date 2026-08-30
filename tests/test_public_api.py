@@ -107,6 +107,7 @@ def test_extension_conversation_and_observability_facades_are_explicit() -> None
         "build_provider_from_config",
         "build_tool_definition",
         "load_prompt",
+        "normalize_model_backend",
         "normalize_provider_name",
     }
     assert set(conversation.__all__) == {

@@ -125,12 +125,21 @@ class DraftAndFinalProvider:
         return LLMCompletionResult(content=json.dumps({"summary": "validated final"}))
 
 
-def _service(tmp_path, *, provider, tool: CountingTool | None = None):
+def _service(
+    tmp_path,
+    *,
+    provider,
+    tool: CountingTool | None = None,
+    agent_kernel_backend: str = "native",
+):
     registry = ToolRegistry()
     if tool is not None:
         registry.register(tool)
     return AgentRunService(
-        settings=CoreSettings(session_file=tmp_path / "session.json"),
+        settings=CoreSettings(
+            session_file=tmp_path / "session.json",
+            agent_kernel_backend=agent_kernel_backend,
+        ),
         provider=provider,
         tool_registry=registry,
         policy_engine=PolicyEngine(),
@@ -184,7 +193,12 @@ def test_resume_continues_after_completed_tool_without_replaying_it(tmp_path) ->
     assert tool.calls == 1
 
     final_provider = FinalProvider()
-    resumed = _service(tmp_path, provider=final_provider, tool=tool).resume(
+    resumed = _service(
+        tmp_path,
+        provider=final_provider,
+        tool=tool,
+        agent_kernel_backend="langgraph",
+    ).resume(
         spec=_spec(),
         context=context,
         run_id="run-1",
