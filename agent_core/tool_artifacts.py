@@ -4,7 +4,7 @@ import hashlib
 import json
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, replace
@@ -531,28 +531,45 @@ class ToolArtifactRuntime:
             metadata={_ARTIFACT_METADATA_KEY: envelope.as_reference().to_dict()},
         )
 
-    def project_messages(self, messages: list[LLMMessage]) -> list[LLMMessage]:
+    def project_messages(
+        self,
+        messages: list[LLMMessage],
+        *,
+        messages_fit: Callable[[list[LLMMessage]], bool] | None = None,
+    ) -> list[LLMMessage]:
         projected = [
             replace(message, tool_calls=list(message.tool_calls), metadata=dict(message.metadata))
             for message in messages
         ]
-        remaining = self.policy.hot_context_bytes
-        for message in reversed(projected):
+        stored_envelopes: list[tuple[LLMMessage, ArtifactResultEnvelope]] = []
+        for message in projected:
             stored_envelope = artifact_envelope_from_message(message)
             if stored_envelope is None:
                 continue
+            stored_envelopes.append((message, stored_envelope))
+            message.content = stored_envelope.as_reference().to_content()
+
+        remaining = self.policy.hot_context_bytes
+        for message, stored_envelope in reversed(stored_envelopes):
             materialization_bytes = self._materialization_bytes(stored_envelope.artifact)
             if materialization_bytes <= remaining:
                 envelope = self._materialize_stored(stored_envelope)
-                if envelope.materialization != "reference":
-                    remaining -= envelope.returned_bytes
-            else:
-                envelope = stored_envelope.as_reference()
-            message.content = envelope.to_content()
+                if envelope.materialization == "reference":
+                    continue
+                message.content = envelope.to_content()
+                if messages_fit is not None and not messages_fit(projected):
+                    message.content = stored_envelope.as_reference().to_content()
+                    continue
+                remaining -= envelope.returned_bytes
         return projected
 
-    def prepare_messages(self, messages: list[LLMMessage]) -> None:
-        messages[:] = self.project_messages(messages)
+    def prepare_messages(
+        self,
+        messages: list[LLMMessage],
+        *,
+        messages_fit: Callable[[list[LLMMessage]], bool] | None = None,
+    ) -> None:
+        messages[:] = self.project_messages(messages, messages_fit=messages_fit)
 
     def tool_specs(self) -> list[LLMToolDefinition]:
         return [
@@ -590,7 +607,14 @@ class ToolArtifactRuntime:
     def is_internal_tool(self, tool_name: str) -> bool:
         return tool_name == READ_ARTIFACT_TOOL_NAME
 
-    def execute(self, *, tool_name: str, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
+    def execute(
+        self,
+        *,
+        tool_name: str,
+        arguments: dict[str, Any],
+        context: ExecutionContext,
+        content_fits: Callable[[str], bool] | None = None,
+    ) -> ToolResult:
         if not self.is_internal_tool(tool_name):
             raise KeyError(tool_name)
         if context.namespace_id != self.namespace_id:
@@ -614,19 +638,41 @@ class ToolArtifactRuntime:
         limit = min(requested_limit, self.policy.max_read_bytes, remaining)
         self.usage.internal_tool_calls += 1
         try:
-            chunk = self.store.read_text(
-                namespace_id=self.namespace_id,
+            chunk, context_limited = self._largest_fitting_chunk(
                 artifact_id=artifact_id,
                 offset=offset,
                 limit=limit,
+                content_fits=content_fits,
             )
         except (FileNotFoundError, PermissionError, ValueError, OSError) as exc:
             return ToolResult(ok=False, content=f"Artifact read failed: {exc}")
+        if chunk is None:
+            self.usage.reads_rejected += 1
+            return ToolResult(
+                ok=False,
+                content=(
+                    "Artifact read stopped: the remaining model context cannot safely hold another chunk. "
+                    "Use the evidence already read and return the best supported final answer."
+                ),
+                metadata={
+                    "tool_kind": "runtime",
+                    "artifact_read": True,
+                    "artifact_read_context_exhausted": True,
+                    "externalize": False,
+                },
+            )
         self.usage.artifact_bytes_read += chunk.next_offset - chunk.offset
+        metadata: dict[str, Any] = {
+            "tool_kind": "runtime",
+            "artifact_read": True,
+            "externalize": False,
+        }
+        if context_limited:
+            metadata["artifact_read_context_limited"] = True
         return ToolResult(
             ok=True,
             content=chunk.to_content(),
-            metadata={"tool_kind": "runtime", "artifact_read": True, "externalize": False},
+            metadata=metadata,
         )
 
     def to_metadata(self) -> dict[str, Any]:
@@ -710,6 +756,42 @@ class ToolArtifactRuntime:
         if descriptor.size_bytes <= self.policy.max_complete_result_bytes:
             return descriptor.size_bytes
         return min(self.policy.preview_bytes, descriptor.size_bytes - 1)
+
+    def _largest_fitting_chunk(
+        self,
+        *,
+        artifact_id: str,
+        offset: int,
+        limit: int,
+        content_fits: Callable[[str], bool] | None,
+    ) -> tuple[ArtifactChunk | None, bool]:
+        chunk = self.store.read_text(
+            namespace_id=self.namespace_id,
+            artifact_id=artifact_id,
+            offset=offset,
+            limit=limit,
+        )
+        if content_fits is None or content_fits(chunk.to_content()):
+            return chunk, False
+
+        low = 1
+        high = limit - 1
+        best: ArtifactChunk | None = None
+        while low <= high:
+            candidate_limit = (low + high) // 2
+            candidate = self.store.read_text(
+                namespace_id=self.namespace_id,
+                artifact_id=artifact_id,
+                offset=offset,
+                limit=candidate_limit,
+            )
+            if content_fits(candidate.to_content()):
+                if best is None or candidate.next_offset > best.next_offset:
+                    best = candidate
+                low = candidate_limit + 1
+            else:
+                high = candidate_limit - 1
+        return best, best is not None
 
 
 def artifact_descriptor_from_message(message: LLMMessage) -> ToolArtifactDescriptor | None:

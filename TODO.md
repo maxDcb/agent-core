@@ -2,6 +2,12 @@
 
 ## Context capacity and large artifacts
 
+- Implemented: structured artifact reads now use the enforced context-window
+  plan as a dynamic byte budget, retain exact unread data in the artifact store,
+  and stop explicitly when no additional chunk can fit while reserving final
+  output capacity. The remaining items below cover broader provider capability
+  discovery and optional artifact-store features.
+
 - Keep the current accuracy-first behavior: do not semantically compact or discard active-run evidence solely because a configurable context target was exceeded.
 - Keep normal conversation compaction after the run completes.
 - In a future change, distinguish the provider's hard context capacity from the configurable active-history target and expose accurate context-usage telemetry.

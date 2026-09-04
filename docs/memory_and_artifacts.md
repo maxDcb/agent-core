@@ -159,7 +159,10 @@ Materialization has three states:
 Before each model request, projection scans stored artifact messages from newest
 to oldest. It rehydrates a full small result or a large-result preview while
 `hot_context_bytes` remains. Older results become references. If stored content
-cannot be read or verified, projection safely leaves a reference.
+cannot be read or verified, projection safely leaves a reference. When an
+enforced `LLMContextPolicy` is active, a hot materialization is also kept only
+if the complete planned request still fits; otherwise the lossless reference
+is sent and the content remains available through bounded reads.
 
 Persisted messages always use the reference form, even when the live provider
 projection was complete or a preview. Raw content therefore exists once in the
@@ -176,9 +179,13 @@ arguments are:
 - `offset`: non-negative byte offset, default 0;
 - `limit`: requested positive byte limit.
 
-The effective limit is the minimum of the requested value,
-`max_read_bytes`, and the run's remaining `max_total_read_bytes`. The response
-is an `artifact_chunk`:
+The initial effective limit is the minimum of the requested value,
+`max_read_bytes`, and the run's remaining `max_total_read_bytes`. In structured
+tasks with an enforced `LLMContextPolicy`, agent-core then reduces that limit
+when necessary so the complete next tool-loop request and an immediate final
+response still fit. The calculation includes messages, tool schemas, the final
+response schema, output reservation and safety margin. The response is an
+`artifact_chunk`:
 
 ```json
 {
@@ -198,6 +205,13 @@ Continue with each `next_offset` until `eof` is true. Reads have independent
 `max_reads_per_run` and `max_total_read_bytes` accounting. They do not consume
 the application tool-call budget and do not pass through application
 `PolicyEngine` rules.
+
+If even the smallest UTF-8 chunk cannot fit, the read returns an explicit
+context-capacity error, increments `reads_rejected`, and the structured task
+moves directly to its no-tool finalization call. `eof` is never forged and
+unread artifact content is never represented as reviewed evidence. Runs without
+an `LLMContextPolicy`, and policies in `observe` mode, retain the fixed-limit
+behavior for compatibility.
 
 Reads are namespace-scoped: the runtime supplies the current namespace and the
 model supplies only the artifact id. The default store does not add a second

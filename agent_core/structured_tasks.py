@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Sequence
 from dataclasses import dataclass, field
 from inspect import Parameter, signature
 from typing import Any, Literal, Protocol, TypedDict, cast
@@ -23,6 +23,7 @@ from agent_core.llm.base import (
     LLMCompletionResult,
     LLMMessage,
     LLMToolCall,
+    LLMToolDefinition,
     LLMUsageSummary,
 )
 from agent_core.llm.errors import LLMProviderError
@@ -758,6 +759,7 @@ class StructuredTaskRunner:
         checkpoint: StructuredTaskCheckpoint,
         on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
     ) -> StructuredTaskResult | None:
+        artifact_context_exhausted = False
         while checkpoint.next_tool_call_index < len(checkpoint.pending_tool_calls):
             tool_call = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index]
             artifact_runtime = active_tool_artifact_runtime()
@@ -785,23 +787,74 @@ class StructuredTaskRunner:
             if not is_internal:
                 checkpoint.tool_calls_used += 1
             self._emit_checkpoint(checkpoint, on_checkpoint)
+            remaining_pending_calls = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index + 1 :]
+            content_fits: Callable[[str], bool] | None = None
+            if is_internal:
+                def artifact_content_fits(
+                    content: str,
+                    current_tool_call_id: str = tool_call.tool_call_id,
+                    current_trailing_tool_calls: tuple[StructuredToolCallCheckpoint, ...] = tuple(
+                        remaining_pending_calls
+                    ),
+                ) -> bool:
+                    return self._artifact_read_content_fits(
+                        spec=spec,
+                        registry=registry,
+                        messages=checkpoint.messages,
+                        tool_call_id=current_tool_call_id,
+                        content=content,
+                        trailing_tool_calls=current_trailing_tool_calls,
+                    )
+
+                content_fits = artifact_content_fits
             tool_message, history_item = self._execute_tool_call(
                 registry=registry,
                 tool_name=tool_call.tool_name,
                 arguments_json=tool_call.arguments_json,
                 tool_call_id=tool_call.tool_call_id,
                 context=context,
+                content_fits=content_fits,
             )
             checkpoint.messages.append(tool_message)
             checkpoint.tool_history.append(history_item)
             tool_call.status = "completed"
             checkpoint.next_tool_call_index += 1
             self._emit_checkpoint(checkpoint, on_checkpoint)
+            if history_item.get("artifact_read_context_exhausted") is True:
+                artifact_context_exhausted = True
+                for skipped in remaining_pending_calls:
+                    skipped_content = "Tool call skipped: artifact context capacity reached."
+                    checkpoint.messages.append(
+                        LLMMessage(
+                            role="tool",
+                            tool_call_id=skipped.tool_call_id,
+                            content=skipped_content,
+                        )
+                    )
+                    checkpoint.tool_history.append(
+                        {
+                            "tool_name": skipped.tool_name,
+                            "arguments": {},
+                            "status": "budget_exhausted",
+                            "content_preview": skipped_content,
+                            "tool_kind": "runtime" if artifact_runtime.is_internal_tool(skipped.tool_name) else "application",
+                        }
+                    )
+                    skipped.status = "budget_exhausted"
+                    checkpoint.next_tool_call_index += 1
+                break
 
         tool_budget_exhausted = any(item.status == "budget_exhausted" for item in checkpoint.pending_tool_calls)
         checkpoint.pending_tool_calls = []
         checkpoint.next_tool_call_index = 0
-        if tool_budget_exhausted:
+        if artifact_context_exhausted:
+            checkpoint.phase = "finalization"
+            checkpoint.finalization_kind = "budget"
+            checkpoint.finalization_reason = (
+                "The remaining model context cannot safely hold another artifact chunk."
+            )
+            checkpoint.raw_failure_content = checkpoint.messages[-1].content if checkpoint.messages else ""
+        elif tool_budget_exhausted:
             checkpoint.phase = "finalization"
             checkpoint.finalization_kind = "budget"
             checkpoint.finalization_reason = "Maximum number of structured task tool calls reached."
@@ -1050,6 +1103,147 @@ class StructuredTaskRunner:
                 history_item["artifact_id"] = descriptor.artifact_id
             tool_history.append(history_item)
 
+    def _artifact_read_content_fits(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        registry: ToolRegistry,
+        messages: list[LLMMessage],
+        tool_call_id: str,
+        content: str,
+        trailing_tool_calls: Sequence[StructuredToolCallCheckpoint],
+    ) -> bool:
+        context_planner = active_llm_context_planner()
+        if context_planner is None or context_planner.policy.mode != "enforce":
+            return True
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during artifact read planning")
+
+        candidate_messages = [
+            *messages,
+            LLMMessage(role="tool", tool_call_id=tool_call_id, content=content),
+            *[
+                LLMMessage(
+                    role="tool",
+                    tool_call_id=tool_call.tool_call_id,
+                    content="Tool call skipped: artifact context capacity reached.",
+                )
+                for tool_call in trailing_tool_calls
+            ],
+        ]
+        tool_specs = self._structured_tool_specs(registry=registry, messages=candidate_messages)
+        tool_options = self._structured_model_options(spec=spec, final_output=False)
+        projected_tool_messages = artifact_runtime.project_messages(
+            candidate_messages,
+            messages_fit=lambda projected: context_planner.can_plan_call(
+                messages=projected,
+                tools=tool_specs,
+                purpose="structured_tool_loop",
+                options=tool_options,
+            ),
+        )
+        if not context_planner.can_plan_call(
+            messages=projected_tool_messages,
+            tools=tool_specs,
+            purpose="structured_tool_loop",
+            options=tool_options,
+        ):
+            return False
+
+        final_reason = "The remaining model context cannot safely hold another artifact chunk."
+        final_messages = self._build_finalization_messages(
+            spec=spec,
+            messages=candidate_messages,
+            failure_reason=final_reason,
+        )
+        final_options = self._structured_finalization_options(spec=spec)
+        projected_final_messages = artifact_runtime.project_messages(
+            final_messages,
+            messages_fit=lambda projected: context_planner.can_plan_call(
+                messages=projected,
+                tools=[],
+                purpose="structured_finalization",
+                options=final_options,
+            ),
+        )
+        return context_planner.can_plan_call(
+            messages=projected_final_messages,
+            tools=[],
+            purpose="structured_finalization",
+            options=final_options,
+        )
+
+    def _structured_tool_specs(
+        self,
+        *,
+        registry: ToolRegistry,
+        messages: list[LLMMessage],
+    ) -> list[LLMToolDefinition]:
+        tool_specs = registry.get_tool_specs()
+        artifact_runtime = active_tool_artifact_runtime()
+        if artifact_runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during model execution")
+        if registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
+            raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
+        if artifact_runtime.has_readable_artifacts(messages):
+            tool_specs.extend(artifact_runtime.tool_specs())
+        return tool_specs
+
+    def _structured_model_options(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        final_output: bool,
+    ) -> LLMCallOptions:
+        return LLMCallOptions(
+            response_format=_response_format_for_spec(spec, final_output=final_output),
+            response_format_fallback=None,
+            max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens)
+            if final_output
+            else None,
+            metadata={
+                "structured_task_id": spec.task_id,
+                "llm_call_purpose": "structured_direct" if final_output else "structured_tool_loop",
+                **spec.metadata,
+            },
+        )
+
+    def _structured_finalization_options(self, *, spec: StructuredTaskSpec) -> LLMCallOptions:
+        return LLMCallOptions(
+            response_format=_response_format_for_spec(spec, final_output=True),
+            response_format_fallback=None,
+            max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens),
+            metadata={
+                "structured_task_id": spec.task_id,
+                "structured_task_finalization": True,
+                "llm_call_purpose": "structured_finalization",
+                **spec.metadata,
+            },
+        )
+
+    def _build_finalization_messages(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        messages: list[LLMMessage],
+        failure_reason: str,
+    ) -> list[LLMMessage]:
+        if spec.output_contract is None:
+            final_instruction = (
+                f"{failure_reason} No more tools are available. "
+                "Return the best possible final answer now, using only the evidence already present "
+                "in the transcript. Do not request tools."
+            )
+        else:
+            final_instruction = (
+                f"{failure_reason} No more tools are available. "
+                "Return the best possible final JSON object now, using only the evidence already present "
+                "in the transcript. Do not request tools. Return one JSON object only, with no prose, "
+                "no markdown fences, and no second JSON object after it."
+            )
+        return [*messages, LLMMessage(role="system", content=final_instruction)]
+
     def _call_model_once(
         self,
         *,
@@ -1059,24 +1253,8 @@ class StructuredTaskRunner:
         final_output: bool = False,
         on_budget_reserved: Callable[[], None] | None = None,
     ) -> LLMCompletionResult:
-        options = LLMCallOptions(
-            response_format=_response_format_for_spec(spec, final_output=final_output),
-            response_format_fallback=None,
-            max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens) if final_output else None,
-            metadata={
-                "structured_task_id": spec.task_id,
-                "llm_call_purpose": "structured_direct" if final_output else "structured_tool_loop",
-                **spec.metadata,
-            },
-        )
-        tool_specs = registry.get_tool_specs()
-        artifact_runtime = active_tool_artifact_runtime()
-        if artifact_runtime is None:
-            raise RuntimeError("Tool artifact runtime is required during model execution")
-        if registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
-            raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
-        if artifact_runtime.has_readable_artifacts(messages):
-            tool_specs.extend(artifact_runtime.tool_specs())
+        options = self._structured_model_options(spec=spec, final_output=final_output)
+        tool_specs = self._structured_tool_specs(registry=registry, messages=messages)
         kwargs: dict[str, Any] = {
             "messages": messages,
             "tools": tool_specs,
@@ -1126,37 +1304,12 @@ class StructuredTaskRunner:
         failure_reason: str,
         on_budget_reserved: Callable[[], None] | None = None,
     ) -> LLMCompletionResult:
-        options = LLMCallOptions(
-            response_format=_response_format_for_spec(spec, final_output=True),
-            response_format_fallback=None,
-            max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens),
-            metadata={
-                "structured_task_id": spec.task_id,
-                "structured_task_finalization": True,
-                "llm_call_purpose": "structured_finalization",
-                **spec.metadata,
-            },
+        options = self._structured_finalization_options(spec=spec)
+        final_messages = self._build_finalization_messages(
+            spec=spec,
+            messages=messages,
+            failure_reason=failure_reason,
         )
-        if spec.output_contract is None:
-            final_instruction = (
-                f"{failure_reason} No more tools are available. "
-                "Return the best possible final answer now, using only the evidence already present "
-                "in the transcript. Do not request tools."
-            )
-        else:
-            final_instruction = (
-                f"{failure_reason} No more tools are available. "
-                "Return the best possible final JSON object now, using only the evidence already present "
-                "in the transcript. Do not request tools. Return one JSON object only, with no prose, "
-                "no markdown fences, and no second JSON object after it."
-            )
-        final_messages = [
-            *messages,
-            LLMMessage(
-                role="system",
-                content=final_instruction,
-            ),
-        ]
         kwargs: dict[str, Any] = {
             "messages": final_messages,
             "tools": [],
@@ -1289,11 +1442,13 @@ class StructuredTaskRunner:
         arguments_json: str,
         tool_call_id: str,
         context: ExecutionContext,
+        content_fits: Callable[[str], bool] | None = None,
     ) -> tuple[LLMMessage, dict[str, Any]]:
         artifact_runtime = active_tool_artifact_runtime()
         if artifact_runtime is None:
             raise RuntimeError("Tool artifact runtime is required during tool execution")
         arguments: dict[str, Any]
+        result_metadata: dict[str, Any] = {}
         try:
             loaded_arguments = json.loads(arguments_json or "{}")
             arguments = loaded_arguments if isinstance(loaded_arguments, dict) else {}
@@ -1329,11 +1484,17 @@ class StructuredTaskRunner:
             else:
                 try:
                     result = (
-                        artifact_runtime.execute(tool_name=tool_name, arguments=arguments, context=context)
+                        artifact_runtime.execute(
+                            tool_name=tool_name,
+                            arguments=arguments,
+                            context=context,
+                            content_fits=content_fits,
+                        )
                         if is_internal
                         else registry.execute(tool_name, arguments, context)
                     )
                     tool_content = result.content
+                    result_metadata = dict(result.metadata)
                     tool_status = "ok" if result.ok else "tool_error"
                     logger.info(
                         "Structured task tool call completed",
@@ -1360,9 +1521,14 @@ class StructuredTaskRunner:
                 metadata={"status": tool_status},
             )
             if not is_internal
-            else LLMMessage(role="tool", tool_call_id=tool_call_id, content=tool_content)
+            else LLMMessage(
+                role="tool",
+                tool_call_id=tool_call_id,
+                content=tool_content,
+                metadata=result_metadata,
+            )
         )
-        history_item = {
+        history_item: dict[str, Any] = {
             "tool_name": tool_name,
             "arguments": arguments,
             "status": tool_status,
@@ -1372,6 +1538,10 @@ class StructuredTaskRunner:
         descriptor = artifact_descriptor_from_message(tool_message)
         if descriptor is not None:
             history_item["artifact_id"] = descriptor.artifact_id
+        if result_metadata.get("artifact_read_context_limited") is True:
+            history_item["artifact_read_context_limited"] = True
+        if result_metadata.get("artifact_read_context_exhausted") is True:
+            history_item["artifact_read_context_exhausted"] = True
         return tool_message, history_item
 
     def _finalize_result(

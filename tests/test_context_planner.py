@@ -157,6 +157,14 @@ def test_observe_mode_reports_overflow_without_changing_request() -> None:
     seen_messages: list[LLMMessage] = []
     seen_options: list[LLMCallOptions | None] = []
 
+    assert planner.can_plan_call(
+        messages=messages,
+        tools=None,
+        purpose="observe_probe",
+        options=None,
+    ) is True
+    assert planner.usage.plans_created == 0
+
     with llm_context_scope(planner):
         run_budgeted_llm_call(
             messages=messages,

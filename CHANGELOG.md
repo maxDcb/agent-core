@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Made structured artifact reads context-aware: oversized chunks are reduced
+  to the largest provider-safe UTF-8 prefix, hot previews fall back to lossless
+  references when needed, and exhausted reads force an explicit no-tool
+  finalization while preserving room for output and response schemas.
+
 - Added opt-in LangGraph kernels for direct, investigate, and deep-investigate
   conversation turns behind `CoreSettings.agent_kernel_backend`, using typed
   internal state, versioned pending graph cursors, and shared native/LangGraph

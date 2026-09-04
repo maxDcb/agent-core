@@ -318,6 +318,29 @@ class LLMContextPlanner:
         self._record(plan)
         return planned_messages, self._effective_options(options, output_reserve), plan
 
+    def can_plan_call(
+        self,
+        *,
+        messages: list[LLMMessage],
+        tools: object,
+        purpose: str,
+        options: LLMCallOptions | None,
+    ) -> bool:
+        """Return whether a call can fit without mutating context-usage telemetry."""
+        if self.policy.mode != "enforce":
+            return True
+        probe = LLMContextPlanner(self.policy)
+        try:
+            _, _, plan = probe.plan_call(
+                messages=messages,
+                tools=tools,
+                purpose=purpose,
+                options=options,
+            )
+        except LLMContextOverflowError:
+            return False
+        return plan.fits
+
     def to_metadata(self) -> dict[str, Any]:
         return {
             "llm_context_policy": self.policy.to_dict(),

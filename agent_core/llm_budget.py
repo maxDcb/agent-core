@@ -401,10 +401,24 @@ def run_budgeted_llm_call(
 ) -> T:
     from agent_core.tool_artifacts import active_tool_artifact_runtime
 
+    context_planner = active_llm_context_planner()
     artifact_runtime = active_tool_artifact_runtime()
     if artifact_runtime is not None:
-        artifact_runtime.prepare_messages(messages)
-    context_planner = active_llm_context_planner()
+        messages_fit: Callable[[list[LLMMessage]], bool] | None = None
+        if context_planner is not None:
+            def context_messages_fit(candidate: list[LLMMessage]) -> bool:
+                return context_planner.can_plan_call(
+                    messages=candidate,
+                    tools=tools,
+                    purpose=purpose,
+                    options=options,
+                )
+
+            messages_fit = context_messages_fit
+        artifact_runtime.prepare_messages(
+            messages,
+            messages_fit=messages_fit,
+        )
     effective_options = options
     if context_planner is not None:
         planned_messages, effective_options, _ = context_planner.plan_call(
