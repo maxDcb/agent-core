@@ -470,6 +470,9 @@ UTF-8 files and is intended for trusted local deployments; production hosts
 handling credentials or browser session data should inject an encrypted store
 with explicit access control and retention.
 
+See [docs/artifact_navigation.md](docs/artifact_navigation.md) for bounded JSON
+selection, literal search, continuation cursors, and recoverable reading errors.
+
 See [docs/memory_and_artifacts.md](docs/memory_and_artifacts.md) for the envelope
 schema, projection rules, read limits and custom-store contract.
 

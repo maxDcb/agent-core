@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
-from collections.abc import Callable, Iterator
+from collections import OrderedDict
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast
 from uuid import uuid4
 
+from agent_core.artifact_navigation import NavigationError, decode_cursor, next_read, render_page, validate_query
 from agent_core.llm.base import LLMMessage, LLMToolDefinition
 from agent_core.types import ToolExecutionStatus, ToolResult
 
@@ -22,6 +25,7 @@ if TYPE_CHECKING:
 READ_ARTIFACT_TOOL_NAME = "agent_core_read_artifact"
 _ARTIFACT_ID_PATTERN = re.compile(r"^art_[0-9a-f]{32}$")
 _ARTIFACT_METADATA_KEY = "artifact_result"
+logger = logging.getLogger(__name__)
 _TOOL_EXECUTION_STATUSES = {
     "ok",
     "pending",
@@ -51,6 +55,8 @@ class ToolArtifactPolicy:
     max_read_bytes: int = 16 * 1024
     max_reads_per_run: int = 20
     max_total_read_bytes: int = 256 * 1024
+    max_navigation_source_bytes: int = 8 * 1024 * 1024
+    max_navigation_cache_bytes: int = 16 * 1024 * 1024
 
     def __post_init__(self) -> None:
         for name in (
@@ -60,6 +66,8 @@ class ToolArtifactPolicy:
             "max_read_bytes",
             "max_reads_per_run",
             "max_total_read_bytes",
+            "max_navigation_source_bytes",
+            "max_navigation_cache_bytes",
         ):
             object.__setattr__(self, name, _positive_int(getattr(self, name), field_name=name))
         if self.preview_bytes > self.hot_context_bytes:
@@ -73,6 +81,8 @@ class ToolArtifactPolicy:
             "max_read_bytes": self.max_read_bytes,
             "max_reads_per_run": self.max_reads_per_run,
             "max_total_read_bytes": self.max_total_read_bytes,
+            "max_navigation_source_bytes": self.max_navigation_source_bytes,
+            "max_navigation_cache_bytes": self.max_navigation_cache_bytes,
         }
 
     @classmethod
@@ -91,6 +101,8 @@ class ToolArtifactPolicy:
             max_read_bytes=cast(int, payload.get("max_read_bytes", 16 * 1024)),
             max_reads_per_run=cast(int, payload.get("max_reads_per_run", 20)),
             max_total_read_bytes=cast(int, payload.get("max_total_read_bytes", 256 * 1024)),
+            max_navigation_source_bytes=cast(int, payload.get("max_navigation_source_bytes", 8 * 1024 * 1024)),
+            max_navigation_cache_bytes=cast(int, payload.get("max_navigation_cache_bytes", 16 * 1024 * 1024)),
         )
 
 
@@ -166,6 +178,9 @@ class ArtifactResultEnvelope:
             "complete": self.complete,
             "next_offset": self.next_offset,
             "read_tool": READ_ARTIFACT_TOOL_NAME,
+            "next_read": None
+            if self.complete
+            else next_read(self.artifact.artifact_id, self.artifact.sha256, {"offset": self.next_offset or 0}),
         }
 
     def to_content(self) -> str:
@@ -264,6 +279,7 @@ class ArtifactChunk:
     size_bytes: int
     content: str
     eof: bool
+    sha256: str = ""
 
     def to_content(self) -> str:
         return json.dumps(
@@ -277,6 +293,9 @@ class ArtifactChunk:
                 "size_bytes": self.size_bytes,
                 "eof": self.eof,
                 "content": self.content,
+                "next_read": None
+                if self.eof
+                else next_read(self.artifact_id, self.sha256, {"offset": self.next_offset}),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -401,6 +420,7 @@ class JsonFileArtifactStore:
             size_bytes=descriptor.size_bytes,
             content=content,
             eof=next_offset >= descriptor.size_bytes,
+            sha256=descriptor.sha256,
         )
 
     def read_all_text(self, *, namespace_id: str, artifact_id: str) -> str:
@@ -455,14 +475,18 @@ class ToolArtifactUsage:
     internal_tool_calls: int = 0
     artifact_bytes_read: int = 0
     reads_rejected: int = 0
+    recovery_attempts: int = 0
+    read_progress: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    def to_dict(self) -> dict[str, int]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "artifacts_written": self.artifacts_written,
             "artifact_bytes_written": self.artifact_bytes_written,
             "internal_tool_calls": self.internal_tool_calls,
             "artifact_bytes_read": self.artifact_bytes_read,
             "reads_rejected": self.reads_rejected,
+            "recovery_attempts": self.recovery_attempts,
+            "read_progress": {key: dict(value) for key, value in self.read_progress.items()},
         }
 
     @classmethod
@@ -482,6 +506,14 @@ class ToolArtifactUsage:
             internal_tool_calls=count("internal_tool_calls"),
             artifact_bytes_read=count("artifact_bytes_read"),
             reads_rejected=count("reads_rejected"),
+            recovery_attempts=count("recovery_attempts"),
+            read_progress={
+                key: dict(value)
+                for key, value in list(payload.get("read_progress", {}).items())[-16:]
+                if isinstance(key, str) and isinstance(value, dict)
+            }
+            if isinstance(payload.get("read_progress"), dict)
+            else {},
         )
 
 
@@ -500,6 +532,7 @@ class ToolArtifactRuntime:
         self.namespace_id = namespace_id
         self.run_id = run_id
         self.usage = ToolArtifactUsage.from_any(usage)
+        self._navigation_cache: OrderedDict[str, tuple[str, str, Any, int]] = OrderedDict()
 
     def externalize(
         self,
@@ -579,12 +612,28 @@ class ToolArtifactRuntime:
                     "Application tool results are artifact_result envelopes. If complete is true, content contains "
                     "the full result and no read is needed. If materialization is preview or reference, use this "
                     "tool only when missing details are needed. Start at the envelope next_offset after a preview, "
-                    "then follow each chunk next_offset until eof is true."
+                    "then follow next_read.arguments exactly. operation='inspect' shows JSON structure; "
+                    "operation='read' with json_pointer selects JSON and fields projects object fields; "
+                    "operation='search' finds literal text. start_line reads text lines. "
+                    "A continuation preserves the selection; do not combine it with selection parameters. "
+                    "selection_complete concerns the selected view only, not the whole document. "
+                    "Recoverable read errors contain a suggested_action. Try that action before treating available data as blocked."
                 ),
                 parameters={
                     "type": "object",
                     "properties": {
                         "artifact_id": {"type": "string", "pattern": r"^art_[0-9a-f]{32}$"},
+                        "operation": {"type": "string", "enum": ["read", "inspect", "search"]},
+                        "continuation": {"type": "string", "maxLength": 8192},
+                        "json_pointer": {"type": "string", "maxLength": 2048},
+                        "fields": {
+                            "type": "array",
+                            "items": {"type": "string", "maxLength": 128},
+                            "minItems": 1,
+                            "maxItems": 32,
+                        },
+                        "query": {"type": "string", "minLength": 1, "maxLength": 256},
+                        "start_line": {"type": "integer", "minimum": 1},
                         "offset": {"type": "integer", "minimum": 0, "default": 0},
                         "limit": {
                             "type": "integer",
@@ -623,6 +672,10 @@ class ToolArtifactRuntime:
             self.usage.reads_rejected += 1
             return ToolResult(ok=False, content="Artifact read denied: maximum internal read calls reached.")
         artifact_id = arguments.get("artifact_id")
+        if isinstance(artifact_id, str) and any(
+            key in arguments for key in ("continuation", "operation", "json_pointer", "fields", "query", "start_line")
+        ):
+            return self._navigate(arguments=arguments, context=context, content_fits=content_fits)
         offset = arguments.get("offset", 0)
         requested_limit = arguments.get("limit", self.policy.max_read_bytes)
         if not isinstance(artifact_id, str):
@@ -661,7 +714,19 @@ class ToolArtifactRuntime:
                     "externalize": False,
                 },
             )
+        if chunk.next_offset - chunk.offset > limit:
+            recoverable = min(self.policy.max_read_bytes, remaining) >= 4
+            return self._navigation_error(
+                artifact_id,
+                NavigationError(
+                    "byte_budget_too_small",
+                    "The byte limit cannot hold the next complete UTF-8 character.",
+                    recoverable=recoverable,
+                    suggested_query={"offset": offset, "limit": 4} if recoverable else None,
+                ),
+            )
         self.usage.artifact_bytes_read += chunk.next_offset - chunk.offset
+        self._remember_read(artifact_id, json.loads(chunk.to_content()))
         metadata: dict[str, Any] = {
             "tool_kind": "runtime",
             "artifact_read": True,
@@ -674,6 +739,171 @@ class ToolArtifactRuntime:
             content=chunk.to_content(),
             metadata=metadata,
         )
+
+    def _remember_read(self, artifact_id: str, payload: dict[str, Any]) -> None:
+        self.usage.read_progress.pop(artifact_id, None)
+        self.usage.read_progress[artifact_id] = {
+            "selection": payload.get("selection", {}),
+            "projection_fields": payload.get("projection_fields"),
+            "last_page_complete": payload.get("selection_complete", payload.get("eof", False)),
+            "next_read": payload.get("next_read"),
+            "note": "Previously delivered; content may no longer be in the model context.",
+        }
+        while len(self.usage.read_progress) > 16:
+            del self.usage.read_progress[next(iter(self.usage.read_progress))]
+        logger.debug(
+            "Artifact page delivered",
+            extra={
+                "artifact_id": artifact_id,
+                "selection_complete": self.usage.read_progress[artifact_id]["last_page_complete"],
+            },
+        )
+
+    def _navigation_error(self, artifact_id: str, error: NavigationError) -> ToolResult:
+        self.usage.reads_rejected += 1
+        logger.debug(
+            "Artifact navigation rejected",
+            extra={"artifact_id": artifact_id, "error_code": error.code, "recoverable": error.recoverable},
+        )
+        action = {"tool": READ_ARTIFACT_TOOL_NAME, "arguments": {"artifact_id": artifact_id, "operation": "inspect"}}
+        if error.code in {"source_too_large", "item_too_large"}:
+            action["arguments"] = {"artifact_id": artifact_id, "offset": 0}
+        if error.suggested_query is not None:
+            action["arguments"] = {"artifact_id": artifact_id, **error.suggested_query}
+        return ToolResult(
+            ok=False,
+            content=json.dumps(
+                {
+                    "kind": "artifact_read_error",
+                    "code": error.code,
+                    "message": str(error),
+                    "recoverable": error.recoverable,
+                    "suggested_action": action if error.recoverable else None,
+                }
+            ),
+            metadata={
+                "tool_kind": "runtime",
+                "artifact_read": True,
+                "externalize": False,
+                "artifact_read_recoverable": error.recoverable,
+                "artifact_read_context_exhausted": error.code == "context_exhausted",
+            },
+        )
+
+    def _navigate(
+        self,
+        *,
+        arguments: dict[str, Any],
+        context: ExecutionContext,
+        content_fits: Callable[[str], bool] | None,
+    ) -> ToolResult:
+        artifact_id = arguments["artifact_id"]
+        self.usage.internal_tool_calls += 1
+        try:
+            # Ownership is checked even on a cache hit and before cursor decoding.
+            probe = self.store.read_text(namespace_id=self.namespace_id, artifact_id=artifact_id, offset=0, limit=1)
+            query = {key: value for key, value in arguments.items() if key != "artifact_id"}
+            if "continuation" in query:
+                if set(query) != {"continuation"}:
+                    raise NavigationError("invalid_arguments", "Pass continuation alone with artifact_id.")
+                query = decode_cursor(query["continuation"], artifact_id, probe.sha256)
+            validate_query(query)
+            if query.get("operation", "read") == "read" and not any(
+                key in query for key in ("json_pointer", "fields", "query", "start_line", "position")
+            ):
+                self.usage.internal_tool_calls -= 1
+                return self.execute(
+                    tool_name=READ_ARTIFACT_TOOL_NAME,
+                    arguments={
+                        "artifact_id": artifact_id,
+                        "offset": query.get("offset", 0),
+                        "limit": query.get("limit", self.policy.max_read_bytes),
+                    },
+                    context=context,
+                    content_fits=content_fits,
+                )
+            remaining = self.policy.max_total_read_bytes - self.usage.artifact_bytes_read
+            if remaining <= 0:
+                raise NavigationError("budget_exhausted", "Total artifact read budget reached.", recoverable=False)
+            if probe.size_bytes > self.policy.max_navigation_source_bytes:
+                raise NavigationError(
+                    "source_too_large", "Artifact exceeds the structured navigation size limit; use bounded raw reads."
+                )
+            cached = self._navigation_cache.get(artifact_id)
+            if cached is not None and cached[0] == probe.sha256:
+                _, text, parsed, _ = cached
+                self._navigation_cache.move_to_end(artifact_id)
+            else:
+                text = self.store.read_all_text(namespace_id=self.namespace_id, artifact_id=artifact_id)
+                try:
+                    parsed = json.loads(text)
+                except (ValueError, RecursionError):
+                    parsed = text
+                # Cache is bounded by source bytes and entry count. Parsed JSON
+                # memory can exceed source size; source admission bounds each item.
+                if probe.size_bytes <= self.policy.max_navigation_cache_bytes:
+                    self._navigation_cache[artifact_id] = (probe.sha256, text, parsed, probe.size_bytes)
+                    while (
+                        len(self._navigation_cache) > 16
+                        or sum(entry[3] for entry in self._navigation_cache.values())
+                        > self.policy.max_navigation_cache_bytes
+                    ):
+                        self._navigation_cache.popitem(last=False)
+            content = render_page(
+                artifact_id=artifact_id,
+                text=text,
+                parsed=parsed,
+                query=query,
+                max_bytes=min(remaining, self.policy.max_read_bytes, query.get("limit", self.policy.max_read_bytes)),
+                previous_read=self.usage.read_progress.get(artifact_id),
+                sha256=probe.sha256,
+                content_fits=content_fits,
+            )
+            self.usage.artifact_bytes_read += len(content.encode("utf-8"))
+            self._remember_read(artifact_id, json.loads(content))
+            return ToolResult(
+                ok=True, content=content, metadata={"tool_kind": "runtime", "artifact_read": True, "externalize": False}
+            )
+        except NavigationError as exc:
+            return self._navigation_error(artifact_id, exc)
+        except (FileNotFoundError, PermissionError, OSError, ValueError, RecursionError):
+            return self._navigation_error(
+                artifact_id,
+                NavigationError(
+                    "artifact_unavailable", "Artifact cannot be read in this namespace.", recoverable=False
+                ),
+            )
+
+    def claim_read_recovery(self, messages: Sequence[LLMMessage], statuses: Sequence[str]) -> bool:
+        """Allow at most two reconsiderations of recoverable artifact-read errors.
+
+        This does not execute actions or override authorization, context, or tool
+        budgets. Only errors from the latest tool step are considered.
+        """
+        if (
+            self.usage.recovery_attempts >= 2
+            or self.usage.internal_tool_calls >= self.policy.max_reads_per_run
+            or self.usage.artifact_bytes_read >= self.policy.max_total_read_bytes
+        ):
+            return False
+        for message, status in zip(messages, statuses, strict=False):
+            if status != "tool_error":
+                continue
+            try:
+                payload = json.loads(message.content)
+                if isinstance(payload, dict) and payload.get("kind") == "artifact_result":
+                    payload = json.loads(payload.get("content") or "null")
+            except (ValueError, TypeError):
+                continue
+            if (
+                isinstance(payload, dict)
+                and payload.get("kind") == "artifact_read_error"
+                and payload.get("recoverable") is True
+                and isinstance(payload.get("suggested_action"), dict)
+            ):
+                self.usage.recovery_attempts += 1
+                return True
+        return False
 
     def to_metadata(self) -> dict[str, Any]:
         return {

@@ -851,3 +851,35 @@ def test_investigation_pending_resume_continues_same_mode(tmp_path) -> None:
         "conversation_turn",
     ]
     assert orchestrator.session_manager.get_state()["meta"].get(AgentOrchestrator.PENDING_TURN_META_KEY) is None
+
+
+@pytest.mark.parametrize("backend", ["native", "langgraph"])
+@pytest.mark.parametrize("recoverable", [True, False])
+def test_conversation_reconsiders_only_recoverable_document_read_errors(tmp_path, backend, recoverable):
+    class DocumentTool(EchoTool):
+        name = "read_document"
+
+        def execute(self, arguments, context):
+            if arguments["value"] == "wrong selection":
+                return ToolResult(False, json.dumps({
+                    "kind": "artifact_read_error", "code": "invalid_selection",
+                    "recoverable": recoverable,
+                    "suggested_action": {"tool": self.name, "arguments": {"value": "correct selection"}},
+                }))
+            return ToolResult(True, '{"document_total": 42}')
+
+    provider = ScriptedProvider(
+        chat=[tool_call(name="read_document", value="wrong selection"), tool_call(name="read_document", value="correct selection", call_id="correct")],
+        reflections=[reflection_payload(remaining_gaps=["Document unread"], should_continue=False), reflection_payload(new_facts=["Document total is 42"], should_continue=False)],
+        decisions=[decision_payload("blocked"), decision_payload("final")],
+    )
+    orchestrator = build_orchestrator(tmp_path, provider, agent_kernel_backend=backend)
+    orchestrator.registry.register(DocumentTool())
+    result = run_turn(orchestrator, "Read the document total", options=RunOptions(mode="investigate", max_iterations=3, max_tool_calls=3, require_initial_plan=False))
+    assert result.metadata["tool_artifact_usage"]["recovery_attempts"] == int(recoverable)
+    if recoverable:
+        assert "Document total is 42" in result.content
+        assert any("bounded read correction" in message.content for message in provider.chat_messages[1])
+    else:
+        assert result.metadata["stop_reason"] == "blocked"
+        assert len(provider.chat_messages) == 2  # Initial tool call and final response.

@@ -748,6 +748,19 @@ class InvestigationController:
                 no_progress_iterations,
             )
 
+        if decision.kind in {"blocked", "final"} and iterations_used < options.max_iterations and tool_step.tool_calls_used < options.max_tool_calls:
+            artifact_runtime = active_tool_artifact_runtime()
+            if artifact_runtime is not None and artifact_runtime.claim_read_recovery(tool_step.tool_messages, tool_step.tool_statuses):
+                messages.append(LLMMessage(role="system", content=(
+                    "The latest artifact read failed with a recoverable selection error. "
+                    "The source may still be available. Inspect the suggested_action in that tool result "
+                    "and attempt a bounded read correction before treating the data as unavailable. "
+                    "Do not repeat the same invalid arguments or infer unread content."
+                )))
+                self._record_event(event_type="artifact_read_recovery", summary="Allowing a bounded artifact read correction", iteration=iterations_used,
+                                   payload={"attempt": artifact_runtime.usage.recovery_attempts})
+                return None, no_progress_iterations
+
         if decision.kind == "blocked":
             return (
                 self._complete_turn(

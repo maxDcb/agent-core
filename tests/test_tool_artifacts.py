@@ -496,7 +496,9 @@ def test_structured_loop_externalizes_results_and_dispatches_internal_reads_outs
     assert result.raw_content == "done"
     assert result.tool_calls_used == 1
     assert [item["tool_kind"] for item in result.tool_history] == ["application", "runtime"]
-    assert result.metadata["tool_artifact_usage"] == {
+    assert {key: result.metadata["tool_artifact_usage"][key] for key in (
+        "artifacts_written", "artifact_bytes_written", "internal_tool_calls", "artifact_bytes_read", "reads_rejected"
+    )} == {
         "artifacts_written": 1,
         "artifact_bytes_written": 2_020,
         "internal_tool_calls": 1,
