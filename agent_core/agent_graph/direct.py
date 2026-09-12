@@ -21,7 +21,7 @@ from agent_core.types import AgentTurnResult, ToolExecutionStatus
 logger = get_logger("core.agent_graph.direct")
 
 AgentKernelBackend = Literal["native", "langgraph"]
-AfterModelRoute = Literal["execute_tools", "complete_response", "end"]
+AfterModelRoute = Literal["execute_tools", "complete_response", "call_model", "end"]
 AfterToolsRoute = Literal["call_model", "complete_budget", "end"]
 
 
@@ -226,9 +226,7 @@ class DirectTurnNodes:
             payload={
                 "content_length": len(llm_response.content),
                 "tool_call_count": len(llm_response.tool_calls),
-                "tool_calls": [
-                    {"id": tool_call.id, "name": tool_call.name} for tool_call in llm_response.tool_calls
-                ],
+                "tool_calls": [{"id": tool_call.id, "name": tool_call.name} for tool_call in llm_response.tool_calls],
                 "provider": llm_response.provider,
                 "model_backend": llm_response.model_backend,
                 "model": llm_response.model,
@@ -237,11 +235,29 @@ class DirectTurnNodes:
                 "usage": llm_response.usage.to_dict() if llm_response.usage is not None else None,
             },
         )
+        recovery = None
+        previous_step = state["tool_step"]
+        artifact_runtime = active_tool_artifact_runtime()
+        if not assistant_message.tool_calls and previous_step is not None and artifact_runtime is not None:
+            recovery = artifact_runtime.read_recovery_message(
+                previous_step.tool_messages,
+                previous_step.tool_statuses,
+                allow_application_tools=state["tool_calls_used"] < self.operations.settings.max_tool_calls_per_turn,
+            )
+            if recovery is not None:
+                messages.append(recovery)
+                self.operations._record_trace_event(
+                    state["trace"],
+                    event_type="artifact_read_recovery",
+                    summary="Allowing a bounded artifact read correction",
+                    iteration=model_call_index,
+                    payload={"attempt": artifact_runtime.usage.recovery_attempts},
+                )
         return {
             "messages": messages,
             "model_call_index": model_call_index,
             "prompt_reserve_warning_emitted": warning_emitted,
-            "assistant_message": assistant_message,
+            "assistant_message": None if recovery is not None else assistant_message,
             "tool_step": None,
             "result": None,
         }
@@ -252,7 +268,8 @@ class DirectTurnNodes:
             return "end"
         assistant_message = state["assistant_message"]
         if assistant_message is None:
-            raise RuntimeError("Direct agent graph has no assistant message after a successful model call")
+            # A claimed read correction asks for another budgeted model call.
+            return "call_model"
         return "execute_tools" if assistant_message.tool_calls else "complete_response"
 
     def complete_response(self, state: AgentGraphState) -> AgentGraphUpdate:
@@ -361,6 +378,8 @@ class NativeDirectTurnKernel:
             model_route = self.nodes.route_after_model(state)
             if model_route == "end":
                 break
+            if model_route == "call_model":
+                continue
             if model_route == "complete_response":
                 state.update(self.nodes.complete_response(state))
                 break
@@ -405,6 +424,7 @@ class LangGraphDirectTurnKernel:
             nodes.route_after_model,
             {
                 "execute_tools": "execute_tools",
+                "call_model": "call_model",
                 "complete_response": "complete_response",
                 "end": END,
             },
@@ -459,6 +479,4 @@ def build_direct_turn_kernel(
         return nodes, NativeDirectTurnKernel(nodes)
     if normalized == "langgraph":
         return nodes, LangGraphDirectTurnKernel(nodes)
-    raise ValueError(
-        f"Unsupported agent kernel backend: {backend!r}. Expected 'native' or 'langgraph'."
-    )
+    raise ValueError(f"Unsupported agent kernel backend: {backend!r}. Expected 'native' or 'langgraph'.")

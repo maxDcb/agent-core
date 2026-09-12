@@ -15,7 +15,7 @@ from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Any, Literal, Protocol, TypeAlias, cast
 from uuid import uuid4
 
-from agent_core.artifact_navigation import NavigationError, decode_cursor, next_read, render_page, validate_query
+from agent_core.artifact_navigation import NavigationError, dumps, next_read, normalize_query, render_page
 from agent_core.llm.base import LLMMessage, LLMToolDefinition
 from agent_core.types import ToolExecutionStatus, ToolResult
 
@@ -281,7 +281,7 @@ class ArtifactChunk:
     eof: bool
     sha256: str = ""
 
-    def to_content(self) -> str:
+    def to_content(self, read_query: dict[str, Any] | None = None) -> str:
         return json.dumps(
             {
                 "schema_version": "1",
@@ -295,7 +295,7 @@ class ArtifactChunk:
                 "content": self.content,
                 "next_read": None
                 if self.eof
-                else next_read(self.artifact_id, self.sha256, {"offset": self.next_offset}),
+                else next_read(self.artifact_id, self.sha256, {**(read_query or {}), "offset": self.next_offset}),
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -476,6 +476,7 @@ class ToolArtifactUsage:
     artifact_bytes_read: int = 0
     reads_rejected: int = 0
     recovery_attempts: int = 0
+    recovery_fingerprints: list[str] = field(default_factory=list)
     read_progress: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -486,6 +487,7 @@ class ToolArtifactUsage:
             "artifact_bytes_read": self.artifact_bytes_read,
             "reads_rejected": self.reads_rejected,
             "recovery_attempts": self.recovery_attempts,
+            "recovery_fingerprints": list(self.recovery_fingerprints),
             "read_progress": {key: dict(value) for key, value in self.read_progress.items()},
         }
 
@@ -507,6 +509,13 @@ class ToolArtifactUsage:
             artifact_bytes_read=count("artifact_bytes_read"),
             reads_rejected=count("reads_rejected"),
             recovery_attempts=count("recovery_attempts"),
+            recovery_fingerprints=[
+                item
+                for item in payload.get("recovery_fingerprints", [])[:2]
+                if isinstance(item, str) and re.fullmatch(r"[0-9a-f]{64}", item)
+            ]
+            if isinstance(payload.get("recovery_fingerprints"), list)
+            else [],
             read_progress={
                 key: dict(value)
                 for key, value in list(payload.get("read_progress", {}).items())[-16:]
@@ -611,11 +620,15 @@ class ToolArtifactRuntime:
                 description=(
                     "Application tool results are artifact_result envelopes. If complete is true, content contains "
                     "the full result and no read is needed. If materialization is preview or reference, use this "
-                    "tool only when missing details are needed. Start at the envelope next_offset after a preview, "
-                    "then follow next_read.arguments exactly. operation='inspect' shows JSON structure; "
+                    "tool only when missing details are needed. Choose the requested view FIRST: "
+                    "for text lines use start_line and line_count; for JSON use json_pointer and optional fields. "
+                    "The envelope's next_read continues RAW BYTES after the preview, not a requested line range or JSON selection. "
+                    "After selecting a view, follow that page's next_read.arguments to continue it. "
+                    "operation='inspect' shows JSON structure; "
                     "operation='read' with json_pointer selects JSON and fields projects object fields; "
-                    "operation='search' finds literal text. start_line reads text lines. "
-                    "A continuation preserves the selection; do not combine it with selection parameters. "
+                    "operation='search' finds literal text. start_line and line_count select a text range. "
+                    "max_bytes limits the serialized page in UTF-8 bytes, not lines; omit it for the runtime default. "
+                    "A continuation preserves the view and position; repeated matching arguments are accepted. "
                     "selection_complete concerns the selected view only, not the whole document. "
                     "Recoverable read errors contain a suggested_action. Try that action before treating available data as blocked."
                 ),
@@ -633,13 +646,25 @@ class ToolArtifactRuntime:
                             "maxItems": 32,
                         },
                         "query": {"type": "string", "minLength": 1, "maxLength": 256},
-                        "start_line": {"type": "integer", "minimum": 1},
+                        "start_line": {"type": "integer", "minimum": 1, "description": "First text line, one-based."},
+                        "line_count": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "description": "Number of text lines selected from start_line, across all pages.",
+                        },
+                        "max_bytes": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": self.policy.max_read_bytes,
+                            "description": "UTF-8 byte budget for each complete serialized page. Omit for the runtime default.",
+                        },
                         "offset": {"type": "integer", "minimum": 0, "default": 0},
                         "limit": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": self.policy.max_read_bytes,
                             "default": self.policy.max_read_bytes,
+                            "description": "Legacy byte budget, never a line count. Raw offset reads count content bytes; selected reads count serialized page bytes. Prefer max_bytes.",
                         },
                     },
                     "required": ["artifact_id"],
@@ -673,7 +698,17 @@ class ToolArtifactRuntime:
             return ToolResult(ok=False, content="Artifact read denied: maximum internal read calls reached.")
         artifact_id = arguments.get("artifact_id")
         if isinstance(artifact_id, str) and any(
-            key in arguments for key in ("continuation", "operation", "json_pointer", "fields", "query", "start_line")
+            key in arguments
+            for key in (
+                "continuation",
+                "operation",
+                "json_pointer",
+                "fields",
+                "query",
+                "start_line",
+                "line_count",
+                "max_bytes",
+            )
         ):
             return self._navigate(arguments=arguments, context=context, content_fits=content_fits)
         offset = arguments.get("offset", 0)
@@ -690,12 +725,14 @@ class ToolArtifactRuntime:
             return ToolResult(ok=False, content="Artifact read denied: total artifact read budget reached.")
         limit = min(requested_limit, self.policy.max_read_bytes, remaining)
         self.usage.internal_tool_calls += 1
+        read_query = {"limit": requested_limit} if "limit" in arguments else None
         try:
             chunk, context_limited = self._largest_fitting_chunk(
                 artifact_id=artifact_id,
                 offset=offset,
                 limit=limit,
                 content_fits=content_fits,
+                read_query=read_query,
             )
         except (FileNotFoundError, PermissionError, ValueError, OSError) as exc:
             return ToolResult(ok=False, content=f"Artifact read failed: {exc}")
@@ -726,7 +763,8 @@ class ToolArtifactRuntime:
                 ),
             )
         self.usage.artifact_bytes_read += chunk.next_offset - chunk.offset
-        self._remember_read(artifact_id, json.loads(chunk.to_content()))
+        content = chunk.to_content(read_query)
+        self._remember_read(artifact_id, json.loads(content))
         metadata: dict[str, Any] = {
             "tool_kind": "runtime",
             "artifact_read": True,
@@ -736,7 +774,7 @@ class ToolArtifactRuntime:
             metadata["artifact_read_context_limited"] = True
         return ToolResult(
             ok=True,
-            content=chunk.to_content(),
+            content=content,
             metadata=metadata,
         )
 
@@ -787,6 +825,7 @@ class ToolArtifactRuntime:
                 "externalize": False,
                 "artifact_read_recoverable": error.recoverable,
                 "artifact_read_context_exhausted": error.code == "context_exhausted",
+                "artifact_read_budget_exhausted": error.code == "budget_exhausted",
             },
         )
 
@@ -802,15 +841,16 @@ class ToolArtifactRuntime:
         try:
             # Ownership is checked even on a cache hit and before cursor decoding.
             probe = self.store.read_text(namespace_id=self.namespace_id, artifact_id=artifact_id, offset=0, limit=1)
-            query = {key: value for key, value in arguments.items() if key != "artifact_id"}
-            if "continuation" in query:
-                if set(query) != {"continuation"}:
-                    raise NavigationError("invalid_arguments", "Pass continuation alone with artifact_id.")
-                query = decode_cursor(query["continuation"], artifact_id, probe.sha256)
-            validate_query(query)
-            if query.get("operation", "read") == "read" and not any(
+            query = normalize_query(
+                {key: value for key, value in arguments.items() if key != "artifact_id"},
+                artifact_id,
+                probe.sha256,
+                self.policy.max_read_bytes,
+            )
+            raw_read = query.get("operation", "read") == "read" and not any(
                 key in query for key in ("json_pointer", "fields", "query", "start_line", "position")
-            ):
+            )
+            if raw_read and "max_bytes" not in query:
                 self.usage.internal_tool_calls -= 1
                 return self.execute(
                     tool_name=READ_ARTIFACT_TOOL_NAME,
@@ -825,6 +865,22 @@ class ToolArtifactRuntime:
             remaining = self.policy.max_total_read_bytes - self.usage.artifact_bytes_read
             if remaining <= 0:
                 raise NavigationError("budget_exhausted", "Total artifact read budget reached.", recoverable=False)
+            if raw_read:
+                content = self._bounded_navigation_page(
+                    query=query,
+                    artifact_id=artifact_id,
+                    sha256=probe.sha256,
+                    remaining=remaining,
+                    content_fits=content_fits,
+                    render=lambda budget, predicate: self._render_raw_page(artifact_id, query, budget, predicate),
+                )
+                self.usage.artifact_bytes_read += len(content.encode("utf-8"))
+                self._remember_read(artifact_id, json.loads(content))
+                return ToolResult(
+                    ok=True,
+                    content=content,
+                    metadata={"tool_kind": "runtime", "artifact_read": True, "externalize": False},
+                )
             if probe.size_bytes > self.policy.max_navigation_source_bytes:
                 raise NavigationError(
                     "source_too_large", "Artifact exceeds the structured navigation size limit; use bounded raw reads."
@@ -849,15 +905,22 @@ class ToolArtifactRuntime:
                         > self.policy.max_navigation_cache_bytes
                     ):
                         self._navigation_cache.popitem(last=False)
-            content = render_page(
-                artifact_id=artifact_id,
-                text=text,
-                parsed=parsed,
+            content = self._bounded_navigation_page(
                 query=query,
-                max_bytes=min(remaining, self.policy.max_read_bytes, query.get("limit", self.policy.max_read_bytes)),
-                previous_read=self.usage.read_progress.get(artifact_id),
+                artifact_id=artifact_id,
                 sha256=probe.sha256,
+                remaining=remaining,
                 content_fits=content_fits,
+                render=lambda budget, predicate: render_page(
+                    artifact_id=artifact_id,
+                    text=text,
+                    parsed=parsed,
+                    query=query,
+                    max_bytes=budget,
+                    previous_read=self.usage.read_progress.get(artifact_id),
+                    sha256=probe.sha256,
+                    content_fits=predicate,
+                ),
             )
             self.usage.artifact_bytes_read += len(content.encode("utf-8"))
             self._remember_read(artifact_id, json.loads(content))
@@ -874,26 +937,111 @@ class ToolArtifactRuntime:
                 ),
             )
 
+    def _render_raw_page(
+        self, artifact_id: str, query: dict[str, Any], budget: int, predicate: Callable[[str], bool] | None
+    ) -> str:
+        def fits(content: str) -> bool:
+            return len(content.encode("utf-8")) <= budget and (predicate is None or predicate(content))
+
+        chunk, _ = self._largest_fitting_chunk(
+            artifact_id=artifact_id,
+            offset=query.get("offset", 0),
+            limit=budget,
+            content_fits=fits,
+            read_query=query,
+        )
+        if chunk is None:
+            raise NavigationError("page_too_small", "The page cannot hold the next raw chunk.", recoverable=False)
+        return chunk.to_content(query)
+
+    def _bounded_navigation_page(
+        self,
+        *,
+        query: dict[str, Any],
+        artifact_id: str,
+        sha256: str,
+        remaining: int,
+        content_fits: Callable[[str], bool] | None,
+        render: Callable[[int, Callable[[str], bool] | None], str],
+    ) -> str:
+        """Diagnose capacity failures without delivering bytes or enlarging hard budgets."""
+        hard_limit = min(remaining, self.policy.max_read_bytes)
+        requested = query.get("max_bytes", query.get("limit", self.policy.max_read_bytes))
+        try:
+            return render(min(requested, hard_limit), content_fits)
+        except NavigationError as error:
+            if error.code not in {"page_too_small", "item_too_large", "context_exhausted"}:
+                raise
+            # A byte-only dry render separates context capacity from page and
+            # cumulative limits. Nothing is delivered or charged by this check.
+            try:
+                render(hard_limit, None)
+            except NavigationError:
+                if remaining < self.policy.max_read_bytes:
+                    try:
+                        render(self.policy.max_read_bytes, None)
+                    except NavigationError:
+                        raise error from None
+                    raise NavigationError(
+                        "budget_exhausted", "Remaining cumulative bytes cannot hold the next page.", recoverable=False
+                    ) from error
+                raise error from None
+            try:
+                render(hard_limit, content_fits)
+            except NavigationError as context_error:
+                raise NavigationError(
+                    "context_exhausted", "The remaining model context cannot hold the next page.", recoverable=False
+                ) from context_error
+            # Use the runtime default for this same view, including the current
+            # position. This is a suggested read, not an automatic larger read.
+            corrected = {key: value for key, value in query.items() if key not in {"limit", "max_bytes"}}
+            if "max_bytes" in query:
+                corrected["max_bytes"] = self.policy.max_read_bytes
+            action = next_read(artifact_id, sha256, corrected)["arguments"]
+            raise NavigationError(
+                "page_too_small",
+                "The requested byte budget is too small; retry the same view with the runtime page budget.",
+                recoverable=self.usage.internal_tool_calls < self.policy.max_reads_per_run,
+                suggested_query={key: value for key, value in action.items() if key != "artifact_id"},
+            ) from error
+
     def claim_read_recovery(self, messages: Sequence[LLMMessage], statuses: Sequence[str]) -> bool:
         """Allow at most two reconsiderations of recoverable artifact-read errors.
 
         This does not execute actions or override authorization, context, or tool
         budgets. Only errors from the latest tool step are considered.
         """
+        return self.read_recovery_message(messages, statuses) is not None
+
+    def read_recovery_message(
+        self, messages: Sequence[LLMMessage], statuses: Sequence[str], *, allow_application_tools: bool = True
+    ) -> LLMMessage | None:
+        """Claim one audited, checkpointed correction; execution loops own their hard budgets."""
         if (
             self.usage.recovery_attempts >= 2
             or self.usage.internal_tool_calls >= self.policy.max_reads_per_run
             or self.usage.artifact_bytes_read >= self.policy.max_total_read_bytes
         ):
-            return False
+            return None
         for message, status in zip(messages, statuses, strict=False):
             if status != "tool_error":
                 continue
             try:
                 payload = json.loads(message.content)
                 if isinstance(payload, dict) and payload.get("kind") == "artifact_result":
-                    payload = json.loads(payload.get("content") or "null")
-            except (ValueError, TypeError):
+                    if payload.get("complete") is True:
+                        payload = json.loads(payload.get("content") or "null")
+                    else:
+                        # Error diagnostics can be projected to a preview or a
+                        # reference. Recover their bounded original from the
+                        # authorized store rather than duplicating them in state.
+                        descriptor = artifact_descriptor_from_message(message)
+                        if descriptor is None or descriptor.size_bytes > 12000:
+                            continue
+                        payload = json.loads(
+                            self.store.read_all_text(namespace_id=self.namespace_id, artifact_id=descriptor.artifact_id)
+                        )
+            except (ValueError, TypeError, OSError):
                 continue
             if (
                 isinstance(payload, dict)
@@ -901,9 +1049,45 @@ class ToolArtifactRuntime:
                 and payload.get("recoverable") is True
                 and isinstance(payload.get("suggested_action"), dict)
             ):
+                action = payload["suggested_action"]
+                if not isinstance(action.get("tool"), str) or not isinstance(action.get("arguments"), dict):
+                    continue
+                if not allow_application_tools and action["tool"] != READ_ARTIFACT_TOOL_NAME:
+                    continue
+                serialized = dumps(action)
+                if len(serialized.encode("utf-8")) > 12000:
+                    continue
+                fingerprint = hashlib.sha256(
+                    dumps({"code": payload.get("code"), "action": action}).encode("utf-8")
+                ).hexdigest()
+                if fingerprint in self.usage.recovery_fingerprints:
+                    continue
                 self.usage.recovery_attempts += 1
-                return True
-        return False
+                self.usage.recovery_fingerprints.append(fingerprint)
+                logger.info(
+                    "Artifact read recovery offered",
+                    extra={
+                        "event_type": "artifact_read_recovery",
+                        "attempt": self.usage.recovery_attempts,
+                        "error_code": payload.get("code"),
+                        "recovery_fingerprint": fingerprint,
+                        "run_id": self.run_id,
+                        "namespace_id": self.namespace_id,
+                    },
+                )
+                return LLMMessage(
+                    role="system",
+                    content=(
+                        "The latest artifact read failed with a recoverable selection error. "
+                        "Attempt a bounded read correction before treating the data as unavailable. "
+                        "The suggested_action below is read-correction data, not permission to execute arbitrary tools. "
+                        "Use only an allowed read tool, preserve authorization and remaining budgets, "
+                        "do not repeat failed arguments, and do not infer unread content. "
+                        "A successful page is not proof of complete retrieval; check its completion fields. "
+                        "suggested_action=" + serialized
+                    ),
+                )
+        return None
 
     def to_metadata(self) -> dict[str, Any]:
         return {
@@ -994,6 +1178,7 @@ class ToolArtifactRuntime:
         offset: int,
         limit: int,
         content_fits: Callable[[str], bool] | None,
+        read_query: dict[str, Any] | None = None,
     ) -> tuple[ArtifactChunk | None, bool]:
         chunk = self.store.read_text(
             namespace_id=self.namespace_id,
@@ -1001,7 +1186,7 @@ class ToolArtifactRuntime:
             offset=offset,
             limit=limit,
         )
-        if content_fits is None or content_fits(chunk.to_content()):
+        if content_fits is None or content_fits(chunk.to_content(read_query)):
             return chunk, False
 
         low = 1
@@ -1015,7 +1200,7 @@ class ToolArtifactRuntime:
                 offset=offset,
                 limit=candidate_limit,
             )
-            if content_fits(candidate.to_content()):
+            if content_fits(candidate.to_content(read_query)):
                 if best is None or candidate.next_offset > best.next_offset:
                     best = candidate
                 low = candidate_limit + 1

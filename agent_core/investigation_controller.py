@@ -211,6 +211,7 @@ class InvestigationController:
         options: RunOptions,
     ) -> AgentTurnResult:
         from agent_core.agent_graph.investigation import LangGraphInvestigationKernel
+
         if normalize_agent_kernel_backend(self.settings.agent_kernel_backend) == "langgraph":
             return LangGraphInvestigationKernel(self).run(
                 user_input=user_input,
@@ -295,6 +296,7 @@ class InvestigationController:
         tool_step: ToolExecutionStepResult | None = None,
     ) -> AgentTurnResult:
         from agent_core.agent_graph.investigation import LangGraphInvestigationKernel
+
         if normalize_agent_kernel_backend(self.settings.agent_kernel_backend) == "langgraph":
             return LangGraphInvestigationKernel(self).resume_after_pending(
                 pending=pending,
@@ -748,17 +750,26 @@ class InvestigationController:
                 no_progress_iterations,
             )
 
-        if decision.kind in {"blocked", "final"} and iterations_used < options.max_iterations and tool_step.tool_calls_used < options.max_tool_calls:
+        if decision.kind in {"blocked", "final"} and iterations_used < options.max_iterations:
             artifact_runtime = active_tool_artifact_runtime()
-            if artifact_runtime is not None and artifact_runtime.claim_read_recovery(tool_step.tool_messages, tool_step.tool_statuses):
-                messages.append(LLMMessage(role="system", content=(
-                    "The latest artifact read failed with a recoverable selection error. "
-                    "The source may still be available. Inspect the suggested_action in that tool result "
-                    "and attempt a bounded read correction before treating the data as unavailable. "
-                    "Do not repeat the same invalid arguments or infer unread content."
-                )))
-                self._record_event(event_type="artifact_read_recovery", summary="Allowing a bounded artifact read correction", iteration=iterations_used,
-                                   payload={"attempt": artifact_runtime.usage.recovery_attempts})
+            recovery_message = (
+                artifact_runtime.read_recovery_message(
+                    tool_step.tool_messages,
+                    tool_step.tool_statuses,
+                    allow_application_tools=tool_step.tool_calls_used < options.max_tool_calls,
+                )
+                if artifact_runtime is not None
+                else None
+            )
+            if recovery_message is not None:
+                assert artifact_runtime is not None
+                messages.append(recovery_message)
+                self._record_event(
+                    event_type="artifact_read_recovery",
+                    summary="Allowing a bounded artifact read correction",
+                    iteration=iterations_used,
+                    payload={"attempt": artifact_runtime.usage.recovery_attempts},
+                )
                 return None, no_progress_iterations
 
         if decision.kind == "blocked":
@@ -1333,6 +1344,14 @@ class InvestigationController:
             "tool_statuses": tool_step.tool_statuses,
             "tool_names": tool_step.tool_names,
         }
+        if artifact_runtime is not None and artifact_runtime.has_readable_artifacts(reflection_messages):
+            payload["artifact_reading_guidance"] = (
+                "Preserve the user's requested selection and page budget in recommended next actions. "
+                "An artifact_result envelope's next_read continues RAW BYTES after its preview; it does not "
+                "select requested text lines or a JSON subtree. Select a requested text range with start_line "
+                "and line_count, or JSON with json_pointer, before following that view's page continuations. "
+                "max_bytes is the page byte budget, not a line count."
+            )
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_step_reflection",

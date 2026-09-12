@@ -105,7 +105,19 @@ SAFE_TOOL_ARGUMENT_KEYS = {
     "url",
 }
 
-SENSITIVE_ARGUMENT_FRAGMENTS = ("answer", "authorization", "body", "cookie", "credential", "email", "field", "pass", "secret", "token", "value")
+SENSITIVE_ARGUMENT_FRAGMENTS = (
+    "answer",
+    "authorization",
+    "body",
+    "cookie",
+    "credential",
+    "email",
+    "field",
+    "pass",
+    "secret",
+    "token",
+    "value",
+)
 
 
 def _safe_tool_argument_summary(arguments: dict[str, Any]) -> dict[str, Any]:
@@ -286,6 +298,7 @@ class StructuredTaskSpec:
         )
         return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
+
 def _response_format_for_spec(spec: StructuredTaskSpec, *, final_output: bool = True) -> dict[str, Any] | None:
     if spec.output_contract is None or not final_output:
         return None
@@ -401,9 +414,7 @@ class StructuredTaskCheckpoint:
             "sequence": self.sequence,
             "llm_budget": self.llm_budget.to_dict() if self.llm_budget is not None else None,
             "llm_budget_usage": self.llm_budget_usage.to_dict(),
-            "llm_context_policy": (
-                self.llm_context_policy.to_dict() if self.llm_context_policy is not None else None
-            ),
+            "llm_context_policy": (self.llm_context_policy.to_dict() if self.llm_context_policy is not None else None),
             "llm_context_usage": self.llm_context_usage.to_dict(),
             "tool_artifact_policy": self.tool_artifact_policy.to_dict(),
             "tool_artifact_usage": self.tool_artifact_usage.to_dict(),
@@ -450,7 +461,9 @@ class StructuredTaskCheckpoint:
             spec_fingerprint=spec_fingerprint,
             phase=phase,
             messages=messages,
-            tool_history=[dict(item) for item in raw_history if isinstance(item, dict)] if isinstance(raw_history, list) else [],
+            tool_history=[dict(item) for item in raw_history if isinstance(item, dict)]
+            if isinstance(raw_history, list)
+            else [],
             iterations=_clean_positive_int(payload.get("iterations"), default=0),
             tool_calls_used=_clean_positive_int(payload.get("tool_calls_used"), default=0),
             llm_calls=(
@@ -556,21 +569,11 @@ class StructuredTaskRunner:
             )
         self._validate_checkpoint_shape(checkpoint)
         budget = checkpoint.llm_budget or spec.llm_budget or self.settings.llm_budget
-        context_policy = (
-            checkpoint.llm_context_policy
-            or spec.llm_context_policy
-            or self.settings.llm_context_policy
-        )
+        context_policy = checkpoint.llm_context_policy or spec.llm_context_policy or self.settings.llm_context_policy
         artifact_policy = (
-            checkpoint.tool_artifact_policy
-            or spec.tool_artifact_policy
-            or self.settings.tool_artifact_policy
+            checkpoint.tool_artifact_policy or spec.tool_artifact_policy or self.settings.tool_artifact_policy
         )
-        controller = (
-            LLMBudgetController(budget, usage=checkpoint.llm_budget_usage)
-            if budget is not None
-            else None
-        )
+        controller = LLMBudgetController(budget, usage=checkpoint.llm_budget_usage) if budget is not None else None
         context_planner = (
             LLMContextPlanner(context_policy, usage=checkpoint.llm_context_usage)
             if context_policy is not None
@@ -599,9 +602,7 @@ class StructuredTaskRunner:
                 kind="invalid_checkpoint",
                 message="Structured task checkpoint is missing required execution state.",
             )
-        if checkpoint.next_tool_call_index < 0 or checkpoint.next_tool_call_index > len(
-            checkpoint.pending_tool_calls
-        ):
+        if checkpoint.next_tool_call_index < 0 or checkpoint.next_tool_call_index > len(checkpoint.pending_tool_calls):
             raise StructuredTaskRecoveryError(
                 kind="invalid_checkpoint",
                 message="Structured task checkpoint has an invalid tool-call cursor.",
@@ -696,6 +697,35 @@ class StructuredTaskRunner:
         )
 
         if not llm_response.tool_calls:
+            if checkpoint.iterations < spec.max_iterations:
+                artifact_runtime = active_tool_artifact_runtime()
+                # Only the most recent tool batch may justify reconsidering a
+                # final answer. Never retry an error buried in earlier history.
+                latest_tools: list[LLMMessage] = []
+                for message in reversed(checkpoint.messages[:-1]):
+                    if message.role != "tool":
+                        break
+                    latest_tools.insert(0, message)
+                statuses = (
+                    [item.get("status", "") for item in checkpoint.tool_history[-len(latest_tools) :]]
+                    if latest_tools
+                    else []
+                )
+                recovery = (
+                    artifact_runtime.read_recovery_message(
+                        latest_tools,
+                        statuses,
+                        allow_application_tools=checkpoint.tool_calls_used < spec.max_tool_calls,
+                    )
+                    if artifact_runtime
+                    else None
+                )
+                if recovery is not None:
+                    checkpoint.messages.append(recovery)
+                    checkpoint.iterations += 1
+                    checkpoint.phase = "model_request"
+                    self._emit_checkpoint(checkpoint, on_checkpoint)
+                    return None
             if spec.output_contract is not None and registry.list_tool_names():
                 checkpoint.phase = "finalization"
                 checkpoint.finalization_kind = "contract"
@@ -760,6 +790,7 @@ class StructuredTaskRunner:
         on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
     ) -> StructuredTaskResult | None:
         artifact_context_exhausted = False
+        artifact_budget_exhausted = False
         while checkpoint.next_tool_call_index < len(checkpoint.pending_tool_calls):
             tool_call = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index]
             artifact_runtime = active_tool_artifact_runtime()
@@ -790,6 +821,7 @@ class StructuredTaskRunner:
             remaining_pending_calls = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index + 1 :]
             content_fits: Callable[[str], bool] | None = None
             if is_internal:
+
                 def artifact_content_fits(
                     content: str,
                     current_tool_call_id: str = tool_call.tool_call_id,
@@ -820,10 +852,18 @@ class StructuredTaskRunner:
             tool_call.status = "completed"
             checkpoint.next_tool_call_index += 1
             self._emit_checkpoint(checkpoint, on_checkpoint)
-            if history_item.get("artifact_read_context_exhausted") is True:
-                artifact_context_exhausted = True
+            if (
+                history_item.get("artifact_read_context_exhausted") is True
+                or history_item.get("artifact_read_budget_exhausted") is True
+            ):
+                artifact_context_exhausted = history_item.get("artifact_read_context_exhausted") is True
+                artifact_budget_exhausted = history_item.get("artifact_read_budget_exhausted") is True
                 for skipped in remaining_pending_calls:
-                    skipped_content = "Tool call skipped: artifact context capacity reached."
+                    skipped_content = (
+                        "Tool call skipped: artifact context capacity reached."
+                        if artifact_context_exhausted
+                        else "Tool call skipped: artifact read budget exhausted."
+                    )
                     checkpoint.messages.append(
                         LLMMessage(
                             role="tool",
@@ -837,7 +877,9 @@ class StructuredTaskRunner:
                             "arguments": {},
                             "status": "budget_exhausted",
                             "content_preview": skipped_content,
-                            "tool_kind": "runtime" if artifact_runtime.is_internal_tool(skipped.tool_name) else "application",
+                            "tool_kind": "runtime"
+                            if artifact_runtime.is_internal_tool(skipped.tool_name)
+                            else "application",
                         }
                     )
                     skipped.status = "budget_exhausted"
@@ -847,11 +889,13 @@ class StructuredTaskRunner:
         tool_budget_exhausted = any(item.status == "budget_exhausted" for item in checkpoint.pending_tool_calls)
         checkpoint.pending_tool_calls = []
         checkpoint.next_tool_call_index = 0
-        if artifact_context_exhausted:
+        if artifact_context_exhausted or artifact_budget_exhausted:
             checkpoint.phase = "finalization"
             checkpoint.finalization_kind = "budget"
             checkpoint.finalization_reason = (
                 "The remaining model context cannot safely hold another artifact chunk."
+                if artifact_context_exhausted
+                else "The cumulative artifact read budget cannot hold another page."
             )
             checkpoint.raw_failure_content = checkpoint.messages[-1].content if checkpoint.messages else ""
         elif tool_budget_exhausted:
@@ -901,9 +945,7 @@ class StructuredTaskRunner:
                 ok=False,
                 task_id=spec.task_id,
                 raw_content=exc.detail or checkpoint.raw_failure_content,
-                failure_reason=(
-                    f"{checkpoint.finalization_reason}; finalization failed: {exc.user_message}"
-                ),
+                failure_reason=(f"{checkpoint.finalization_reason}; finalization failed: {exc.user_message}"),
                 tool_history=checkpoint.tool_history,
                 iterations=checkpoint.iterations,
                 tool_calls_used=checkpoint.tool_calls_used,
@@ -1261,6 +1303,7 @@ class StructuredTaskRunner:
             "model": spec.model or self.settings.model,
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
+
         def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             logger.info(
                 "Structured task LLM request prepared",
@@ -1410,7 +1453,9 @@ class StructuredTaskRunner:
         ]
         if allowed_roots:
             lines.extend(f"  - {root}" for root in allowed_roots)
-            lines.append("- For local code tools, use absolute paths inside these roots or paths relative to one of these roots.")
+            lines.append(
+                "- For local code tools, use absolute paths inside these roots or paths relative to one of these roots."
+            )
         else:
             lines.append("  - none")
 
@@ -1530,11 +1575,14 @@ class StructuredTaskRunner:
         )
         history_item: dict[str, Any] = {
             "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
             "arguments": arguments,
             "status": tool_status,
             "content_preview": safe_preview(tool_content, limit=500),
             "tool_kind": "runtime" if is_internal else "application",
         }
+        if result_metadata.get("artifact_read_budget_exhausted") is True:
+            history_item["artifact_read_budget_exhausted"] = True
         descriptor = artifact_descriptor_from_message(tool_message)
         if descriptor is not None:
             history_item["artifact_id"] = descriptor.artifact_id
@@ -1587,10 +1635,7 @@ class StructuredTaskRunner:
                 contract=output_contract,
             )
         except StructuredOutputValidationError as exc:
-            issue_summary = [
-                f"{issue.validator}@{issue.instance_path or '/'}"
-                for issue in exc.issues
-            ]
+            issue_summary = [f"{issue.validator}@{issue.instance_path or '/'}" for issue in exc.issues]
             logger.warning(
                 "Structured task final output failed local JSON Schema validation: %s",
                 ", ".join(issue_summary),
@@ -1886,6 +1931,4 @@ def build_structured_task_kernel(
         return nodes, NativeStructuredTaskKernel(nodes)
     if normalized == "langgraph":
         return nodes, LangGraphStructuredTaskKernel(nodes)
-    raise ValueError(
-        f"Unsupported agent kernel backend: {backend!r}. Expected 'native' or 'langgraph'."
-    )
+    raise ValueError(f"Unsupported agent kernel backend: {backend!r}. Expected 'native' or 'langgraph'.")
