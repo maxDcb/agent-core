@@ -42,6 +42,19 @@ transcript, counters, tool cursor, tool history and a fingerprint of the task
 specification. `AgentRunService.resume()` continues a non-terminal run from
 that checkpoint. A changed specification is rejected.
 
+`AgentRunService.continue_run()` starts a new, linked structured run after a
+completed run. It keeps the source run terminal and immutable, rebuilds the
+current system, task, and scope prompts, carries forward the source task
+history (excluding stale system messages), and appends the new instruction.
+The new run has its own budget and tool-call counters; historical tool calls
+are context, never pending work to replay. The source and continuation must
+share a namespace, application parent, and execution scope. The caller supplies
+the continuation specification and remains responsible for selecting its tools
+and validating instructions proposed by other agents. Repeating the same
+continuation run id with the same instruction and specification returns its
+stored result; rebinding either is rejected. The full inherited transcript is
+stored, while `LLMContextPolicy` may select a recent suffix for a model call.
+
 Every successful provider response also contributes a typed `LLMCallRecord`.
 OpenAI, Azure OpenAI and Azure Anthropic usage fields are normalized without
 estimating missing values. Calls and token usage are persisted at the same
@@ -110,6 +123,7 @@ The lifecycle suite treats persistence boundaries as public behavior:
 - checkpoints, attempts and terminal results survive serialization round trips;
 - missing, foreign or unsupported checkpoints block recovery without calling the provider;
 - completed and blocked runs remain idempotent across repeated resume requests;
+- continuations retain task history with fresh counters and never replay source tools;
 - completed tools are not replayed, while ambiguous effects require explicit reconciliation;
 - invalid reconciliation and context rebinding leave the persisted run unchanged;
 - multi-tool recovery executes only the remaining calls;

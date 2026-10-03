@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from collections.abc import Callable
 from uuid import uuid4
@@ -96,6 +97,87 @@ class AgentRunService:
             if on_started is not None:
                 on_started(resolved_run_id)
             return self._start_or_resume_locked(state=state, spec=spec, resume_checkpoint=None)
+
+    def continue_run(
+        self,
+        *,
+        source_run_id: str,
+        instruction: str,
+        spec: StructuredTaskSpec,
+        context: RunContext,
+        run_id: str | None = None,
+        on_started: Callable[[str], None] | None = None,
+    ) -> AgentRunResult:
+        """Create a new structured run that continues a completed run's task history."""
+        source_run_id = source_run_id.strip()
+        instruction = instruction.strip()
+        if not source_run_id or not instruction:
+            raise ValueError("Continuation requires a source run and a new instruction")
+        resolved_run_id = (run_id or context.run_id or f"run-{uuid4().hex}").strip()
+        if resolved_run_id == source_run_id:
+            raise ValueError("A continuation must use a new run id")
+        bound_context = context.with_run_id(resolved_run_id)
+        instruction_hash = hashlib.sha256(instruction.encode("utf-8")).hexdigest()
+        with self.run_store.acquire_execution(namespace_id=bound_context.namespace_id, run_id=resolved_run_id):
+            existing = self.run_store.load(namespace_id=bound_context.namespace_id, run_id=resolved_run_id)
+            if existing is not None:
+                self._validate_binding(state=existing, spec=spec, context=bound_context)
+                if (
+                    existing.continued_from_run_id != source_run_id
+                    or existing.continuation_instruction_hash != instruction_hash
+                    or not self._checkpoint_matches_spec(state=existing, spec=spec)
+                ):
+                    raise ValueError(f"Run id is already bound to a different continuation: {resolved_run_id}")
+                if existing.result is not None and existing.status in {"completed", "failed", "cancelled", "blocked"}:
+                    return existing.result
+                checkpoint = self._continuation_checkpoint_from_state(existing)
+                if existing.status in {"running", "pending"}:
+                    self._mark_active_attempt_interrupted(existing)
+                    existing.transition("interrupted")
+                    self.run_store.save(existing)
+                return self._start_or_resume_locked(state=existing, spec=spec, resume_checkpoint=checkpoint)
+
+            source = self.run_store.load(namespace_id=bound_context.namespace_id, run_id=source_run_id)
+            if source is None:
+                raise KeyError(f"Unknown source run: {source_run_id}")
+            if source.status != "completed" or source.result is None:
+                raise ValueError("Only a completed run can be continued")
+            if (
+                source.strategy != "structured"
+                or source.context.parent_id != bound_context.parent_id
+                or source.context.thread_id != bound_context.thread_id
+            ):
+                raise ValueError("Continuation must stay within the source structured task's parent and thread")
+            if source.context.scope != bound_context.scope:
+                raise ValueError("Continuation cannot change the source execution scope")
+            source_checkpoint = self._continuation_checkpoint_from_state(source)
+            execution_context = ExecutionContext.from_run_context(context=bound_context, settings=self.settings)
+            checkpoint = self.executor.continuation_checkpoint(
+                spec=spec, context=execution_context, source=source_checkpoint, instruction=instruction,
+            )
+            state = AgentRunState(
+                run_id=resolved_run_id,
+                strategy="structured",
+                spec_id=spec.task_id,
+                context=bound_context,
+                checkpoint=RunCheckpoint(kind="structured_task", sequence=checkpoint.sequence, payload=checkpoint.to_dict()),
+                continued_from_run_id=source_run_id,
+                continuation_instruction_hash=instruction_hash,
+            )
+            self.run_store.create(state)
+            if on_started is not None:
+                on_started(resolved_run_id)
+            return self._start_or_resume_locked(state=state, spec=spec, resume_checkpoint=checkpoint)
+
+    @staticmethod
+    def _continuation_checkpoint_from_state(state: AgentRunState) -> StructuredTaskCheckpoint:
+        checkpoint = state.checkpoint
+        if checkpoint is None or checkpoint.kind != "structured_task":
+            raise ValueError("Run has no structured checkpoint")
+        structured = StructuredTaskCheckpoint.from_dict(checkpoint.payload)
+        if structured is None:
+            raise ValueError("Run has an invalid structured checkpoint")
+        return structured
 
     def resume(
         self,
@@ -256,11 +338,14 @@ class AgentRunService:
         spec: StructuredTaskSpec,
         resume_checkpoint: StructuredTaskCheckpoint | None,
     ) -> AgentRunResult:
+        starting_new_run = state.status == "created"
         if state.status in {"created", "interrupted", "blocked"}:
             state.transition("running")
         attempt = AgentRunAttempt(
             attempt_id=f"attempt-{uuid4().hex}",
-            resumed_from_sequence=(resume_checkpoint.sequence if resume_checkpoint is not None else None),
+            resumed_from_sequence=(
+                resume_checkpoint.sequence if resume_checkpoint is not None and not starting_new_run else None
+            ),
         )
         state.attempts.append(attempt)
         self.run_store.save(state)

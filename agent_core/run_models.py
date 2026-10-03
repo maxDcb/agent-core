@@ -27,7 +27,7 @@ RunAttemptStatus: TypeAlias = Literal[
     "cancelled",
     "blocked",
 ]
-RUN_SCHEMA_VERSION = 3
+RUN_SCHEMA_VERSION = 4
 
 
 @dataclass(slots=True)
@@ -230,6 +230,8 @@ class AgentRunState:
     error: AgentRunError | None = None
     checkpoint: RunCheckpoint | None = None
     attempts: list[AgentRunAttempt] = field(default_factory=list)
+    continued_from_run_id: str | None = None
+    continuation_instruction_hash: str | None = None
     schema_version: int = RUN_SCHEMA_VERSION
 
     def transition(self, status: RunStatus) -> None:
@@ -262,6 +264,8 @@ class AgentRunState:
             "error": self.error.to_dict() if self.error is not None else None,
             "checkpoint": self.checkpoint.to_dict() if self.checkpoint is not None else None,
             "attempts": [attempt.to_dict() for attempt in self.attempts],
+            "continued_from_run_id": self.continued_from_run_id,
+            "continuation_instruction_hash": self.continuation_instruction_hash,
         }
 
     @classmethod
@@ -329,5 +333,13 @@ class AgentRunState:
             error=AgentRunError.from_dict(payload.get("error")),
             checkpoint=checkpoint,
             attempts=attempts,
-            schema_version=schema_version if isinstance(schema_version, int) else 0,
+            continued_from_run_id=(
+                payload.get("continued_from_run_id")
+                if isinstance(payload.get("continued_from_run_id"), str) else None
+            ),
+            continuation_instruction_hash=(
+                payload.get("continuation_instruction_hash")
+                if isinstance(payload.get("continuation_instruction_hash"), str) else None
+            ),
+            schema_version=max(schema_version, RUN_SCHEMA_VERSION) if isinstance(schema_version, int) else 0,
         )

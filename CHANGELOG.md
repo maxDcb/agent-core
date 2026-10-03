@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.5.0
+
+- Added `AgentRunService.continue_run()` to continue a completed structured run
+  with a new instruction, preserving its task history while starting a linked
+  run with fresh budgets and tool counters.
 - Made structured artifact reads context-aware: oversized chunks are reduced
   to the largest provider-safe UTF-8 prefix, hot previews fall back to lossless
   references when needed, and exhausted reads force an explicit no-tool

@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 import pytest
 
 from agent_core import StructuredOutputContract
 from agent_core.llm.base import LLMCompletionResult, LLMTokenUsage, LLMToolCall
 from agent_core.policy_engine import PolicyEngine
-from agent_core.run_context import RunContext
+from agent_core.run_context import ExecutionScope, RunContext
 from agent_core.run_models import AgentRunState, RunCheckpoint
 from agent_core.run_service import AgentRunService
 from agent_core.run_store import JsonFileRunStore, RunExecutionBusyError
@@ -111,6 +112,24 @@ class NeverCallProvider:
     def complete_with_tools(self, **kwargs):
         _ = kwargs
         raise AssertionError("persisted provider response should be reused")
+
+
+class ContinuationProvider:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.continuation_messages = []
+
+    def complete_with_tools(self, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return LLMCompletionResult(
+                content="",
+                tool_calls=[LLMToolCall(id="source-count", name="count", arguments_json="{}")],
+            )
+        if self.calls == 2:
+            return LLMCompletionResult(content="original conclusion")
+        self.continuation_messages = list(kwargs["messages"])
+        return LLMCompletionResult(content="revised conclusion")
 
 
 class DraftAndFinalProvider:
@@ -489,6 +508,130 @@ def test_repeated_resume_of_terminal_run_is_side_effect_free(tmp_path) -> None:
     assert after is not None
     assert after.to_dict() == before.to_dict()
     assert provider.calls == 1
+
+
+def test_continue_run_preserves_context_and_recent_actions_without_replaying_tools(tmp_path) -> None:
+    provider = ContinuationProvider()
+    tool = CountingTool()
+    service = _service(tmp_path, provider=provider, tool=tool)
+    context = RunContext(namespace_id="assessment", parent_id="job-1")
+    source_spec = _spec()
+    source = service.execute(spec=source_spec, context=context, run_id="run-source")
+    original_state = service.get(namespace_id="assessment", run_id="run-source")
+    assert source.status == "completed" and original_state is not None
+    assert tool.calls == 1
+
+    continuation_spec = replace(source_spec, objective="Correct the conclusion from the recorded action.")
+    continuation = service.continue_run(
+        source_run_id="run-source",
+        instruction="Reassess the original result and correct it if necessary.",
+        spec=continuation_spec,
+        context=context,
+        run_id="run-continuation",
+    )
+
+    assert continuation.status == "completed"
+    assert continuation.raw_content == "revised conclusion"
+    assert tool.calls == 1
+    assert provider.calls == 3
+    assert service.get(namespace_id="assessment", run_id="run-source").to_dict() == original_state.to_dict()
+    state = service.get(namespace_id="assessment", run_id="run-continuation")
+    assert state is not None and state.continued_from_run_id == "run-source"
+    assert state.attempts[0].resumed_from_sequence is None
+    assert state.result is not None and state.result.tool_calls_used == 0
+    assert len(state.result.llm_calls) == 1
+    messages = provider.continuation_messages
+    assert [message.role for message in messages[:3]] == ["system", "system", "system"]
+    assert "Run ID: run-continuation" in messages[2].content
+    assert any(message.role == "tool" and "count:1" in message.content for message in messages)
+    assert any(message.role == "assistant" and message.content == "original conclusion" for message in messages)
+    assert messages[-1].role == "user"
+    assert "Correct the conclusion" in messages[-1].content
+    assert "Reassess the original result" in messages[-1].content
+
+    repeated = service.continue_run(
+        source_run_id="run-source",
+        instruction="Reassess the original result and correct it if necessary.",
+        spec=continuation_spec,
+        context=context,
+        run_id="run-continuation",
+    )
+    assert repeated.to_dict() == continuation.to_dict()
+    assert provider.calls == 3
+    with pytest.raises(ValueError, match="different continuation"):
+        service.continue_run(
+            source_run_id="run-source",
+            instruction="Investigate an unrelated target.",
+            spec=continuation_spec,
+            context=context,
+            run_id="run-continuation",
+        )
+
+    next_step = service.continue_run(
+        source_run_id="run-continuation",
+        instruction="Perform one further investigation using the recorded result.",
+        spec=continuation_spec,
+        context=context,
+        run_id="run-next-step",
+    )
+    assert next_step.status == "completed"
+    assert provider.calls == 4
+    assert service.get(namespace_id="assessment", run_id="run-next-step").continued_from_run_id == "run-continuation"
+    assert any(
+        message.role == "user" and "Reassess the original result" in message.content
+        for message in provider.continuation_messages
+    )
+
+
+def test_continue_run_requires_completed_source_and_same_scope(tmp_path) -> None:
+    service = _service(tmp_path, provider=ImmediateFinalProvider(), tool=CountingTool())
+    context = RunContext(namespace_id="assessment", parent_id="job-1")
+    with pytest.raises(KeyError, match="Unknown source run"):
+        service.continue_run(
+            source_run_id="missing", instruction="Continue.", spec=_spec(), context=context,
+            run_id="run-child",
+        )
+    service.execute(spec=_spec(), context=context, run_id="run-source")
+    with pytest.raises(ValueError, match="parent"):
+        service.continue_run(
+            source_run_id="run-source", instruction="Continue.", spec=_spec(),
+            context=RunContext(namespace_id="assessment", parent_id="job-2"), run_id="run-child",
+        )
+    with pytest.raises(ValueError, match="scope"):
+        service.continue_run(
+            source_run_id="run-source", instruction="Continue.", spec=_spec(),
+            context=RunContext(
+                namespace_id="assessment", parent_id="job-1", scope=ExecutionScope(allowed_http_hosts=()),
+            ),
+            run_id="run-child",
+        )
+
+
+def test_interrupted_continuation_recovers_without_restarting_source(tmp_path) -> None:
+    context = RunContext(namespace_id="assessment", parent_id="job-1")
+    spec = _spec()
+    first = _service(tmp_path, provider=ImmediateFinalProvider(), tool=CountingTool())
+    source = first.execute(spec=spec, context=context, run_id="run-source")
+    assert source.status == "completed"
+
+    interrupted = _service(tmp_path, provider=ImmediateCrashProvider(), tool=CountingTool())
+    with pytest.raises(SystemExit, match="simulated process loss"):
+        interrupted.continue_run(
+            source_run_id="run-source", instruction="Inspect the previous result again.",
+            spec=spec, context=context, run_id="run-child",
+        )
+    child = first.get(namespace_id="assessment", run_id="run-child")
+    assert child is not None and child.status == "running"
+    assert child.continued_from_run_id == "run-source"
+
+    provider = FinalProvider()
+    recovered = _service(tmp_path, provider=provider, tool=CountingTool()).resume(
+        spec=spec, context=context, run_id="run-child",
+    )
+    assert recovered.status == "completed"
+    assert provider.messages[-1].role == "user"
+    assert "Inspect the previous result again" in provider.messages[-1].content
+    assert first.get(namespace_id="assessment", run_id="run-source").result.to_dict() == source.to_dict()
 
 
 def test_repeated_resume_of_blocked_run_does_not_create_attempts(tmp_path) -> None:

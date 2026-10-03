@@ -7,7 +7,7 @@ their own prompts, tools, policy rules, storage and domain memory. It is meant
 to be the generic runtime under an agent application, not a domain-specific
 agent package.
 
-Version `0.4.0` is an alpha release. The runtime is usable and tested, but the
+Version `0.5.0` is an alpha release. The runtime is usable and tested, but the
 public API may still evolve before `1.0.0`.
 
 ## What It Provides
@@ -51,7 +51,7 @@ specializing it for one workflow.
 From a tagged Git repository:
 
 ```bash
-python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.4.0"
+python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.5.0"
 ```
 
 For local development:
@@ -515,6 +515,13 @@ completed = conversation_agent.resume(
 
 See [docs/run_architecture.md](docs/run_architecture.md) for identifier,
 context, idempotence and pipeline ownership rules.
+
+To give a completed structured run a new instruction, call
+`AgentRunService.continue_run(source_run_id=..., instruction=..., spec=...,
+context=..., run_id=...)`. The continuation is a new run linked to its source;
+`resume()` remains reserved for recovery of an interrupted run. The caller
+chooses the continuation's tools and budget; its namespace, parent, thread,
+and execution scope must match the source run.
 
 ## Public API
 

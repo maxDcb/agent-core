@@ -554,6 +554,47 @@ class StructuredTaskRunner:
                     )
                     return self._attach_runtime_metadata(result)
 
+    def continuation_checkpoint(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        context: ExecutionContext,
+        source: StructuredTaskCheckpoint,
+        instruction: str,
+    ) -> StructuredTaskCheckpoint:
+        """Start a new task from a completed transcript without inheriting execution counters."""
+        if (
+            source.phase != "result"
+            or source.pending_tool_calls
+            or len(source.messages) < 5
+            or [message.role for message in source.messages[:4]] != ["system", "system", "system", "user"]
+            or source.messages[-1].role != "assistant"
+        ):
+            raise ValueError("Source run has no complete structured transcript to continue")
+        historical_messages = [
+            LLMMessage.from_history_dict(message_to_persistence_dict(message))
+            for message in source.messages[3:]
+            if message.role != "system"
+        ]
+        continuation_request = json.dumps(
+            {"task": spec.to_payload(), "new_instruction": instruction},
+            ensure_ascii=False,
+            indent=2,
+        )
+        return StructuredTaskCheckpoint(
+            spec_fingerprint=spec.fingerprint(),
+            phase="model_request",
+            messages=[
+                *self._build_messages(spec=spec, context=context)[:3],
+                *historical_messages,
+                LLMMessage(role="user", content=continuation_request),
+            ],
+            iterations=1,
+            llm_budget=spec.llm_budget or self.settings.llm_budget,
+            llm_context_policy=spec.llm_context_policy or self.settings.llm_context_policy,
+            tool_artifact_policy=spec.tool_artifact_policy or self.settings.tool_artifact_policy,
+        )
+
     def resume(
         self,
         *,

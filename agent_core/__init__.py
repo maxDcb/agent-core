@@ -45,7 +45,7 @@ from agent_core.tool_artifacts import (
     ToolArtifactUsage,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     "AgentRunError",

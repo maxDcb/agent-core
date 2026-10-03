@@ -102,3 +102,16 @@ def test_malformed_attempts_do_not_destroy_an_otherwise_valid_run_state() -> Non
     assert len(restored.attempts) == 1
     assert restored.attempts[0].attempt_id == "kept"
     assert restored.attempts[0].status == "interrupted"
+
+
+def test_prior_run_state_schema_upgrades_when_loaded() -> None:
+    payload = _state().to_dict()
+    payload["schema_version"] = 3
+    payload.pop("continued_from_run_id")
+    payload.pop("continuation_instruction_hash")
+
+    restored = AgentRunState.from_dict(payload)
+
+    assert restored is not None
+    assert restored.schema_version == 4
+    assert restored.continued_from_run_id is None
