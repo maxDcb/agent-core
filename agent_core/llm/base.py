@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
 
 LLMMessageRole = Literal["system", "user", "assistant", "tool"]
+CONTEXT_PAYLOAD_PREFIX_KEY = "context_payload_prefix"
 
 
 @dataclass(slots=True)
@@ -349,8 +350,7 @@ class LLMCallOptions:
     response_format: dict[str, Any] | None = None
     response_format_fallback: dict[str, Any] | None = None
     max_output_tokens: int | None = None
-    # Enable only when a mandatory state message carries earlier exchange results.
-    compact_current_turn: bool = False
+    context_finalization: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

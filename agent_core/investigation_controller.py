@@ -5,6 +5,7 @@ from dataclasses import asdict
 from typing import Any, Protocol
 
 from agent_core.agent_graph.state import build_graph_checkpoint, normalize_agent_kernel_backend
+from agent_core.context_projection import LLMContextRequest, context_payload_message
 from agent_core.execution_context import ExecutionContext
 from agent_core.investigation_models import FinalCritique, InvestigationDecision, StepReflection
 from agent_core.investigation_prompts import (
@@ -123,7 +124,6 @@ class TraceRecorder(Protocol):
 
 
 INVESTIGATION_STATE_MESSAGE_PREFIX = "Investigation controller state:"
-UNREFLECTED_EXCHANGES_KEY = "_agent_core_unreflected_tool_exchanges"
 
 
 def with_investigation_guidance(
@@ -380,9 +380,15 @@ class InvestigationController:
                 )
                 llm_response = self.call_model_once(
                     messages=assistant_messages,
-                    options=self._call_options(options=options, target="assistant_step", state=state),
+                    options=self._call_options(options=options, target="assistant_step"),
                 )
             except LLMProviderError as exc:
+                if exc.kind == "context_overflow" and any(message.role == "tool" for message in messages):
+                    return self._complete_with_budget_answer(
+                        user_input=user_input, turn_index=turn_index, options=options, state=state,
+                        messages=messages, iterations_used=iterations_used, tool_calls_used=tool_calls_used,
+                        stop_reason="llm_context_exhausted",
+                    )
                 self._record_event(
                     event_type="llm_provider_failure",
                     summary="Assistant step provider failure handled",
@@ -516,7 +522,7 @@ class InvestigationController:
                     messages=messages,
                     iterations_used=iterations_used,
                     tool_calls_used=tool_calls_used,
-                    stop_reason="max_tool_calls",
+                    stop_reason=tool_step.finalization_reason or "max_tool_calls",
                 )
 
             terminal_result, no_progress_iterations = self._reflect_and_decide_after_tools(
@@ -555,27 +561,22 @@ class InvestigationController:
         iterations_used: int,
         no_progress_iterations: int,
     ) -> tuple[AgentTurnResult | None, int]:
+        if tool_step.finalization_reason is not None:
+            return self._complete_with_budget_answer(
+                user_input=user_input, turn_index=turn_index, options=options, state=state,
+                messages=messages, iterations_used=iterations_used, tool_calls_used=tool_step.tool_calls_used,
+                stop_reason=tool_step.finalization_reason,
+            ), no_progress_iterations
         previous_fingerprint = state.progress_fingerprint()
         try:
             reflection = self._synthesize_reflection(state=state, tool_step=tool_step, options=options)
         except LLMProviderError as exc:
             if exc.kind == "context_overflow":
-                failure_result = self.handle_provider_failure(
-                    error=exc,
-                    user_input=user_input,
-                    turn_index=turn_index,
-                )
-                return (
-                    self._attach_metadata(
-                        failure_result,
-                        options=options,
-                        iterations_used=iterations_used,
-                        tool_calls_used=tool_step.tool_calls_used,
-                        stop_reason="llm_context_overflow",
-                        state=state,
-                    ),
-                    no_progress_iterations,
-                )
+                return self._complete_with_budget_answer(
+                    user_input=user_input, turn_index=turn_index, options=options, state=state,
+                    messages=messages, iterations_used=iterations_used, tool_calls_used=tool_step.tool_calls_used,
+                    stop_reason="llm_context_exhausted",
+                ), no_progress_iterations
             if exc.kind != "budget_exhausted":
                 raise
             state.risk_notes.append(
@@ -597,7 +598,6 @@ class InvestigationController:
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
                 raise
-            state.metadata[UNREFLECTED_EXCHANGES_KEY] = True
             logger.warning(
                 "Investigation reflection synthesis failed; continuing without state update",
                 extra={"error_preview": safe_preview(str(exc), limit=200)},
@@ -663,22 +663,11 @@ class InvestigationController:
             )
         except LLMProviderError as exc:
             if exc.kind == "context_overflow":
-                failure_result = self.handle_provider_failure(
-                    error=exc,
-                    user_input=user_input,
-                    turn_index=turn_index,
-                )
-                return (
-                    self._attach_metadata(
-                        failure_result,
-                        options=options,
-                        iterations_used=iterations_used,
-                        tool_calls_used=tool_step.tool_calls_used,
-                        stop_reason="llm_context_overflow",
-                        state=state,
-                    ),
-                    no_progress_iterations,
-                )
+                return self._complete_with_budget_answer(
+                    user_input=user_input, turn_index=turn_index, options=options, state=state,
+                    messages=messages, iterations_used=iterations_used, tool_calls_used=tool_step.tool_calls_used,
+                    stop_reason="llm_context_exhausted",
+                ), no_progress_iterations
             if exc.kind != "budget_exhausted":
                 raise
             return (
@@ -1028,6 +1017,7 @@ class InvestigationController:
         final_metadata: dict[str, Any] = {}
         if options.final_output_mode == "json_schema":
             final_content, final_metadata = self._render_final_json_schema(
+                user_input=user_input,
                 content=content,
                 messages=messages,
                 options=options,
@@ -1135,6 +1125,79 @@ class InvestigationController:
         )
         return final_content, {"final_response_origin": "model"}
 
+    def final_context_request(
+        self,
+        *,
+        user_input: str,
+        content: str,
+        messages: list[LLMMessage],
+        options: RunOptions,
+        state: InvestigationState,
+        stop_reason: str,
+        fallback_complete: bool,
+    ) -> LLMContextRequest:
+        """Use the exact final envelope for both read admission and final rendering."""
+        contract = options.final_output_contract
+        if options.final_output_mode == "json_schema":
+            if contract is None:
+                raise ValueError("json_schema final output requires a final output contract")
+            payload: dict[str, Any] = {
+                "original_user_request": user_input,
+                "candidate_final_answer": content,
+                "stop_reason": stop_reason,
+                "investigation_state": state.to_dict(),
+                "contract_name": contract.name,
+                "contract_instructions": list(contract.instructions),
+            }
+            instruction = "\n".join(
+                [
+                    "Formalize the final answer as one JSON object matching the provider-enforced JSON Schema.",
+                    "Use only the candidate answer and investigation state already present in this transcript.",
+                    "Do not request tools. Do not add prose, markdown fences, comments, or a second JSON object.",
+                    "Preserve uncertainty from the investigation state instead of inventing missing facts.",
+                    *contract.instructions,
+                ]
+            )
+            call_options = LLMCallOptions(
+                context_finalization=True,
+                reasoning_effort=options.reasoning_effort,
+                reasoning_summary=options.reasoning_summary,
+                response_format=contract.response_format(),
+                max_output_tokens=self.settings.llm_max_output_tokens,
+                metadata={
+                    **options.metadata,
+                    "mode": options.mode,
+                    "target": "final_output_json_schema",
+                    "final_output_contract": contract.name,
+                },
+            )
+        else:
+            payload = {
+                "original_user_request": user_input,
+                "candidate_answer": content.strip() or None,
+                "completion_status": "complete" if fallback_complete else "incomplete",
+                "stop_reason": stop_reason,
+                "investigation_state": state.to_dict(),
+            }
+            instruction = self.prompt_set.final_response
+            call_options = LLMCallOptions(
+                context_finalization=True,
+                reasoning_effort=options.reasoning_effort,
+                reasoning_summary=options.reasoning_summary,
+                max_output_tokens=self.settings.llm_max_output_tokens,
+                metadata={**options.metadata, "mode": options.mode, "target": "investigation_final_response"},
+            )
+        return LLMContextRequest(
+            messages=[
+                *messages,
+                LLMMessage(role="system", content=instruction),
+                context_payload_message(role="user", payload=payload, protected_fields=("original_user_request",)),
+            ],
+            tools=[],
+            options=call_options,
+            purpose="investigation_finalization",
+        )
+
     def _render_final_text(
         self,
         *,
@@ -1146,32 +1209,11 @@ class InvestigationController:
         stop_reason: str,
         fallback_complete: bool,
     ) -> str:
-        payload = {
-            "original_user_request": user_input,
-            "candidate_answer": content.strip() or None,
-            "completion_status": "complete" if fallback_complete else "incomplete",
-            "stop_reason": stop_reason,
-            "investigation_state": state.to_dict(),
-        }
-        final_messages = [
-            *messages,
-            LLMMessage(role="system", content=self.prompt_set.final_response),
-            LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
-        ]
-        llm_response = self.call_final_model_once(
-            messages=final_messages,
-            options=LLMCallOptions(
-                reasoning_effort=options.reasoning_effort,
-                reasoning_summary=options.reasoning_summary,
-                response_format=None,
-                max_output_tokens=self.settings.llm_max_output_tokens,
-                metadata={
-                    **options.metadata,
-                    "mode": options.mode,
-                    "target": "investigation_final_response",
-                },
-            ),
+        request = self.final_context_request(
+            user_input=user_input, content=content, messages=messages, options=options,
+            state=state, stop_reason=stop_reason, fallback_complete=fallback_complete,
         )
+        llm_response = self.call_final_model_once(messages=request.messages, options=request.options)
         if llm_response.tool_calls:
             raise LLMProviderError(
                 kind="response_error",
@@ -1194,6 +1236,7 @@ class InvestigationController:
     def _render_final_json_schema(
         self,
         *,
+        user_input: str,
         content: str,
         messages: list[LLMMessage],
         options: RunOptions,
@@ -1204,43 +1247,11 @@ class InvestigationController:
         if contract is None:
             raise ValueError("json_schema final output requires a final output contract")
 
-        payload = {
-            "candidate_final_answer": content,
-            "stop_reason": stop_reason,
-            "investigation_state": state.to_dict(),
-            "contract_name": contract.name,
-            "contract_instructions": list(contract.instructions),
-        }
-        instruction_lines = [
-            "Formalize the final answer as one JSON object matching the provider-enforced JSON Schema.",
-            "Use only the candidate answer and investigation state already present in this transcript.",
-            "Do not request tools. Do not add prose, markdown fences, comments, or a second JSON object.",
-            "Preserve uncertainty from the investigation state instead of inventing missing facts.",
-        ]
-        if contract.instructions:
-            instruction_lines.append("Contract-specific instructions:")
-            instruction_lines.extend(f"- {instruction}" for instruction in contract.instructions)
-
-        final_messages = [
-            *messages,
-            LLMMessage(role="system", content="\n".join(instruction_lines)),
-            LLMMessage(role="user", content=json.dumps(payload, ensure_ascii=False, indent=2)),
-        ]
-        llm_response = self.call_final_model_once(
-            messages=final_messages,
-            options=LLMCallOptions(
-                reasoning_effort=options.reasoning_effort,
-                reasoning_summary=options.reasoning_summary,
-                response_format=contract.response_format(),
-                max_output_tokens=self.settings.llm_max_output_tokens,
-                metadata={
-                    "mode": options.mode,
-                    "target": "final_output_json_schema",
-                    "final_output_contract": contract.name,
-                    **options.metadata,
-                },
-            ),
+        request = self.final_context_request(
+            user_input=user_input, content=content, messages=messages, options=options,
+            state=state, stop_reason=stop_reason, fallback_complete=True,
         )
+        llm_response = self.call_final_model_once(messages=request.messages, options=request.options)
         if llm_response.tool_calls:
             raise LLMProviderError(
                 kind="response_error",
@@ -1307,8 +1318,10 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_initial_plan",
+                project_payload=True,
+                protected_payload_fields=("objective",),
                 instructions=self.prompt_set.initial_plan,
-                output_format=InvestigationState.create_template(objective=user_input).to_dict(),
+                output_format=InvestigationState.create_template().to_dict(),
                 payload={"objective": user_input, "current_state": state.to_dict()},
                 parser=InvestigationState.from_any,
                 options=self._call_options(options=options, target="investigation_initial_plan"),
@@ -1357,6 +1370,7 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_step_reflection",
+                project_payload=True,
                 instructions=self.prompt_set.step_reflection,
                 output_format=StepReflection.create_template().to_dict(),
                 payload=payload,
@@ -1388,6 +1402,7 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_decision",
+                project_payload=True,
                 instructions=self.prompt_set.decision,
                 output_format=InvestigationDecision.create_template().to_dict(),
                 payload=payload,
@@ -1406,6 +1421,7 @@ class InvestigationController:
         return self.structured_synthesizer.synthesize(
             request=StructuredSynthesisRequest(
                 target_name="investigation_final_critique",
+                project_payload=True,
                 instructions=self.prompt_set.final_critique,
                 output_format=FinalCritique.create_template().to_dict(),
                 payload={"current_state": state.to_dict(), "final_draft": final_draft},
@@ -1461,37 +1477,31 @@ class InvestigationController:
             "confidence": state.confidence,
             "stop_reason": state.stop_reason,
             "tool_artifact_ids": state.metadata.get("tool_artifact_ids", []),
-            "unreflected_tool_exchanges": state.metadata.get(UNREFLECTED_EXCHANGES_KEY) is True,
         }
-        state_message = LLMMessage(
+        state_message = context_payload_message(
             role="system",
-            content="\n".join(
+            payload=state_payload,
+            prefix="\n".join(
                 [
                     INVESTIGATION_STATE_MESSAGE_PREFIX,
                     "This is the controller's current auditable state, not new user evidence.",
                     "Use established facts, prioritize next actions, close evidence gaps, and respect risk notes.",
                     "When next_actions is non-empty and an available tool can perform the next action within scope and budget, call that tool now. Do not produce a final answer instead of performing a required next action. Finalize only when no required next action remains or the state establishes that continuation is blocked, unsafe, unavailable, or over budget.",
                     "Do not repeat completed actions unless verification requires it.",
-                    json.dumps(state_payload, ensure_ascii=False, separators=(",", ":")),
                 ]
-            ),
+            ) + "\n",
         )
         if messages and messages[-1].role == "user":
             return [*messages[:-1], state_message, messages[-1]]
         return [*messages, state_message]
 
     def _call_options(
-        self, *, options: RunOptions, target: str, state: InvestigationState | None = None,
+        self, *, options: RunOptions, target: str,
     ) -> LLMCallOptions:
         return LLMCallOptions(
             reasoning_effort=options.reasoning_effort,
             reasoning_summary=options.reasoning_summary,
             response_format={"type": "json_object"} if target != "assistant_step" else None,
-            compact_current_turn=(
-                target == "assistant_step"
-                and state is not None
-                and state.metadata.get(UNREFLECTED_EXCHANGES_KEY) is not True
-            ),
             metadata={"mode": options.mode, "target": target, **options.metadata},
         )
 

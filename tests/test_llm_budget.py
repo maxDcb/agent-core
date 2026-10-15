@@ -43,7 +43,7 @@ def test_budget_enforces_call_limit_before_invoking_provider() -> None:
     controller = LLMBudgetController(LLMBudget(max_calls=1))
     invoked = 0
 
-    def invoke(options: LLMCallOptions | None) -> LLMCompletionResult:
+    def invoke(projected: list[LLMMessage], options: LLMCallOptions | None) -> LLMCompletionResult:
         nonlocal invoked
         invoked += 1
         return _completion()
@@ -83,7 +83,7 @@ def test_budget_caps_output_to_remaining_total_tokens() -> None:
             messages=messages,
             purpose="bounded",
             options=None,
-            invoke=lambda options: observed_options.append(options) or _completion(input_tokens=estimated_input),
+            invoke=lambda projected, options: observed_options.append(options) or _completion(input_tokens=estimated_input),
         )
 
     assert observed_options[0] is not None
@@ -99,7 +99,7 @@ def test_observe_mode_records_violation_without_blocking() -> None:
             messages=[LLMMessage(role="user", content="observe")],
             purpose="observe",
             options=None,
-            invoke=lambda options: _completion(),
+            invoke=lambda projected, options: _completion(),
         )
 
     assert result.content == "done"
@@ -114,7 +114,7 @@ def test_budget_rejects_estimated_input_over_limit() -> None:
     controller = LLMBudgetController(LLMBudget(max_input_tokens=estimated_input - 1))
     invoked = False
 
-    def invoke(options: LLMCallOptions | None) -> LLMCompletionResult:
+    def invoke(projected: list[LLMMessage], options: LLMCallOptions | None) -> LLMCompletionResult:
         nonlocal invoked
         invoked = True
         return _completion()

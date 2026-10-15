@@ -78,13 +78,36 @@ every provider call. The planner measures the complete request envelope:
 messages, tool definitions and structured response schema. It subtracts the
 configured output reserve and safety margin from the provider context window,
 then removes only complete historical message groups until the request fits.
-System messages and the current user request are mandatory. Direct mode also
-keeps the whole current tool turn. Investigation assistant steps may omit older
-completed tool exchanges from the provider request once controller reflections
-carry their facts and artifact references; the latest exchange remains mandatory.
-Tool calls are never separated from their responses, and persisted exchanges are
-unchanged. An irreducible overflow fails before provider invocation. Planner aggregates are persisted in pending turns
-and structured checkpoints and exposed in final metadata.
+`context_projection.prepare_llm_context` is the shared boundary for direct,
+investigation, structured-task and synthesis calls. It produces a separate
+provider view, so planning cannot remove exchanges from resumable checkpoints.
+Large runtime payloads and omitted exchanges are stored through the existing
+run-scoped artifact store. Bounded excerpts retain their labels and source
+references and omitted counts, explicitly mark incomplete data, and never
+establish findings by themselves. Tool excerpts stay in an assistant data message
+and are never promoted to system instructions. Tool-less synthesis receives an
+operational view retaining old and recent facts, open hypotheses and gaps, with
+source identifiers and a warning that retrieval is unavailable. The deterministic projection does not rewrite the full controller
+state or the persisted transcript.
+
+Context archives reuse immutable 4096-character parts through the existing
+artifact store. The file store hides its ordered part manifests behind a single
+logical artifact: ordinary raw reads and structured navigation expose the exact
+original source, with the usual byte pagination and budgets. Content-addressed
+reuse is scoped to namespace, run and tool, and survives checkpoint resume.
+This avoids repeatedly writing full growing transcript/state prefixes. The
+small manifests and genuinely changed parts still consume storage.
+
+System instructions, the live user request and the latest exchange stay
+mandatory while tools remain available. No-tool finalization may project out
+the latest exchange as well, with an archived source and incomplete excerpts.
+Tool calls are never separated from their responses. Artifact read admission
+uses the exact same projection for both the continuation and the finalization
+request. Probes neither publish archives nor charge read budgets. If no safe
+page remains, or cumulative read limits are exhausted, both execution modes
+finalize with available evidence and uncertainty. Fixed instructions or schemas
+which cannot fit still fail before provider invocation. Planner aggregates are
+persisted in pending turns and structured checkpoints and exposed in results.
 
 Tool-result artifact storage is always active. Every application-tool result is
 published to an `ArtifactStore` before its execution state is persisted.

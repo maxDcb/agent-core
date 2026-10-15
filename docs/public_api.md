@@ -19,11 +19,25 @@ state without making the internal controller a public extension point.
 planner and expose content-free planning telemetry; the stateful planner itself
 remains an implementation detail.
 
+`LLMCallOptions.context_finalization` identifies a final no-tool rendering call.
+Only calls without tools may project out the latest exchange; execution calls
+retain it. The original user request and fixed instructions remain mandatory.
+
 `ToolArtifactPolicy`, `ToolArtifactDescriptor`, `ArtifactResultEnvelope`,
 `ToolArtifactUsage`, `ArtifactChunk`, and `JsonFileArtifactStore` configure and
 describe lossless tool-result externalization. `ArtifactStore` is exported from
 both the package root and the SPI for hosts that provide remote or
 transactional artifact persistence.
+
+`ArtifactStore.put_text` accepts `deduplicate=True` for immutable runtime context
+archives. Store implementations must reuse identical content within the same
+namespace, run and tool identity. Normal application tool results keep distinct
+artifact identities. The file store implements this with content-addressed ids
+and validates existing content before reuse. A returned descriptor's ephemeral
+`newly_created` flag is false for reuse and is not serialized. Usage counts newly
+published logical artifacts and their source sizes, not physical storage bytes.
+The file store deduplicates large archives internally; both read methods expose
+the original source transparently, never its storage manifest.
 
 ## Extension SPI: `agent_core.spi`
 

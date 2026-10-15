@@ -58,7 +58,7 @@ class _HugeResultTool:
         )
 
     def execute(self, arguments: dict[str, Any], context: ExecutionContext) -> ToolResult:
-        return ToolResult(ok=True, content="XML-EVIDENCE:<item>\"quoted\" & useful</item>\n" * 500)
+        return ToolResult(ok=True, content='XML-EVIDENCE:<item>"quoted" & useful</item>\n' * 500)
 
 
 class _ReadBackProvider:
@@ -443,8 +443,8 @@ def test_context_planning_demotes_hot_artifact_preview_before_provider_call(tmp_
             messages=messages,
             purpose="artifact_projection",
             options=None,
-            invoke=lambda options: (
-                seen_materializations.append(json.loads(messages[-1].content)["materialization"]),
+            invoke=lambda projected, options: (
+                seen_materializations.append(json.loads(projected[-1].content)["materialization"]),
                 LLMCompletionResult(content="ok"),
             )[-1],
         )
@@ -496,9 +496,16 @@ def test_structured_loop_externalizes_results_and_dispatches_internal_reads_outs
     assert result.raw_content == "done"
     assert result.tool_calls_used == 1
     assert [item["tool_kind"] for item in result.tool_history] == ["application", "runtime"]
-    assert {key: result.metadata["tool_artifact_usage"][key] for key in (
-        "artifacts_written", "artifact_bytes_written", "internal_tool_calls", "artifact_bytes_read", "reads_rejected"
-    )} == {
+    assert {
+        key: result.metadata["tool_artifact_usage"][key]
+        for key in (
+            "artifacts_written",
+            "artifact_bytes_written",
+            "internal_tool_calls",
+            "artifact_bytes_read",
+            "reads_rejected",
+        )
+    } == {
         "artifacts_written": 1,
         "artifact_bytes_written": 2_020,
         "internal_tool_calls": 1,
@@ -525,7 +532,7 @@ def test_structured_loop_externalizes_results_and_dispatches_internal_reads_outs
 
 
 @pytest.mark.parametrize("kernel_backend", ["native", "langgraph"])
-def test_structured_reads_stop_at_context_boundary_and_preserve_finalization_capacity(
+def test_structured_reads_compact_history_and_preserve_finalization_capacity(
     tmp_path,
     kernel_backend: Literal["native", "langgraph"],
 ) -> None:
@@ -589,12 +596,79 @@ def test_structured_reads_stop_at_context_boundary_and_preserve_finalization_cap
     assert result.raw_content == '{"answer":"bounded final answer"}'
     assert result.output == {"answer": "bounded final answer"}
     assert result.metadata["forced_finalization"] is True
-    assert "remaining model context" in result.metadata["budget_failure_reason"]
+    assert "artifact read budget" in result.metadata["budget_failure_reason"]
     assert result.metadata["tool_artifact_usage"]["reads_rejected"] == 1
-    assert result.metadata["tool_artifact_usage"]["artifact_bytes_read"] < 20_000
+    assert result.metadata["tool_artifact_usage"]["artifact_bytes_read"] == 20_000
+    assert result.metadata["llm_context_usage"]["calls_compacted"] > 0
     assert len(provider.returned_bytes) >= 1
-    assert result.tool_history[-1]["artifact_read_context_exhausted"] is True
+    assert result.tool_history[-1]["artifact_read_budget_exhausted"] is True
     assert any(checkpoint["phase"] == "finalization" for checkpoint in checkpoints)
+    assert len(checkpoints[-1]["messages"]) > max(len(call["messages"]) for call in provider.calls)
+    assert len([message for message in checkpoints[-1]["messages"] if message["role"] == "tool"]) == len(
+        result.tool_history
+    )
+
+
+@pytest.mark.parametrize("backend", ["native", "langgraph"])
+@pytest.mark.parametrize("mode", ["direct", "investigate"])
+def test_conversation_reads_use_common_admission_and_finalize_at_read_budget(tmp_path, backend, mode) -> None:
+    class ConversationReader(_ReadUntilContextBoundaryProvider):
+        def complete_with_tools(self, **kwargs):
+            if not kwargs["tools"]:
+                self.calls.append(kwargs)
+                assert (
+                    estimate_llm_input_tokens(messages=kwargs["messages"], tools=[], options=kwargs.get("options"))
+                    <= 4872
+                )
+                return LLMCompletionResult(
+                    content="Partial answer. Saved evidence was read within the budget; remaining evidence is unverified."
+                )
+            return super().complete_with_tools(**kwargs)
+
+    settings = CoreSettings(
+        base_system_prompt="system",
+        session_file=tmp_path / "session.json",
+        artifacts_directory=tmp_path / "artifacts",
+        agent_kernel_backend=backend,
+        llm_max_output_tokens=128,
+        llm_context_policy=LLMContextPolicy(
+            max_context_tokens=5000, reserved_output_tokens=128, safety_margin_tokens=0
+        ),
+        tool_artifact_policy=ToolArtifactPolicy(
+            hot_context_bytes=128,
+            max_complete_result_bytes=128,
+            preview_bytes=64,
+            max_read_bytes=900,
+            max_reads_per_run=30,
+            max_total_read_bytes=20000,
+        ),
+    )
+    registry = ToolRegistry()
+    registry.register(_HugeResultTool())
+    provider = ConversationReader(max_context_tokens=5000, reserved_output_tokens=128)
+    orchestrator = AgentOrchestrator(
+        settings=settings,
+        provider=provider,
+        registry=registry,
+        session_manager=SessionManager(SessionRepository(settings.session_file)),
+        policy_engine=PolicyEngine(),
+    )
+    result = run_turn(
+        orchestrator,
+        "Read evidence until the budget is exhausted.",
+        options=RunOptions(
+            mode=mode,
+            max_iterations=30,
+            max_tool_calls=1,
+            require_initial_plan=False,
+            recover_internal_synthesis_errors=True,
+        ),
+    )
+    assert result.status == "completed"
+    assert result.content.startswith("Partial answer.")
+    assert result.metadata["stop_reason"] == "artifact_read_budget_exhausted"
+    assert result.metadata["llm_context_usage"]["calls_compacted"] > 0
+    assert provider.calls[-1]["tools"] == []
 
 
 def test_conversation_loop_exposes_internal_reader_without_consuming_application_budget(tmp_path) -> None:
@@ -688,3 +762,54 @@ def test_pending_conversation_resume_restores_artifact_policy_and_usage(tmp_path
     assert completed.metadata["tool_artifact_usage"]["artifacts_written"] == 1
     assert completed.metadata["tool_artifact_usage"]["internal_tool_calls"] == 1
     assert provider.artifact_id
+
+
+def test_context_archive_is_transparently_paginated_through_runtime(tmp_path) -> None:
+    settings = CoreSettings(base_system_prompt="system", artifacts_directory=tmp_path / "artifacts")
+    context = execution_context(settings, namespace_id="tenant")
+    store = JsonFileArtifactStore(settings.artifacts_directory)
+    runtime = ToolArtifactRuntime(
+        policy=ToolArtifactPolicy(),
+        store=store,
+        namespace_id="tenant",
+        run_id=context.run_id,
+    )
+    content = "abc🧪\n" * 32768
+    reference = runtime.archive_context(content, persist=True)
+    offset = 0
+    pages = []
+    while offset < reference["size_bytes"]:
+        result = runtime.execute(
+            tool_name=READ_ARTIFACT_TOOL_NAME,
+            arguments={"artifact_id": reference["artifact_id"], "offset": offset, "limit": 16384},
+            context=context,
+        )
+        assert result.ok, result.content
+        page = json.loads(result.content)
+        assert page["size_bytes"] == len(content.encode("utf-8"))
+        pages.append(page["content"])
+        offset = page["next_offset"]
+    assert page["eof"] is True
+    assert "".join(pages) == content
+    assert runtime.usage.internal_tool_calls == 16
+    assert store.read_all_text(namespace_id="tenant", artifact_id=reference["artifact_id"]) == content
+    with pytest.raises(FileNotFoundError):
+        store.read_all_text(namespace_id="other", artifact_id=reference["artifact_id"])
+
+
+def test_context_archive_rejects_corrupted_storage_parts(tmp_path) -> None:
+    store = JsonFileArtifactStore(tmp_path / "artifacts")
+    descriptor = store.put_text(
+        namespace_id="tenant",
+        run_id="run",
+        tool_name="runtime_context",
+        content="evidence" * 2000,
+        deduplicate=True,
+    )
+    manifest_path = next(store.directory.rglob(f"{descriptor.artifact_id}.txt"))
+    parts = json.loads(manifest_path.read_text(encoding="utf-8"))
+    child_path = manifest_path.with_name(f"{parts[0]['artifact_id']}.txt")
+    original = child_path.read_bytes()
+    child_path.write_bytes(b"X" + original[1:])
+    with pytest.raises(ValueError, match="does not match"):
+        store.read_text(namespace_id="tenant", artifact_id=descriptor.artifact_id, offset=0, limit=4096)

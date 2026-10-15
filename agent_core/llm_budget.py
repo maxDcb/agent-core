@@ -8,6 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import Any, Literal, TypeVar
 
 from agent_core.context_planner import active_llm_context_planner, estimate_llm_input_tokens
+from agent_core.context_projection import LLMContextRequest, prepare_llm_context
 from agent_core.llm.base import LLMCallOptions, LLMCompletionResult, LLMMessage, LLMTokenUsage
 from agent_core.llm.errors import LLMProviderError
 
@@ -396,49 +397,24 @@ def run_budgeted_llm_call(
     tools: object = None,
     purpose: str,
     options: LLMCallOptions | None,
-    invoke: Callable[[LLMCallOptions | None], T],
+    invoke: Callable[[list[LLMMessage], LLMCallOptions | None], T],
     on_reserved: Callable[[], None] | None = None,
 ) -> T:
-    from agent_core.tool_artifacts import active_tool_artifact_runtime
-
     context_planner = active_llm_context_planner()
-    artifact_runtime = active_tool_artifact_runtime()
-    if artifact_runtime is not None:
-        messages_fit: Callable[[list[LLMMessage]], bool] | None = None
-        if context_planner is not None:
-            def context_messages_fit(candidate: list[LLMMessage]) -> bool:
-                return context_planner.can_plan_call(
-                    messages=candidate,
-                    tools=tools,
-                    purpose=purpose,
-                    options=options,
-                )
-
-            messages_fit = context_messages_fit
-        artifact_runtime.prepare_messages(
-            messages,
-            messages_fit=messages_fit,
-        )
-    effective_options = options
-    if context_planner is not None:
-        planned_messages, effective_options, _ = context_planner.plan_call(
-            messages=messages,
-            tools=tools,
-            purpose=purpose,
-            options=options,
-        )
-        messages[:] = planned_messages
+    projected, effective_options = prepare_llm_context(
+        LLMContextRequest(messages=messages, tools=tools, purpose=purpose, options=options),
+    )
 
     controller = active_llm_budget_controller()
     if controller is None:
         if context_planner is not None and on_reserved is not None:
             on_reserved()
-        return invoke(effective_options)
+        return invoke(projected, effective_options)
 
     reservation, effective_options = controller.prepare_call(
         purpose=purpose,
         estimated_input_tokens=estimate_llm_input_tokens(
-            messages=messages,
+            messages=projected,
             tools=tools,
             options=effective_options,
         ),
@@ -447,7 +423,7 @@ def run_budgeted_llm_call(
     try:
         if on_reserved is not None:
             on_reserved()
-        result = invoke(effective_options)
+        result = invoke(projected, effective_options)
     except Exception:
         controller.fail_call(reservation)
         raise

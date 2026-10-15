@@ -64,6 +64,10 @@ class DirectTurnOperations(Protocol):
 
     def _refresh_memory_after_turn(self, *, turn_index: int) -> None: ...
 
+    def _complete_capacity_exhausted(
+        self, *, messages: list[LLMMessage], user_input: str, turn_index: int, stop_reason: str,
+    ) -> AgentTurnResult: ...
+
     def _execute_tool_calls_once(
         self,
         *,
@@ -179,6 +183,11 @@ class DirectTurnNodes:
         try:
             llm_response = self.operations._call_model_once(messages=messages)
         except LLMProviderError as exc:
+            if exc.kind == "context_overflow" and any(message.role == "tool" for message in messages):
+                return {"result": self.operations._complete_capacity_exhausted(
+                    messages=messages, user_input=state["user_input"], turn_index=state["turn_index"],
+                    stop_reason="llm_context_exhausted",
+                )}
             self.operations._record_trace_event(
                 state["trace"],
                 event_type="llm_provider_failure",
@@ -328,6 +337,11 @@ class DirectTurnNodes:
         return "call_model"
 
     def complete_budget(self, state: AgentGraphState) -> AgentGraphUpdate:
+        if state["tool_step"] is not None and state["tool_step"].finalization_reason is not None:
+            return {"result": self.operations._complete_capacity_exhausted(
+                messages=state["messages"], user_input=state["user_input"], turn_index=state["turn_index"],
+                stop_reason=state["tool_step"].finalization_reason,
+            )}
         message = "Maximum number of tool calls reached for this turn."
         logger.error(message)
         self.operations._record_trace_event(

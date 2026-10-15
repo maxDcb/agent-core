@@ -113,6 +113,8 @@ class ToolArtifactDescriptor:
     size_bytes: int
     sha256: str
     content_type: str = "text/plain; charset=utf-8"
+    # Publication outcome is local to the write, never part of the persisted identity.
+    newly_created: bool = field(default=True, compare=False, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -311,6 +313,7 @@ class ArtifactStore(Protocol):
         tool_name: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        deduplicate: bool = False,
     ) -> ToolArtifactDescriptor: ...
 
     def read_text(
@@ -339,24 +342,52 @@ class JsonFileArtifactStore:
         tool_name: str,
         content: str,
         metadata: dict[str, Any] | None = None,
+        deduplicate: bool = False,
     ) -> ToolArtifactDescriptor:
         raw = content.encode("utf-8")
-        artifact_id = f"art_{uuid4().hex}"
+        digest = hashlib.sha256(raw).hexdigest()
+        identity = json.dumps([run_id, tool_name, digest], ensure_ascii=False, separators=(",", ":"))
+        artifact_id = (
+            f"art_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:32]}" if deduplicate else f"art_{uuid4().hex}"
+        )
         descriptor = ToolArtifactDescriptor(
             artifact_id=artifact_id,
             tool_name=tool_name,
             size_bytes=len(raw),
-            sha256=hashlib.sha256(raw).hexdigest(),
+            sha256=digest,
         )
         namespace_directory = self._namespace_directory(namespace_id)
         namespace_directory.mkdir(parents=True, exist_ok=True)
         content_path, metadata_path = self._paths(namespace_directory, artifact_id)
-        self._atomic_write_bytes(content_path, raw)
+        if deduplicate and content_path.exists() and metadata_path.exists():
+            existing, _ = self._resolve_owned(namespace_id=namespace_id, artifact_id=artifact_id)
+            if existing != descriptor:
+                raise ValueError("Content-addressed artifact identity does not match its descriptor")
+            self.read_all_text(namespace_id=namespace_id, artifact_id=artifact_id)
+            return replace(existing, newly_created=False)
+        storage: dict[str, Any] = {}
+        stored_raw = raw
+        if deduplicate and len(content) > 4096:
+            parts = [
+                self.put_text(
+                    namespace_id=namespace_id,
+                    run_id=run_id,
+                    tool_name=tool_name,
+                    content=content[offset : offset + 4096],
+                    deduplicate=True,
+                    metadata={"kind": "context_archive_part"},
+                ).to_dict()
+                for offset in range(0, len(content), 4096)
+            ]
+            stored_raw = json.dumps(parts, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            storage = {"storage_kind": "parts", "stored_sha256": hashlib.sha256(stored_raw).hexdigest()}
+        self._atomic_write_bytes(content_path, stored_raw)
         self._atomic_write_bytes(
             metadata_path,
             json.dumps(
                 {
                     "schema_version": 1,
+                    **storage,
                     "namespace_id": namespace_id,
                     "run_id": run_id,
                     "descriptor": descriptor.to_dict(),
@@ -383,11 +414,7 @@ class JsonFileArtifactStore:
         limit = _positive_int(limit, field_name="limit")
         if offset > descriptor.size_bytes:
             raise ValueError("offset is beyond the end of the artifact")
-        if content_path.stat().st_size != descriptor.size_bytes:
-            raise ValueError("artifact content size does not match its descriptor")
-        with content_path.open("rb") as handle:
-            handle.seek(offset)
-            raw = handle.read(min(limit, descriptor.size_bytes - offset))
+        raw = self._read_content_range(namespace_id, descriptor, content_path, offset, limit)
         decoded_raw = raw
         while decoded_raw:
             try:
@@ -400,9 +427,7 @@ class JsonFileArtifactStore:
         else:
             content = ""
         if not decoded_raw and raw and offset < descriptor.size_bytes:
-            with content_path.open("rb") as handle:
-                handle.seek(offset)
-                prefix = handle.read(min(4, descriptor.size_bytes - offset))
+            prefix = self._read_content_range(namespace_id, descriptor, content_path, offset, 4)
             for end in range(1, len(prefix) + 1):
                 try:
                     content = prefix[:end].decode("utf-8")
@@ -425,10 +450,55 @@ class JsonFileArtifactStore:
 
     def read_all_text(self, *, namespace_id: str, artifact_id: str) -> str:
         descriptor, content_path = self._resolve_owned(namespace_id=namespace_id, artifact_id=artifact_id)
-        raw = content_path.read_bytes()
+        raw = self._read_content_range(namespace_id, descriptor, content_path, 0, descriptor.size_bytes)
         if len(raw) != descriptor.size_bytes or hashlib.sha256(raw).hexdigest() != descriptor.sha256:
             raise ValueError("artifact content does not match its descriptor")
         return raw.decode("utf-8")
+
+    def _read_content_range(
+        self,
+        namespace_id: str,
+        descriptor: ToolArtifactDescriptor,
+        content_path: Path,
+        offset: int,
+        limit: int,
+    ) -> bytes:
+        """Expose one logical source regardless of its deduplicated storage layout."""
+        metadata = json.loads(content_path.with_suffix(".json").read_text(encoding="utf-8"))
+        if metadata.get("storage_kind") != "parts":
+            if content_path.stat().st_size != descriptor.size_bytes:
+                raise ValueError("artifact content size does not match its descriptor")
+            with content_path.open("rb") as handle:
+                handle.seek(offset)
+                return handle.read(min(limit, descriptor.size_bytes - offset))
+        manifest = content_path.read_bytes()
+        if hashlib.sha256(manifest).hexdigest() != metadata.get("stored_sha256"):
+            raise ValueError("artifact storage manifest does not match its descriptor")
+        payload = json.loads(manifest)
+        if not isinstance(payload, list):
+            raise ValueError("invalid artifact storage manifest")
+        parts = [ToolArtifactDescriptor.from_any(part) for part in payload]
+        if any(part is None for part in parts):
+            raise ValueError("invalid artifact storage part")
+        descriptors = cast(list[ToolArtifactDescriptor], parts)
+        if sum(part.size_bytes for part in descriptors) != descriptor.size_bytes:
+            raise ValueError("artifact storage size does not match its descriptor")
+        result = bytearray()
+        cursor = 0
+        end = min(descriptor.size_bytes, offset + limit)
+        for part in descriptors:
+            part_end = cursor + part.size_bytes
+            if cursor < end and part_end > offset:
+                owned, path = self._resolve_owned(namespace_id=namespace_id, artifact_id=part.artifact_id)
+                child_metadata = json.loads(path.with_suffix(".json").read_text(encoding="utf-8"))
+                if owned != part or child_metadata.get("storage_kind") == "parts" or part.size_bytes > 16384:
+                    raise ValueError("invalid artifact storage part")
+                raw = self.read_all_text(namespace_id=namespace_id, artifact_id=part.artifact_id).encode("utf-8")
+                result.extend(raw[max(0, offset - cursor) : min(part.size_bytes, end - cursor)])
+            cursor = part_end
+            if cursor >= end:
+                break
+        return bytes(result)
 
     def _resolve_owned(self, *, namespace_id: str, artifact_id: str) -> tuple[ToolArtifactDescriptor, Path]:
         if not _ARTIFACT_ID_PATTERN.fullmatch(artifact_id):
@@ -542,6 +612,36 @@ class ToolArtifactRuntime:
         self.run_id = run_id
         self.usage = ToolArtifactUsage.from_any(usage)
         self._navigation_cache: OrderedDict[str, tuple[str, str, Any, int]] = OrderedDict()
+        self._context_references: OrderedDict[tuple[str, bool], dict[str, Any]] = OrderedDict()
+
+    def archive_context(self, content: str, *, persist: bool) -> dict[str, Any]:
+        """Archive exact context; admission probes never mutate the store or usage."""
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        cached = self._context_references.get((digest, True)) or self._context_references.get((digest, persist))
+        if cached is not None:
+            return dict(cached)
+        descriptor = None
+        if persist:
+            descriptor = self.store.put_text(
+                namespace_id=self.namespace_id,
+                run_id=self.run_id,
+                tool_name="runtime_context",
+                content=content,
+                metadata={"kind": "context_archive"},
+                deduplicate=True,
+            )
+            if descriptor.newly_created:
+                self.usage.artifacts_written += 1
+                self.usage.artifact_bytes_written += descriptor.size_bytes
+        reference = {
+            "artifact_id": descriptor.artifact_id if descriptor else f"art_{digest[:32]}",
+            "sha256": digest,
+            "size_bytes": len(content.encode("utf-8")),
+        }
+        self._context_references[(digest, persist)] = reference
+        while len(self._context_references) > 16:
+            self._context_references.popitem(last=False)
+        return dict(reference)
 
     def externalize(
         self,
@@ -604,14 +704,6 @@ class ToolArtifactRuntime:
                     continue
                 remaining -= envelope.returned_bytes
         return projected
-
-    def prepare_messages(
-        self,
-        messages: list[LLMMessage],
-        *,
-        messages_fit: Callable[[list[LLMMessage]], bool] | None = None,
-    ) -> None:
-        messages[:] = self.project_messages(messages, messages_fit=messages_fit)
 
     def tool_specs(self) -> list[LLMToolDefinition]:
         return [
@@ -695,7 +787,11 @@ class ToolArtifactRuntime:
             return ToolResult(ok=False, content="Artifact read denied: namespace mismatch.")
         if self.usage.internal_tool_calls >= self.policy.max_reads_per_run:
             self.usage.reads_rejected += 1
-            return ToolResult(ok=False, content="Artifact read denied: maximum internal read calls reached.")
+            return ToolResult(
+                ok=False,
+                content="Artifact read denied: maximum internal read calls reached.",
+                metadata={"artifact_read_budget_exhausted": True},
+            )
         artifact_id = arguments.get("artifact_id")
         if isinstance(artifact_id, str) and any(
             key in arguments
@@ -722,7 +818,11 @@ class ToolArtifactRuntime:
         remaining = self.policy.max_total_read_bytes - self.usage.artifact_bytes_read
         if remaining <= 0:
             self.usage.reads_rejected += 1
-            return ToolResult(ok=False, content="Artifact read denied: total artifact read budget reached.")
+            return ToolResult(
+                ok=False,
+                content="Artifact read denied: total artifact read budget reached.",
+                metadata={"artifact_read_budget_exhausted": True},
+            )
         limit = min(requested_limit, self.policy.max_read_bytes, remaining)
         self.usage.internal_tool_calls += 1
         read_query = {"limit": requested_limit} if "limit" in arguments else None

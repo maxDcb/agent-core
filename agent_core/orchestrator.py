@@ -15,6 +15,7 @@ from agent_core.context_planner import (
     active_llm_context_planner,
     llm_context_scope,
 )
+from agent_core.context_projection import LLMContextRequest, context_payloads_need_reader, context_requests_fit
 from agent_core.conversation_state import (
     build_conversation_state_view,
     build_turn_memory_context_view,
@@ -1102,7 +1103,9 @@ class AgentOrchestrator:
             raise RuntimeError("Tool artifact runtime is required during model execution")
         if self.registry.get_tool(READ_ARTIFACT_TOOL_NAME) is not None:
             raise ValueError(f"Tool name is reserved by agent-core: {READ_ARTIFACT_TOOL_NAME}")
-        if artifact_runtime.has_readable_artifacts(messages):
+        if artifact_runtime.has_readable_artifacts(messages) or context_payloads_need_reader(
+            LLMContextRequest(messages=messages, tools=tool_specs, options=options, purpose="conversation_tool_loop"),
+        ):
             tool_specs.extend(artifact_runtime.tool_specs())
         purpose = (
             str(options.metadata.get("target"))
@@ -1110,17 +1113,17 @@ class AgentOrchestrator:
             else "conversation_tool_loop"
         )
 
-        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+        def invoke(projected: list[LLMMessage], effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             if effective_options is not None and self._provider_accepts_options("complete_with_tools"):
                 return self.provider.complete_with_tools(
-                    messages=messages,
+                    messages=projected,
                     tools=tool_specs,
                     model=self.settings.model,
                     temperature=self.settings.temperature,
                     options=effective_options,
                 )
             return self.provider.complete_with_tools(
-                messages=messages,
+                messages=projected,
                 tools=tool_specs,
                 model=self.settings.model,
                 temperature=self.settings.temperature,
@@ -1146,9 +1149,9 @@ class AgentOrchestrator:
             else "conversation_finalization"
         )
 
-        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+        def invoke(projected: list[LLMMessage], effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             kwargs: dict[str, Any] = {
-                "messages": messages,
+                "messages": projected,
                 "tools": [],
                 "model": self.settings.model,
                 "temperature": self.settings.temperature,
@@ -1163,6 +1166,92 @@ class AgentOrchestrator:
             purpose=purpose,
             options=options,
             invoke=invoke,
+        )
+
+    def _direct_finalization_request(self, messages: list[LLMMessage]) -> LLMContextRequest:
+        return LLMContextRequest(
+            messages=[
+                *messages,
+                LLMMessage(
+                    role="system",
+                    content=(
+                        "The remaining model context cannot safely continue the task. No more tools are available. "
+                        "Return the best supported partial answer from observed evidence. State unresolved questions "
+                        "and omitted or unread evidence explicitly. Do not infer missing results."
+                    ),
+                ),
+            ],
+            purpose="conversation_context_finalization",
+            tools=[],
+            options=LLMCallOptions(context_finalization=True, max_output_tokens=self.settings.llm_max_output_tokens),
+        )
+
+    def _complete_capacity_exhausted(
+        self,
+        *,
+        messages: list[LLMMessage],
+        user_input: str,
+        turn_index: int,
+        stop_reason: str,
+    ) -> AgentTurnResult:
+        request = self._direct_finalization_request(messages)
+        try:
+            completion = self._call_final_model_once(messages=request.messages, options=request.options)
+            content = completion.content.strip()
+            if completion.tool_calls or not content:
+                raise ValueError("Context finalization returned no usable text")
+        except (LLMProviderError, ValueError):
+            content = "The investigation stopped at its context limit. Saved evidence remains available; the answer is incomplete."
+        self._persist_conversation_turn(turn_index=turn_index, user_input=user_input, assistant_content=content)
+        self._refresh_memory_after_turn(turn_index=turn_index)
+        return AgentTurnResult(status="completed", content=content, metadata={"stop_reason": stop_reason})
+
+    def _artifact_read_content_fits(
+        self,
+        *,
+        messages: list[LLMMessage],
+        tool_call_id: str,
+        content: str,
+        trailing_tool_calls: list[Any],
+        user_input: str,
+        pending_metadata: dict[str, Any],
+    ) -> bool:
+        candidate = [
+            *messages,
+            LLMMessage(role="tool", tool_call_id=tool_call_id, content=content),
+            *[
+                LLMMessage(role="tool", tool_call_id=call.id, content="Tool call skipped: context capacity reached.")
+                for call in trailing_tool_calls
+            ],
+        ]
+        runtime = active_tool_artifact_runtime()
+        if runtime is None:
+            raise RuntimeError("Tool artifact runtime is required during context admission")
+        tool_specs = [*self.registry.get_tool_specs(), *runtime.tool_specs()]
+        if pending_metadata.get("mode") in {"investigate", "deep_investigate"}:
+            options = RunOptions(**pending_metadata["run_options"])
+            state = InvestigationState.from_any(pending_metadata.get("investigation_state"))
+            if state is None:
+                raise ValueError("Investigation context admission requires controller state")
+            controller = self._build_investigation_controller(
+                prompt_set=self._build_investigation_prompt_set(options=options)
+            )
+            continuation = controller._messages_with_iteration_state(messages=candidate, state=state, iteration=1)
+            final = controller.final_context_request(
+                user_input=user_input,
+                content="",
+                messages=candidate,
+                options=options,
+                state=state,
+                stop_reason="llm_context_exhausted",
+                fallback_complete=False,
+            )
+        else:
+            continuation = candidate
+            final = self._direct_finalization_request(candidate)
+        return context_requests_fit(
+            LLMContextRequest(messages=continuation, tools=tool_specs, purpose="conversation_tool_loop"),
+            final,
         )
 
     def _execute_tool_calls_once(
@@ -1189,6 +1278,7 @@ class AgentOrchestrator:
         tool_statuses = list(existing_tool_statuses or [])
         tool_names = list(existing_tool_names or [])
         tool_budget_exhausted = False
+        tool_capacity_reason: str | None = None
         current_exchange_index = exchange_index if reuse_exchange_index else exchange_index + 1
         effective_pending_metadata_extra = dict(pending_metadata_extra or {})
         if trace is not None:
@@ -1204,6 +1294,15 @@ class AgentOrchestrator:
             if artifact_runtime is None:
                 raise RuntimeError("Tool artifact runtime is required during tool execution")
             is_internal = artifact_runtime.is_internal_tool(tc.name)
+            if tool_capacity_reason is not None:
+                tool_messages.append(LLMMessage(role="tool", tool_call_id=tc.id, content="Tool call skipped: context capacity reached."))
+                messages.append(tool_messages[-1])
+                tool_names.append(tc.name)
+                tool_statuses.append("budget_exhausted")
+                self.session_manager.append_tool_history(self._build_tool_history_item(
+                    tool_name=tc.name, arguments={}, tool_content=tool_messages[-1].content, status="budget_exhausted",
+                ))
+                continue
             if not is_internal and tool_calls_used >= max_tool_calls:
                 logger.error("Tool-call budget exhausted before executing remaining tool calls")
                 tool_budget_exhausted = True
@@ -1264,12 +1363,30 @@ class AgentOrchestrator:
                             "Dispatching tool execution",
                             extra={"tool_name": tc.name, "argument_keys": sorted(arguments.keys())},
                         )
+                        def content_fits(
+                            content: str, call_id: str = tc.id,
+                            trailing: tuple[Any, ...] = tuple(remaining_tool_calls[relative_offset + 1:]),
+                        ) -> bool:
+                            return self._artifact_read_content_fits(
+                                messages=messages, tool_call_id=call_id, content=content,
+                                trailing_tool_calls=list(trailing), user_input=user_input,
+                                pending_metadata=effective_pending_metadata_extra,
+                            )
+
                         result = (
-                            artifact_runtime.execute(tool_name=tc.name, arguments=arguments, context=context)
+                            artifact_runtime.execute(
+                                tool_name=tc.name, arguments=arguments, context=context, content_fits=content_fits,
+                            )
                             if is_internal
                             else self.registry.execute(tc.name, arguments, context)
                         )
                         tool_content = result.content
+                        if result.metadata.get("artifact_read_context_exhausted") is True:
+                            tool_capacity_reason = "llm_context_exhausted"
+                            tool_budget_exhausted = True
+                        elif result.metadata.get("artifact_read_budget_exhausted") is True:
+                            tool_capacity_reason = "artifact_read_budget_exhausted"
+                            tool_budget_exhausted = True
                         if result.pending:
                             pending_id = result.pending_id or self._build_pending_id(
                                 session_id=session_id,
@@ -1411,6 +1528,7 @@ class AgentOrchestrator:
             exchange_index=current_exchange_index,
             tool_calls_used=tool_calls_used,
             budget_exhausted=tool_budget_exhausted,
+            finalization_reason=tool_capacity_reason,
             tool_statuses=tool_statuses,
             tool_names=tool_names,
         )

@@ -207,8 +207,8 @@ the application tool-call budget and do not pass through application
 `PolicyEngine` rules.
 
 If even the smallest UTF-8 chunk cannot fit, the read returns an explicit
-context-capacity error, increments `reads_rejected`, and the structured task
-moves directly to its no-tool finalization call. `eof` is never forged and
+context-capacity error, increments `reads_rejected`, and the conversation or
+structured task moves directly to its no-tool finalization call. `eof` is never forged and
 unread artifact content is never represented as reviewed evidence. Runs without
 an `LLMContextPolicy`, and policies in `observe` mode, retain the fixed-limit
 behavior for compatibility.

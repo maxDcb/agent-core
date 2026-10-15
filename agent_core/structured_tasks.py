@@ -15,6 +15,7 @@ from agent_core.context_planner import (
     active_llm_context_planner,
     llm_context_scope,
 )
+from agent_core.context_projection import LLMContextRequest, context_requests_fit
 from agent_core.execution_context import ExecutionContext
 from agent_core.llm.base import (
     BaseLLMProvider,
@@ -709,6 +710,12 @@ class StructuredTaskRunner:
                 on_budget_reserved=lambda: self._emit_checkpoint(checkpoint, on_checkpoint),
             )
         except LLMProviderError as exc:
+            if exc.kind == "context_overflow" and any(message.role == "tool" for message in checkpoint.messages):
+                checkpoint.phase = "finalization"
+                checkpoint.finalization_kind = "budget"
+                checkpoint.finalization_reason = "The remaining model context cannot safely continue the task."
+                self._emit_checkpoint(checkpoint, on_checkpoint)
+                return None
             logger.error(
                 "Structured task provider failure",
                 extra={"task_id": spec.task_id, "error_kind": exc.kind},
@@ -1217,44 +1224,13 @@ class StructuredTaskRunner:
         ]
         tool_specs = self._structured_tool_specs(registry=registry, messages=candidate_messages)
         tool_options = self._structured_model_options(spec=spec, final_output=False)
-        projected_tool_messages = artifact_runtime.project_messages(
-            candidate_messages,
-            messages_fit=lambda projected: context_planner.can_plan_call(
-                messages=projected,
-                tools=tool_specs,
-                purpose="structured_tool_loop",
-                options=tool_options,
-            ),
-        )
-        if not context_planner.can_plan_call(
-            messages=projected_tool_messages,
-            tools=tool_specs,
-            purpose="structured_tool_loop",
-            options=tool_options,
-        ):
-            return False
-
-        final_reason = "The remaining model context cannot safely hold another artifact chunk."
         final_messages = self._build_finalization_messages(
-            spec=spec,
-            messages=candidate_messages,
-            failure_reason=final_reason,
+            spec=spec, messages=candidate_messages,
+            failure_reason="The remaining model context cannot safely hold another artifact chunk.",
         )
-        final_options = self._structured_finalization_options(spec=spec)
-        projected_final_messages = artifact_runtime.project_messages(
-            final_messages,
-            messages_fit=lambda projected: context_planner.can_plan_call(
-                messages=projected,
-                tools=[],
-                purpose="structured_finalization",
-                options=final_options,
-            ),
-        )
-        return context_planner.can_plan_call(
-            messages=projected_final_messages,
-            tools=[],
-            purpose="structured_finalization",
-            options=final_options,
+        return context_requests_fit(
+            LLMContextRequest(messages=candidate_messages, tools=tool_specs, purpose="structured_tool_loop", options=tool_options),
+            LLMContextRequest(messages=final_messages, tools=[], purpose="structured_finalization", options=self._structured_finalization_options(spec=spec)),
         )
 
     def _structured_tool_specs(
@@ -1294,6 +1270,7 @@ class StructuredTaskRunner:
 
     def _structured_finalization_options(self, *, spec: StructuredTaskSpec) -> LLMCallOptions:
         return LLMCallOptions(
+            context_finalization=True,
             response_format=_response_format_for_spec(spec, final_output=True),
             response_format_fallback=None,
             max_output_tokens=_clean_optional_positive_int(self.settings.llm_max_output_tokens),
@@ -1345,7 +1322,7 @@ class StructuredTaskRunner:
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
 
-        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+        def invoke(projected: list[LLMMessage], effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             logger.info(
                 "Structured task LLM request prepared",
                 extra={
@@ -1363,10 +1340,10 @@ class StructuredTaskRunner:
                         effective_options.response_format_fallback if effective_options is not None else None
                     ),
                     "max_output_tokens": effective_options.max_output_tokens if effective_options is not None else None,
-                    **_message_content_stats(messages),
+                    **_message_content_stats(projected),
                 },
             )
-            effective_kwargs = dict(kwargs)
+            effective_kwargs = {**kwargs, "messages": projected}
             if effective_options is not None and self._provider_accepts_options("complete_with_tools"):
                 effective_kwargs["options"] = effective_options
             return self.provider.complete_with_tools(**effective_kwargs)
@@ -1401,7 +1378,7 @@ class StructuredTaskRunner:
             "temperature": spec.temperature if spec.temperature is not None else self.settings.temperature,
         }
 
-        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+        def invoke(projected: list[LLMMessage], effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             logger.info(
                 "Structured task finalization LLM request prepared",
                 extra={
@@ -1418,10 +1395,10 @@ class StructuredTaskRunner:
                         effective_options.response_format_fallback if effective_options is not None else None
                     ),
                     "max_output_tokens": effective_options.max_output_tokens if effective_options is not None else None,
-                    **_message_content_stats(final_messages),
+                    **_message_content_stats(projected),
                 },
             )
-            effective_kwargs = dict(kwargs)
+            effective_kwargs = {**kwargs, "messages": projected}
             if effective_options is not None and self._provider_accepts_options("complete_with_tools"):
                 effective_kwargs["options"] = effective_options
             return self.provider.complete_with_tools(**effective_kwargs)

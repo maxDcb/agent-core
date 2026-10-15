@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from inspect import Parameter, signature
 from typing import Any, Generic, TypeVar
 
+from agent_core.context_projection import context_payload_message
 from agent_core.llm.base import BaseLLMProvider, LLMCallOptions, LLMCompletionResult, LLMMessage, completion_content
 from agent_core.llm_budget import run_budgeted_llm_call
 from agent_core.logging_utils import get_logger, safe_preview
@@ -26,6 +27,8 @@ class StructuredSynthesisRequest(Generic[T]):
     payload: dict[str, Any]
     parser: Callable[[object], T | None]
     options: LLMCallOptions | None = None
+    project_payload: bool = False
+    protected_payload_fields: tuple[str, ...] = ()
 
 
 class StructuredSynthesizer:
@@ -52,7 +55,8 @@ class StructuredSynthesizer:
         )
         messages = [
             LLMMessage(role="system", content=system_prompt),
-            LLMMessage(role="user", content=json.dumps(request.payload, ensure_ascii=False, indent=2)),
+            context_payload_message(role="user", payload=request.payload, protected_fields=request.protected_payload_fields)
+            if request.project_payload else LLMMessage(role="user", content=json.dumps(request.payload, ensure_ascii=False, indent=2)),
         ]
 
         if self.settings.log_synthesis_payloads:
@@ -97,16 +101,16 @@ class StructuredSynthesizer:
         options: LLMCallOptions | None,
         purpose: str,
     ) -> str:
-        def invoke(effective_options: LLMCallOptions | None) -> LLMCompletionResult:
+        def invoke(projected: list[LLMMessage], effective_options: LLMCallOptions | None) -> LLMCompletionResult:
             if effective_options is not None and self._provider_accepts_options("complete_text"):
                 return self.provider.complete_text(
-                    messages=messages,
+                    messages=projected,
                     model=self.settings.memory_model,
                     temperature=self.settings.memory_temperature,
                     options=effective_options,
                 )
             return self.provider.complete_text(
-                messages=messages,
+                messages=projected,
                 model=self.settings.memory_model,
                 temperature=self.settings.memory_temperature,
             )

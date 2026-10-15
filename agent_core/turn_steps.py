@@ -15,6 +15,7 @@ class ToolExecutionStepResult:
     tool_calls_used: int
     pending_result: AgentTurnResult | None = None
     budget_exhausted: bool = False
+    finalization_reason: str | None = None
     tool_statuses: list[ToolExecutionStatus] = field(default_factory=list)
     tool_names: list[str] = field(default_factory=list)
 

@@ -413,15 +413,27 @@ context_policy = LLMContextPolicy(
 options = RunOptions.investigate(llm_context_policy=context_policy)
 ```
 
-Enforcement preserves system messages and the current user request. It removes
-complete older history groups when needed, keeping tool calls paired with their
-responses. Investigation assistant steps may also remove older exchanges from
-the current turn after their results have been reflected into controller state;
-the latest exchange and artifact references remain available. This changes only
-the provider-facing request, not persisted exchange history. Direct turns keep
-the entire current exchange sequence. If mandatory context still cannot fit,
-the call is rejected before provider invocation with `LLMContextOverflowError`.
-`mode="observe"` records the overflow without changing the request.
+Conversation and structured tasks use the same admission policy. The provider
+receives a projected copy; the complete transcript remains available for audit
+and checkpoint resume. Large runtime state payloads receive a bounded view and
+an exact source artifact reference. When older exchanges must leave the prompt,
+their full transcript is archived with bounded tool-data excerpts and explicit
+uncertainty. No extra model call is needed to create these projections.
+
+System instructions, the current user request, and the latest exchange remain
+mandatory during execution. Tool calls stay paired with their responses. A
+no-tool finalization may also archive the latest exchange to return a supported
+partial answer. Before delivering an artifact page, the runtime verifies both
+the continuation and its actual finalization envelope, including the output
+schema and output reserve. Reads shrink to fit; exhausted context or read budgets
+stop further tools and lead to finalization in both conversation and structured
+tasks. Runtime payloads in investigation reflection, decision, critique and final
+rendering use the same projection.
+
+Fixed instructions, live requests and provider schemas are never silently
+truncated. If these cannot fit even after projection, `LLMContextOverflowError`
+still rejects the call before provider invocation. `mode="observe"` records the
+overflow without compacting runtime payloads or archiving exchanges.
 
 Results expose `llm_context_policy` and `llm_context_usage`; pending turns and
 structured checkpoints persist the same planner usage across resume. Token

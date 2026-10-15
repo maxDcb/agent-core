@@ -67,7 +67,7 @@ class InvestigationOperations(Protocol):
     ) -> list[LLMMessage]: ...
 
     def _call_options(
-        self, *, options: RunOptions, target: str, state: InvestigationState | None = None,
+        self, *, options: RunOptions, target: str,
     ) -> LLMCallOptions: ...
 
     def call_model_once(
@@ -286,10 +286,16 @@ class InvestigationTurnNodes:
             llm_response = self.operations.call_model_once(
                 messages=assistant_messages,
                 options=self.operations._call_options(
-                    options=options, target="assistant_step", state=investigation_state,
+                    options=options, target="assistant_step",
                 ),
             )
         except LLMProviderError as exc:
+            if exc.kind == "context_overflow" and any(message.role == "tool" for message in messages):
+                return {"result": self.operations._complete_with_budget_answer(
+                    user_input=state["user_input"], turn_index=state["turn_index"], options=options, state=investigation_state,
+                    messages=messages, iterations_used=iterations_used, tool_calls_used=state["tool_calls_used"],
+                    stop_reason="llm_context_exhausted",
+                )}
             self.operations._record_event(
                 event_type="llm_provider_failure",
                 summary="Assistant step provider failure handled",
@@ -492,7 +498,7 @@ class InvestigationTurnNodes:
                 messages=state["messages"],
                 iterations_used=state["iterations_used"],
                 tool_calls_used=state["tool_calls_used"],
-                stop_reason="max_tool_calls",
+                stop_reason=(state["tool_step"].finalization_reason or "max_tool_calls") if state["tool_step"] is not None else "max_tool_calls",
             )
         }
 

@@ -92,7 +92,7 @@ def test_planner_rejects_mandatory_context_before_provider_call() -> None:
     ]
     invoked = False
 
-    def invoke(options: LLMCallOptions | None) -> LLMCompletionResult:
+    def invoke(projected: list[LLMMessage], options: LLMCallOptions | None) -> LLMCompletionResult:
         nonlocal invoked
         invoked = True
         return LLMCompletionResult(content="unexpected")
@@ -165,7 +165,7 @@ def test_planner_compacts_older_current_turn_exchanges_when_requested() -> None:
         messages=messages,
         tools=None,
         purpose="assistant_step",
-        options=LLMCallOptions(compact_current_turn=True),
+        options=None, compact_current_turn=True,
     )
 
     assert planned == expected
@@ -189,7 +189,7 @@ def test_planner_keeps_current_user_when_compacting_before_first_exchange() -> N
         messages=[system, LLMMessage(role="user", content="old request " * 100), current_user],
         tools=None,
         purpose="assistant_step",
-        options=LLMCallOptions(compact_current_turn=True),
+        options=None, compact_current_turn=True,
     )
 
     assert planned == expected
@@ -224,8 +224,8 @@ def test_observe_mode_reports_overflow_without_changing_request() -> None:
             messages=messages,
             purpose="observe",
             options=None,
-            invoke=lambda options: (
-                seen_messages.extend(messages),
+            invoke=lambda projected, options: (
+                seen_messages.extend(projected),
                 seen_options.append(options),
                 LLMCompletionResult(content="ok"),
             )[-1],
@@ -290,7 +290,7 @@ def test_budget_accounts_for_context_after_planning() -> None:
                 messages=messages,
                 purpose="planned_then_budgeted",
                 options=None,
-                invoke=lambda options: provider_messages.extend(messages) or LLMCompletionResult(content="ok"),
+                invoke=lambda projected, options: provider_messages.extend(projected) or LLMCompletionResult(content="ok"),
             )
 
     assert provider_messages == [system, current]

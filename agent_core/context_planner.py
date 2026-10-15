@@ -227,6 +227,9 @@ class LLMContextPlanner:
         tools: object,
         purpose: str,
         options: LLMCallOptions | None,
+        compact_current_turn: bool = False,
+        preserve_latest: bool = True,
+        source_messages: list[LLMMessage] | None = None,
     ) -> tuple[list[LLMMessage], LLMCallOptions | None, LLMContextPlan]:
         purpose = purpose.strip() or "unspecified"
         output_reserve = (
@@ -237,27 +240,30 @@ class LLMContextPlanner:
         output_reserve = max(1, output_reserve)
         max_input_tokens = self.policy.max_context_tokens - output_reserve - self.policy.safety_margin_tokens
         original_tokens = estimate_llm_input_tokens(messages=messages, tools=tools, options=options)
+        source_tokens = original_tokens if source_messages is None else estimate_llm_input_tokens(messages=source_messages, tools=tools, options=options)
+        source_count = len(messages) if source_messages is None else len(source_messages)
 
         if original_tokens <= max_input_tokens or self.policy.mode == "observe":
             plan = LLMContextPlan(
                 purpose=purpose,
-                original_input_tokens=original_tokens,
+                original_input_tokens=source_tokens,
                 planned_input_tokens=original_tokens,
                 max_input_tokens=max_input_tokens,
                 reserved_output_tokens=output_reserve,
-                original_message_count=len(messages),
+                original_message_count=source_count,
                 planned_message_count=len(messages),
                 removed_message_count=0,
                 removed_group_count=0,
                 fits=original_tokens <= max_input_tokens,
-                compacted=False,
+                compacted=source_tokens > original_tokens,
             )
             self._record(plan)
             return list(messages), self._effective_options(options, output_reserve), plan
 
         groups = _group_messages(
             messages,
-            compact_current_turn=options.compact_current_turn if options is not None else False,
+            compact_current_turn=compact_current_turn,
+            preserve_latest=preserve_latest,
         )
         mandatory_indices = {group.index for group in groups if group.mandatory}
         selected_indices = set(mandatory_indices)
@@ -270,16 +276,16 @@ class LLMContextPlanner:
         if mandatory_tokens > max_input_tokens:
             plan = LLMContextPlan(
                 purpose=purpose,
-                original_input_tokens=original_tokens,
+                original_input_tokens=source_tokens,
                 planned_input_tokens=mandatory_tokens,
                 max_input_tokens=max_input_tokens,
                 reserved_output_tokens=output_reserve,
-                original_message_count=len(messages),
+                original_message_count=source_count,
                 planned_message_count=len(mandatory_messages),
-                removed_message_count=len(messages) - len(mandatory_messages),
+                removed_message_count=max(0, source_count - len(mandatory_messages)),
                 removed_group_count=len(groups) - len(selected_indices),
                 fits=False,
-                compacted=len(mandatory_messages) != len(messages),
+                compacted=source_tokens > mandatory_tokens,
             )
             self._record(plan)
             raise LLMContextOverflowError(
@@ -307,16 +313,16 @@ class LLMContextPlanner:
         planned_tokens = estimate_llm_input_tokens(messages=planned_messages, tools=tools, options=options)
         plan = LLMContextPlan(
             purpose=purpose,
-            original_input_tokens=original_tokens,
+            original_input_tokens=source_tokens,
             planned_input_tokens=planned_tokens,
             max_input_tokens=max_input_tokens,
             reserved_output_tokens=output_reserve,
-            original_message_count=len(messages),
+            original_message_count=source_count,
             planned_message_count=len(planned_messages),
-            removed_message_count=len(messages) - len(planned_messages),
+            removed_message_count=max(0, source_count - len(planned_messages)),
             removed_group_count=len(groups) - len(selected_indices),
             fits=planned_tokens <= max_input_tokens,
-            compacted=len(planned_messages) != len(messages),
+            compacted=source_tokens > planned_tokens,
         )
         self._record(plan)
         return planned_messages, self._effective_options(options, output_reserve), plan
@@ -383,7 +389,7 @@ class LLMContextPlanner:
 
 
 def _group_messages(
-    messages: list[LLMMessage], *, compact_current_turn: bool = False,
+    messages: list[LLMMessage], *, compact_current_turn: bool = False, preserve_latest: bool = True,
 ) -> list[_MessageGroup]:
     groups: list[_MessageGroup] = []
     last_user_index = max(
@@ -397,8 +403,10 @@ def _group_messages(
         group_messages = [message]
         if (
             message.role == "user"
+            and (not compact_current_turn or start_index != last_user_index)
             and index + 1 < len(messages)
             and messages[index + 1].role == "assistant"
+            and not messages[index + 1].metadata.get("context_handoff")
             and not messages[index + 1].tool_calls
         ):
             group_messages.append(messages[index + 1])
@@ -423,12 +431,13 @@ def _group_messages(
                 messages=group_messages,
                 mandatory=(
                     message.role == "system"
+                    or any(item.metadata.get("context_handoff") is True for item in group_messages)
                     or start_index == last_user_index
                     or (not compact_current_turn and last_user_index >= 0 and index > last_user_index)
                 ),
             )
         )
-    if compact_current_turn and last_user_index >= 0:
+    if compact_current_turn and preserve_latest and last_user_index >= 0:
         last_user_group_index = next(
             group.index for group in groups if group.messages[0] is messages[last_user_index]
         )

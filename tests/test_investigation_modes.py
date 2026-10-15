@@ -644,9 +644,9 @@ def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) ->
 def test_investigation_compacts_older_exchange_without_losing_persisted_evidence(tmp_path) -> None:
     def provider_for_run() -> ScriptedProvider:
         first_call = tool_call(value="first", call_id="first")
-        first_call.content = "earlier model analysis " * 160
+        first_call.content = "earlier model analysis " * 400
         second_call = tool_call(value="second", call_id="second")
-        second_call.content = "recent model analysis " * 160
+        second_call.content = "recent model analysis " * 400
         return ScriptedProvider(
             chat=[first_call, second_call, LLMCompletionResult(content="Investigation finished.")],
             reflections=[
@@ -674,7 +674,7 @@ def test_investigation_compacts_older_exchange_without_losing_persisted_evidence
     ]
     input_limit = estimate_llm_input_tokens(
         messages=without_first_exchange, tools=baseline_provider.chat_tools[2],
-    ) + 20
+    ) + 800
     assert estimate_llm_input_tokens(
         messages=third_call_messages, tools=baseline_provider.chat_tools[2],
     ) > input_limit
@@ -729,7 +729,6 @@ def test_investigation_keeps_tool_history_after_reflection_recovery(tmp_path, ba
     )
 
     assert result.status == "completed"
-    assert provider.tool_options[1].compact_current_turn is False
     assert any(
         call.id == "unreflected"
         for message in provider.chat_messages[1]
@@ -739,7 +738,46 @@ def test_investigation_keeps_tool_history_after_reflection_recovery(tmp_path, ba
         message.content for message in provider.chat_messages[1]
         if message.role == "system" and message.content.startswith(INVESTIGATION_STATE_MESSAGE_PREFIX)
     ]
-    assert json.loads(state_messages[0].splitlines()[-1])["unreflected_tool_exchanges"] is True
+    assert json.loads(state_messages[0].splitlines()[-1])["facts"] == []
+
+
+@pytest.mark.parametrize("backend", ["native", "langgraph"])
+def test_large_investigation_state_is_projected_for_every_call(tmp_path, backend) -> None:
+    from agent_core.investigation_state import InvestigationState
+
+    class BoundedProvider(ScriptedProvider):
+        def check(self, messages, tools, options):
+            assert estimate_llm_input_tokens(messages=messages, tools=tools, options=options) <= 8872
+
+        def complete_text(self, *, messages, model, temperature, options=None):
+            self.check(messages, [], options)
+            return super().complete_text(messages=messages, model=model, temperature=temperature, options=options)
+
+        def complete_with_tools(self, *, messages, tools, model, temperature, options=None):
+            self.check(messages, tools, options)
+            return super().complete_with_tools(messages=messages, tools=tools, model=model, temperature=temperature, options=options)
+
+    plan = InvestigationState.create_template(objective="inspect").to_dict()
+    plan["facts"] = [{"id": f"fact-{i}", "source": "observed_tool", "summary": f"observation-{i}:" + "x" * 1000} for i in range(300)]
+    provider = BoundedProvider(
+        chat=[tool_call(value="fresh")], plans=[plan],
+        reflections=[reflection_payload(new_facts=["fresh observation"], should_continue=False)],
+        decisions=[decision_payload("final")],
+        finals=[LLMCompletionResult(content="Partial response with archived evidence and explicit uncertainty.")],
+    )
+    orchestrator = build_orchestrator(tmp_path, provider, agent_kernel_backend=backend)
+    orchestrator.settings.llm_max_output_tokens = 128
+    result = run_turn(
+        orchestrator, "inspect",
+        options=RunOptions.investigate(
+            llm_context_policy=LLMContextPolicy(max_context_tokens=9000, reserved_output_tokens=128, safety_margin_tokens=0),
+        ),
+    )
+    assert result.status == "completed"
+    assert len(result.metadata["investigation_state"]["facts"]) == 301
+    assert result.metadata["llm_context_usage"]["calls_compacted"] >= 3
+    final_payload = json.loads(provider.chat_messages[-1][-1].content)
+    assert final_payload["_context_projection"]["complete"] is False
 
 
 def test_investigation_does_not_finalize_when_reflection_requires_continuation(tmp_path) -> None:
