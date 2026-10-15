@@ -255,7 +255,10 @@ class LLMContextPlanner:
             self._record(plan)
             return list(messages), self._effective_options(options, output_reserve), plan
 
-        groups = _group_messages(messages)
+        groups = _group_messages(
+            messages,
+            compact_current_turn=options.compact_current_turn if options is not None else False,
+        )
         mandatory_indices = {group.index for group in groups if group.mandatory}
         selected_indices = set(mandatory_indices)
         mandatory_messages = _flatten_selected(groups, selected_indices)
@@ -379,7 +382,9 @@ class LLMContextPlanner:
         self.usage.last_plan = plan.to_dict()
 
 
-def _group_messages(messages: list[LLMMessage]) -> list[_MessageGroup]:
+def _group_messages(
+    messages: list[LLMMessage], *, compact_current_turn: bool = False,
+) -> list[_MessageGroup]:
     groups: list[_MessageGroup] = []
     last_user_index = max(
         (index for index, message in enumerate(messages) if message.role == "user"),
@@ -387,6 +392,7 @@ def _group_messages(messages: list[LLMMessage]) -> list[_MessageGroup]:
     )
     index = 0
     while index < len(messages):
+        start_index = index
         message = messages[index]
         group_messages = [message]
         if (
@@ -415,9 +421,21 @@ def _group_messages(messages: list[LLMMessage]) -> list[_MessageGroup]:
             _MessageGroup(
                 index=group_index,
                 messages=group_messages,
-                mandatory=message.role == "system" or (last_user_index >= 0 and index > last_user_index),
+                mandatory=(
+                    message.role == "system"
+                    or start_index == last_user_index
+                    or (not compact_current_turn and last_user_index >= 0 and index > last_user_index)
+                ),
             )
         )
+    if compact_current_turn and last_user_index >= 0:
+        last_user_group_index = next(
+            group.index for group in groups if group.messages[0] is messages[last_user_index]
+        )
+        for group in reversed(groups[last_user_group_index + 1:]):
+            if group.messages[0].role not in {"system", "user"}:
+                group.mandatory = True
+                break
     if last_user_index < 0:
         for group in reversed(groups):
             if any(message.role != "system" for message in group.messages):

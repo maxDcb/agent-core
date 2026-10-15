@@ -5,6 +5,7 @@ from typing import Any
 
 import pytest
 
+from agent_core.context_planner import LLMContextPolicy, estimate_llm_input_tokens
 from agent_core.domain_hooks import DomainHooks
 from agent_core.investigation_controller import INVESTIGATION_STATE_MESSAGE_PREFIX
 from agent_core.investigation_prompts import InvestigationPromptSet
@@ -636,6 +637,109 @@ def test_investigation_reflection_can_resolve_previous_evidence_gap(tmp_path) ->
     assert second_iteration_state["facts"][0]["summary"] == "navigation succeeded"
     assert second_iteration_state["evidence_gaps"] == ["browser_snapshot not yet performed"]
     assert second_iteration_state["next_actions"] == ["run browser_snapshot"]
+    assert len(second_iteration_state["tool_artifact_ids"]) == 1
+    assert second_iteration_state["tool_artifact_ids"][0].startswith("art_")
+
+
+def test_investigation_compacts_older_exchange_without_losing_persisted_evidence(tmp_path) -> None:
+    def provider_for_run() -> ScriptedProvider:
+        first_call = tool_call(value="first", call_id="first")
+        first_call.content = "earlier model analysis " * 160
+        second_call = tool_call(value="second", call_id="second")
+        second_call.content = "recent model analysis " * 160
+        return ScriptedProvider(
+            chat=[first_call, second_call, LLMCompletionResult(content="Investigation finished.")],
+            reflections=[
+                reflection_payload(new_facts=["first observation"], recommended_next_actions=["check second"],
+                                   observation_summary="first observed"),
+                reflection_payload(new_facts=["second observation"], recommended_next_actions=[],
+                                   observation_summary="second observed"),
+            ],
+            decisions=[decision_payload("continue"), decision_payload("continue")],
+        )
+
+    baseline_provider = provider_for_run()
+    baseline_orchestrator = build_orchestrator(tmp_path / "baseline", baseline_provider)
+    baseline = run_turn(
+        baseline_orchestrator,
+        "investigate",
+        options=RunOptions(mode="investigate", max_iterations=3, require_initial_plan=False),
+    )
+    assert baseline.status == "completed"
+    third_call_messages = baseline_provider.chat_messages[2]
+    without_first_exchange = [
+        message for message in third_call_messages
+        if message.tool_call_id != "first"
+        and not any(call.id == "first" for call in message.tool_calls)
+    ]
+    input_limit = estimate_llm_input_tokens(
+        messages=without_first_exchange, tools=baseline_provider.chat_tools[2],
+    ) + 20
+    assert estimate_llm_input_tokens(
+        messages=third_call_messages, tools=baseline_provider.chat_tools[2],
+    ) > input_limit
+
+    provider = provider_for_run()
+    orchestrator = build_orchestrator(tmp_path / "bounded", provider)
+    orchestrator.settings.llm_max_output_tokens = 128
+    result = run_turn(
+        orchestrator,
+        "investigate",
+        options=RunOptions(
+            mode="investigate", max_iterations=3, require_initial_plan=False,
+            llm_context_policy=LLMContextPolicy(
+                max_context_tokens=input_limit + 128,
+                reserved_output_tokens=128,
+                safety_margin_tokens=0,
+            ),
+        ),
+    )
+
+    assert result.status == "completed"
+    assert result.metadata["llm_context_usage"]["calls_compacted"] >= 1
+    third_call = provider.chat_messages[2]
+    assert not any(call.id == "first" for message in third_call for call in message.tool_calls)
+    assert any(call.id == "second" for message in third_call for call in message.tool_calls)
+    journal = orchestrator.session_manager.get_memory_journal()
+    assert len([exchange for exchange in journal.exchanges if exchange.kind == "tool_exchange"]) == 2
+
+
+@pytest.mark.parametrize("backend", ["native", "langgraph"])
+def test_investigation_keeps_tool_history_after_reflection_recovery(tmp_path, backend: str) -> None:
+    class InvalidReflectionProvider(ScriptedProvider):
+        def complete_text(self, *, messages, model, temperature, options=None):
+            if options is not None and options.metadata.get("target") == "investigation_step_reflection":
+                return "invalid reflection"
+            return super().complete_text(
+                messages=messages, model=model, temperature=temperature, options=options,
+            )
+
+    provider = InvalidReflectionProvider(
+        chat=[tool_call(value="unreflected", call_id="unreflected"), LLMCompletionResult(content="Stop.")],
+    )
+    orchestrator = build_orchestrator(tmp_path, provider, agent_kernel_backend=backend)
+
+    result = run_turn(
+        orchestrator,
+        "investigate",
+        options=RunOptions(
+            mode="investigate", max_iterations=2, require_initial_plan=False,
+            recover_internal_synthesis_errors=True,
+        ),
+    )
+
+    assert result.status == "completed"
+    assert provider.tool_options[1].compact_current_turn is False
+    assert any(
+        call.id == "unreflected"
+        for message in provider.chat_messages[1]
+        for call in message.tool_calls
+    )
+    state_messages = [
+        message.content for message in provider.chat_messages[1]
+        if message.role == "system" and message.content.startswith(INVESTIGATION_STATE_MESSAGE_PREFIX)
+    ]
+    assert json.loads(state_messages[0].splitlines()[-1])["unreflected_tool_exchanges"] is True
 
 
 def test_investigation_does_not_finalize_when_reflection_requires_continuation(tmp_path) -> None:

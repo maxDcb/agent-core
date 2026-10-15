@@ -123,6 +123,7 @@ class TraceRecorder(Protocol):
 
 
 INVESTIGATION_STATE_MESSAGE_PREFIX = "Investigation controller state:"
+UNREFLECTED_EXCHANGES_KEY = "_agent_core_unreflected_tool_exchanges"
 
 
 def with_investigation_guidance(
@@ -379,7 +380,7 @@ class InvestigationController:
                 )
                 llm_response = self.call_model_once(
                     messages=assistant_messages,
-                    options=self._call_options(options=options, target="assistant_step"),
+                    options=self._call_options(options=options, target="assistant_step", state=state),
                 )
             except LLMProviderError as exc:
                 self._record_event(
@@ -596,6 +597,7 @@ class InvestigationController:
         except ValueError as exc:
             if not options.recover_internal_synthesis_errors:
                 raise
+            state.metadata[UNREFLECTED_EXCHANGES_KEY] = True
             logger.warning(
                 "Investigation reflection synthesis failed; continuing without state update",
                 extra={"error_preview": safe_preview(str(exc), limit=200)},
@@ -1458,6 +1460,8 @@ class InvestigationController:
             "risk_notes": list(state.risk_notes),
             "confidence": state.confidence,
             "stop_reason": state.stop_reason,
+            "tool_artifact_ids": state.metadata.get("tool_artifact_ids", []),
+            "unreflected_tool_exchanges": state.metadata.get(UNREFLECTED_EXCHANGES_KEY) is True,
         }
         state_message = LLMMessage(
             role="system",
@@ -1476,11 +1480,18 @@ class InvestigationController:
             return [*messages[:-1], state_message, messages[-1]]
         return [*messages, state_message]
 
-    def _call_options(self, *, options: RunOptions, target: str) -> LLMCallOptions:
+    def _call_options(
+        self, *, options: RunOptions, target: str, state: InvestigationState | None = None,
+    ) -> LLMCallOptions:
         return LLMCallOptions(
             reasoning_effort=options.reasoning_effort,
             reasoning_summary=options.reasoning_summary,
             response_format={"type": "json_object"} if target != "assistant_step" else None,
+            compact_current_turn=(
+                target == "assistant_step"
+                and state is not None
+                and state.metadata.get(UNREFLECTED_EXCHANGES_KEY) is not True
+            ),
             metadata={"mode": options.mode, "target": target, **options.metadata},
         )
 

@@ -413,12 +413,15 @@ context_policy = LLMContextPolicy(
 options = RunOptions.investigate(llm_context_policy=context_policy)
 ```
 
-Enforcement preserves all system messages and the complete current turn,
-including each assistant tool call with all matching tool responses. If the
-request is too large, it removes only complete older history groups, newest
-first. If the mandatory context still cannot fit, the call is rejected before
-provider invocation with `LLMContextOverflowError`. `mode="observe"` records
-the overflow without changing the request.
+Enforcement preserves system messages and the current user request. It removes
+complete older history groups when needed, keeping tool calls paired with their
+responses. Investigation assistant steps may also remove older exchanges from
+the current turn after their results have been reflected into controller state;
+the latest exchange and artifact references remain available. This changes only
+the provider-facing request, not persisted exchange history. Direct turns keep
+the entire current exchange sequence. If mandatory context still cannot fit,
+the call is rejected before provider invocation with `LLMContextOverflowError`.
+`mode="observe"` records the overflow without changing the request.
 
 Results expose `llm_context_policy` and `llm_context_usage`; pending turns and
 structured checkpoints persist the same planner usage across resume. Token

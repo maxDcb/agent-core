@@ -66,7 +66,9 @@ class InvestigationOperations(Protocol):
         iteration: int,
     ) -> list[LLMMessage]: ...
 
-    def _call_options(self, *, options: RunOptions, target: str) -> LLMCallOptions: ...
+    def _call_options(
+        self, *, options: RunOptions, target: str, state: InvestigationState | None = None,
+    ) -> LLMCallOptions: ...
 
     def call_model_once(
         self,
@@ -283,7 +285,9 @@ class InvestigationTurnNodes:
             )
             llm_response = self.operations.call_model_once(
                 messages=assistant_messages,
-                options=self.operations._call_options(options=options, target="assistant_step"),
+                options=self.operations._call_options(
+                    options=options, target="assistant_step", state=investigation_state,
+                ),
             )
         except LLMProviderError as exc:
             self.operations._record_event(

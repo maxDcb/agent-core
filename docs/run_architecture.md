@@ -78,9 +78,12 @@ every provider call. The planner measures the complete request envelope:
 messages, tool definitions and structured response schema. It subtracts the
 configured output reserve and safety margin from the provider context window,
 then removes only complete historical message groups until the request fits.
-System messages and the entire current user/tool turn are mandatory, so tool
-calls are never separated from their responses. An irreducible overflow fails
-before provider invocation. Planner aggregates are persisted in pending turns
+System messages and the current user request are mandatory. Direct mode also
+keeps the whole current tool turn. Investigation assistant steps may omit older
+completed tool exchanges from the provider request once controller reflections
+carry their facts and artifact references; the latest exchange remains mandatory.
+Tool calls are never separated from their responses, and persisted exchanges are
+unchanged. An irreducible overflow fails before provider invocation. Planner aggregates are persisted in pending turns
 and structured checkpoints and exposed in final metadata.
 
 Tool-result artifact storage is always active. Every application-tool result is

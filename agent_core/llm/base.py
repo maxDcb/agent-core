@@ -349,6 +349,8 @@ class LLMCallOptions:
     response_format: dict[str, Any] | None = None
     response_format_fallback: dict[str, Any] | None = None
     max_output_tokens: int | None = None
+    # Enable only when a mandatory state message carries earlier exchange results.
+    compact_current_turn: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

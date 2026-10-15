@@ -141,6 +141,60 @@ def test_planner_never_drops_current_turn_tool_results_to_make_room() -> None:
         )
 
 
+def test_planner_compacts_older_current_turn_exchanges_when_requested() -> None:
+    system = LLMMessage(role="system", content="system")
+    user = LLMMessage(role="user", content="investigate")
+    first_exchange = _tool_exchange()
+    latest_exchange = [
+        LLMMessage(
+            role="assistant",
+            content="",
+            tool_calls=[LLMToolCall(id="call-2", name="lookup", arguments_json='{"q":"latest"}')],
+        ),
+        LLMMessage(role="tool", content="latest evidence", tool_call_id="call-2"),
+    ]
+    state = LLMMessage(role="system", content="Controller state contains reflected evidence and artifact references")
+    expected = [system, user, *latest_exchange, state]
+    messages = [system, user, *first_exchange, *latest_exchange, state]
+    max_input = estimate_llm_input_tokens(messages=expected)
+    planner = LLMContextPlanner(
+        LLMContextPolicy(max_context_tokens=max_input + 40, reserved_output_tokens=40, safety_margin_tokens=0)
+    )
+
+    planned, _, plan = planner.plan_call(
+        messages=messages,
+        tools=None,
+        purpose="assistant_step",
+        options=LLMCallOptions(compact_current_turn=True),
+    )
+
+    assert planned == expected
+    assert plan.removed_message_count == 2
+    assert messages == [system, user, *first_exchange, *latest_exchange, state]
+
+
+def test_planner_keeps_current_user_when_compacting_before_first_exchange() -> None:
+    system = LLMMessage(role="system", content="system")
+    current_user = LLMMessage(role="user", content="current request")
+    expected = [system, current_user]
+    planner = LLMContextPlanner(
+        LLMContextPolicy(
+            max_context_tokens=estimate_llm_input_tokens(messages=expected) + 20,
+            reserved_output_tokens=20,
+            safety_margin_tokens=0,
+        )
+    )
+
+    planned, _, _ = planner.plan_call(
+        messages=[system, LLMMessage(role="user", content="old request " * 100), current_user],
+        tools=None,
+        purpose="assistant_step",
+        options=LLMCallOptions(compact_current_turn=True),
+    )
+
+    assert planned == expected
+
+
 def test_observe_mode_reports_overflow_without_changing_request() -> None:
     messages = [
         LLMMessage(role="system", content="system " * 100),
