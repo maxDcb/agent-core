@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+## 0.6.0
+
+- Unified provider-facing context admission for conversation, investigation,
+  structured tasks, and synthesis. The full transcript and runtime payloads
+  remain persisted while a bounded provider view can reference archived data.
+- Archived older tool exchanges and large marked runtime payloads through the
+  existing artifact store, with explicit incomplete views and on-demand reads.
+- Applied the same context projection when checking whether artifact reads and
+  finalization requests can fit, without charging read budgets for probes.
+- Preserved an atomic latest exchange during tool-using turns and allowed
+  no-tool finalization to archive it when required by the context window.
+- Added Juice Shop checkpoint validation of the context projection. Fixed
+  instructions, schemas, or memory synthesis inputs can still exceed a small
+  configured window; deterministic memory fallback remains available.
+
 ## 0.5.0
 
 - Added `AgentRunService.continue_run()` to continue a completed structured run

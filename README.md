@@ -7,7 +7,7 @@ their own prompts, tools, policy rules, storage and domain memory. It is meant
 to be the generic runtime under an agent application, not a domain-specific
 agent package.
 
-Version `0.5.0` is an alpha release. The runtime is usable and tested, but the
+Version `0.6.0` is an alpha release. The runtime is usable and tested, but the
 public API may still evolve before `1.0.0`.
 
 ## What It Provides
@@ -51,7 +51,7 @@ specializing it for one workflow.
 From a tagged Git repository:
 
 ```bash
-python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.5.0"
+python -m pip install "agent-core @ git+https://github.com/maxDcb/agent-core.git@v0.6.0"
 ```
 
 For local development:
