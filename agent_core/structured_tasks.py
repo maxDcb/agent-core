@@ -57,12 +57,12 @@ from agent_core.tool_artifacts import (
     tool_artifact_scope,
 )
 from agent_core.tool_registry import ToolRegistry
-from agent_core.types import ToolExecutionStatus
+from agent_core.types import ToolExecutionStatus, ToolResult
 
 logger = get_logger(__name__)
 
 StructuredTaskCheckpointPhase = Literal["model_request", "tools", "finalization", "result"]
-StructuredToolCallStatus = Literal["prepared", "running", "completed", "budget_exhausted"]
+StructuredToolCallStatus = Literal["prepared", "running", "pending", "completed", "budget_exhausted"]
 StructuredFinalizationKind = Literal["contract", "budget"]
 StructuredResultKind = Literal["direct", "contract", "budget"]
 
@@ -318,6 +318,9 @@ class StructuredTaskResult:
     tool_calls_used: int = 0
     llm_calls: list[LLMCallRecord] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    pending: bool = False
+    pending_id: str | None = None
+    pending_tool_name: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -332,6 +335,9 @@ class StructuredTaskResult:
             "llm_calls": [call.to_dict() for call in self.llm_calls],
             "usage": LLMUsageSummary.from_calls(self.llm_calls).to_dict(),
             "metadata": dict(self.metadata),
+            "pending": self.pending,
+            "pending_id": self.pending_id,
+            "pending_tool_name": self.pending_tool_name,
         }
 
 
@@ -341,6 +347,8 @@ class StructuredToolCallCheckpoint:
     tool_name: str
     arguments_json: str
     status: StructuredToolCallStatus = "prepared"
+    pending_id: str | None = None
+    pending_metadata: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -348,6 +356,8 @@ class StructuredToolCallCheckpoint:
             "tool_name": self.tool_name,
             "arguments_json": self.arguments_json,
             "status": self.status,
+            "pending_id": self.pending_id,
+            "pending_metadata": dict(self.pending_metadata),
         }
 
     @classmethod
@@ -363,13 +373,16 @@ class StructuredToolCallCheckpoint:
         if not isinstance(arguments_json, str):
             arguments_json = "{}"
         normalized_status: StructuredToolCallStatus = (
-            status if status in {"prepared", "running", "completed", "budget_exhausted"} else "prepared"
+            status if status in {"prepared", "running", "pending", "completed", "budget_exhausted"} else "prepared"
         )
         return cls(
             tool_call_id=tool_call_id,
             tool_name=tool_name,
             arguments_json=arguments_json,
             status=normalized_status,
+            pending_id=payload.get("pending_id") if isinstance(payload.get("pending_id"), str) else None,
+            pending_metadata=dict(payload["pending_metadata"])
+            if isinstance(payload.get("pending_metadata"), dict) else {},
         )
 
 
@@ -649,6 +662,12 @@ class StructuredTaskRunner:
                 kind="invalid_checkpoint",
                 message="Structured task checkpoint has an invalid tool-call cursor.",
             )
+        for call in checkpoint.pending_tool_calls:
+            if call.status == "pending" and not call.pending_id:
+                raise StructuredTaskRecoveryError(
+                    kind="invalid_checkpoint",
+                    message="Structured task pending tool has no pending id.",
+                )
         if checkpoint.phase == "finalization" and checkpoint.finalization_kind is None:
             raise StructuredTaskRecoveryError(
                 kind="invalid_checkpoint",
@@ -807,6 +826,23 @@ class StructuredTaskRunner:
         checkpoint: StructuredTaskCheckpoint,
         on_checkpoint: Callable[[StructuredTaskCheckpoint], None] | None,
     ) -> StructuredTaskResult | None:
+        waiting = next(
+            (item for item in checkpoint.pending_tool_calls if item.status == "pending"),
+            None,
+        )
+        if waiting is not None:
+            return StructuredTaskResult(
+                ok=False,
+                task_id=spec.task_id,
+                tool_history=list(checkpoint.tool_history),
+                iterations=checkpoint.iterations,
+                tool_calls_used=checkpoint.tool_calls_used,
+                llm_calls=list(checkpoint.llm_calls),
+                metadata=dict(waiting.pending_metadata),
+                pending=True,
+                pending_id=waiting.pending_id,
+                pending_tool_name=waiting.tool_name,
+            )
         blocked = next(
             (item for item in checkpoint.pending_tool_calls if item.status == "running"),
             None,
@@ -887,7 +923,7 @@ class StructuredTaskRunner:
                     )
 
                 content_fits = artifact_content_fits
-            tool_message, history_item = self._execute_tool_call(
+            tool_message, history_item, pending_result = self._execute_tool_call(
                 registry=registry,
                 tool_name=tool_call.tool_name,
                 arguments_json=tool_call.arguments_json,
@@ -895,6 +931,28 @@ class StructuredTaskRunner:
                 context=context,
                 content_fits=content_fits,
             )
+            if pending_result is not None:
+                identity = f"{context.namespace_id}:{context.run_id}:{tool_call.tool_call_id}"
+                tool_call.pending_id = pending_result.pending_id or "pending-" + hashlib.sha256(
+                    identity.encode("utf-8")
+                ).hexdigest()
+                tool_call.pending_metadata = dict(pending_result.metadata)
+                tool_call.status = "pending"
+                self._emit_checkpoint(checkpoint, on_checkpoint)
+                return StructuredTaskResult(
+                    ok=False,
+                    task_id=spec.task_id,
+                    raw_content=pending_result.content,
+                    tool_history=list(checkpoint.tool_history),
+                    iterations=checkpoint.iterations,
+                    tool_calls_used=checkpoint.tool_calls_used,
+                    llm_calls=list(checkpoint.llm_calls),
+                    metadata=dict(pending_result.metadata),
+                    pending=True,
+                    pending_id=tool_call.pending_id,
+                    pending_tool_name=tool_call.tool_name,
+                )
+            assert tool_message is not None and history_item is not None
             checkpoint.messages.append(tool_message)
             checkpoint.tool_history.append(history_item)
             tool_call.status = "completed"
@@ -1506,7 +1564,7 @@ class StructuredTaskRunner:
         tool_call_id: str,
         context: ExecutionContext,
         content_fits: Callable[[str], bool] | None = None,
-    ) -> tuple[LLMMessage, dict[str, Any]]:
+    ) -> tuple[LLMMessage | None, dict[str, Any] | None, ToolResult | None]:
         artifact_runtime = active_tool_artifact_runtime()
         if artifact_runtime is None:
             raise RuntimeError("Tool artifact runtime is required during tool execution")
@@ -1556,6 +1614,8 @@ class StructuredTaskRunner:
                         if is_internal
                         else registry.execute(tool_name, arguments, context)
                     )
+                    if result.pending:
+                        return None, None, result
                     tool_content = result.content
                     result_metadata = dict(result.metadata)
                     tool_status = "ok" if result.ok else "tool_error"
@@ -1608,7 +1668,7 @@ class StructuredTaskRunner:
             history_item["artifact_read_context_limited"] = True
         if result_metadata.get("artifact_read_context_exhausted") is True:
             history_item["artifact_read_context_exhausted"] = True
-        return tool_message, history_item
+        return tool_message, history_item, None
 
     def _finalize_result(
         self,

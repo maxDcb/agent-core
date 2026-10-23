@@ -79,6 +79,7 @@ class AgentRunService:
                 if not self._checkpoint_matches_spec(state=existing, spec=spec):
                     raise ValueError(f"Run id is already bound to a different specification: {resolved_run_id}")
                 if existing.result is not None and existing.status in {
+                    "pending",
                     "completed",
                     "failed",
                     "cancelled",
@@ -202,7 +203,7 @@ class AgentRunService:
                     kind="spec_mismatch",
                     message="The structured task specification does not match the persisted run checkpoint.",
                 )
-            if state.result is not None and state.status in {"completed", "failed", "cancelled", "blocked"}:
+            if state.result is not None and state.status in {"pending", "completed", "failed", "cancelled", "blocked"}:
                 return state.result
 
             if state.status in {"running", "pending"}:
@@ -279,57 +280,110 @@ class AgentRunService:
             if pending.tool_call_id != tool_call_id or pending.status != "running":
                 raise ValueError(f"Tool call is not the ambiguous execution recorded by the run: {tool_call_id}")
 
-            try:
-                loaded_arguments = json.loads(pending.arguments_json or "{}")
-                arguments = loaded_arguments if isinstance(loaded_arguments, dict) else {}
-            except json.JSONDecodeError:
-                arguments = {}
-            status: ToolExecutionStatus = "ok" if result.ok else "tool_error"
-            artifact_runtime = ToolArtifactRuntime(
-                policy=checkpoint.tool_artifact_policy,
-                store=self.executor.artifact_store,
-                namespace_id=bound_context.namespace_id,
-                run_id=resolved_run_id,
-                usage=checkpoint.tool_artifact_usage,
+            self._commit_external_tool_result(
+                state=state, checkpoint=checkpoint, tool_call_id=tool_call_id,
+                result=result, reconciled=True,
             )
-            tool_message = artifact_runtime.externalize(
-                tool_name=pending.tool_name,
-                content=result.content,
-                tool_call_id=tool_call_id,
-                status=status,
-                metadata={
-                    "status": status,
-                    "reconciled_after_interruption": True,
-                },
-            )
-            checkpoint.messages.append(tool_message)
-            checkpoint.tool_artifact_usage = ToolArtifactUsage.from_any(artifact_runtime.usage)
-            history_item = {
-                "tool_name": pending.tool_name,
-                "arguments": arguments,
-                "status": status,
-                "content_preview": safe_preview(result.content, limit=500),
-                "reconciled_after_interruption": True,
-            }
-            descriptor = artifact_descriptor_from_message(tool_message)
-            if descriptor is not None:
-                history_item["artifact_id"] = descriptor.artifact_id
-            checkpoint.tool_history.append(history_item)
-            pending.status = "completed"
-            checkpoint.next_tool_call_index += 1
-            checkpoint.sequence += 1
-            state.checkpoint = RunCheckpoint(
-                kind="structured_task",
-                sequence=checkpoint.sequence,
-                payload=checkpoint.to_dict(),
-            )
-            state.result = None
-            state.error = None
             return self._start_or_resume_locked(
                 state=state,
                 spec=spec,
                 resume_checkpoint=checkpoint,
             )
+
+    def resume_pending_tool(
+        self,
+        *,
+        spec: StructuredTaskSpec,
+        context: RunContext,
+        run_id: str,
+        pending_id: str,
+        tool_content: str,
+        ok: bool = True,
+    ) -> AgentRunResult:
+        """Inject an external result into a deliberately pending structured tool call."""
+
+        resolved_run_id = run_id.strip()
+        bound_context = context.with_run_id(resolved_run_id)
+        with self.run_store.acquire_execution(namespace_id=bound_context.namespace_id, run_id=resolved_run_id):
+            state = self.run_store.load(namespace_id=bound_context.namespace_id, run_id=resolved_run_id)
+            if state is None:
+                raise KeyError(f"Unknown run: {resolved_run_id}")
+            self._validate_binding(state=state, spec=spec, context=bound_context)
+            if not self._checkpoint_matches_spec(state=state, spec=spec):
+                raise ValueError("Pending run checkpoint does not match the supplied specification")
+            if state.result is not None and state.status in {"completed", "failed", "cancelled", "blocked"}:
+                return state.result
+            if state.status != "pending" or state.checkpoint is None or state.checkpoint.kind != "structured_task":
+                raise ValueError(f"Run is not pending a structured tool result: {resolved_run_id}")
+            checkpoint = StructuredTaskCheckpoint.from_dict(state.checkpoint.payload)
+            if checkpoint is None or checkpoint.phase != "tools":
+                raise ValueError("Pending run has no valid structured-task checkpoint")
+            index = checkpoint.next_tool_call_index
+            if index >= len(checkpoint.pending_tool_calls):
+                raise ValueError("Pending run has no tool call to resume")
+            pending = checkpoint.pending_tool_calls[index]
+            if pending.status != "pending" or pending.pending_id != pending_id:
+                raise ValueError(f"Pending id does not match the structured tool call: {pending_id}")
+            self._commit_external_tool_result(
+                state=state, checkpoint=checkpoint, tool_call_id=pending.tool_call_id,
+                result=ToolResult(ok=ok, content=tool_content), reconciled=False,
+            )
+            return self._start_or_resume_locked(state=state, spec=spec, resume_checkpoint=checkpoint)
+
+    def _commit_external_tool_result(
+        self,
+        *,
+        state: AgentRunState,
+        checkpoint: StructuredTaskCheckpoint,
+        tool_call_id: str,
+        result: ToolResult,
+        reconciled: bool,
+    ) -> None:
+        pending = checkpoint.pending_tool_calls[checkpoint.next_tool_call_index]
+        try:
+            loaded_arguments = json.loads(pending.arguments_json or "{}")
+            arguments = loaded_arguments if isinstance(loaded_arguments, dict) else {}
+        except json.JSONDecodeError:
+            arguments = {}
+        status: ToolExecutionStatus = "ok" if result.ok else "tool_error"
+        artifact_runtime = ToolArtifactRuntime(
+            policy=checkpoint.tool_artifact_policy,
+            store=self.executor.artifact_store,
+            namespace_id=state.context.namespace_id,
+            run_id=state.run_id,
+            usage=checkpoint.tool_artifact_usage,
+        )
+        tool_message = artifact_runtime.externalize(
+            tool_name=pending.tool_name, content=result.content, tool_call_id=tool_call_id,
+            status=status,
+            metadata={"status": status, "reconciled_after_interruption": reconciled},
+        )
+        checkpoint.messages.append(tool_message)
+        checkpoint.tool_artifact_usage = ToolArtifactUsage.from_any(artifact_runtime.usage)
+        history_item = {
+            "tool_name": pending.tool_name,
+            "tool_call_id": tool_call_id,
+            "arguments": arguments,
+            "status": status,
+            "content_preview": safe_preview(result.content, limit=500),
+        }
+        if reconciled:
+            history_item["reconciled_after_interruption"] = True
+        descriptor = artifact_descriptor_from_message(tool_message)
+        if descriptor is not None:
+            history_item["artifact_id"] = descriptor.artifact_id
+        checkpoint.tool_history.append(history_item)
+        pending.status = "completed"
+        pending.pending_id = None
+        pending.pending_metadata = {}
+        checkpoint.next_tool_call_index += 1
+        checkpoint.sequence += 1
+        state.checkpoint = RunCheckpoint(
+            kind="structured_task", sequence=checkpoint.sequence, payload=checkpoint.to_dict(),
+        )
+        state.result = None
+        state.error = None
+        self.run_store.save(state)
 
     def _start_or_resume_locked(
         self,
@@ -339,7 +393,7 @@ class AgentRunService:
         resume_checkpoint: StructuredTaskCheckpoint | None,
     ) -> AgentRunResult:
         starting_new_run = state.status == "created"
-        if state.status in {"created", "interrupted", "blocked"}:
+        if state.status in {"created", "pending", "interrupted", "blocked"}:
             state.transition("running")
         attempt = AgentRunAttempt(
             attempt_id=f"attempt-{uuid4().hex}",
@@ -405,6 +459,27 @@ class AgentRunService:
         task_result: StructuredTaskResult,
         spec: StructuredTaskSpec,
     ) -> AgentRunResult:
+        if task_result.pending:
+            result = AgentRunResult(
+                run_id=state.run_id,
+                status="pending",
+                raw_content=task_result.raw_content,
+                tool_history=list(task_result.tool_history),
+                iterations=task_result.iterations,
+                tool_calls_used=task_result.tool_calls_used,
+                llm_calls=list(task_result.llm_calls),
+                metadata={
+                    **task_result.metadata,
+                    "spec_id": spec.task_id,
+                    "pending_id": task_result.pending_id,
+                    "tool_name": task_result.pending_tool_name,
+                },
+            )
+            state.result = result
+            attempt.finish("pending")
+            state.transition("pending")
+            self.run_store.save(state)
+            return result
         if task_result.ok:
             result = AgentRunResult(
                 run_id=state.run_id,

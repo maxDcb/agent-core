@@ -350,6 +350,27 @@ result = service.execute(
 )
 ```
 
+Structured tools may also return `ToolResult.pending_result(...)`. In that
+case `execute()` returns a persisted `pending` run without keeping a worker
+active. The host keeps the external correlation ID from the tool metadata and
+injects the eventual result with:
+
+```python
+completed = service.resume_pending_tool(
+    spec=spec,
+    context=context,
+    run_id=pending.run_id,
+    pending_id=pending.metadata["pending_id"],
+    tool_content="external result",
+    ok=True,
+)
+```
+
+The same pending result can be read after process restart. Repeating
+`resume_pending_tool()` after completion returns the stored result without
+executing the tool again. A tool interrupted before it returned `pending`
+still uses the existing ambiguous-effect recovery path.
+
 ## Run-Level LLM Budgets
 
 `LLMBudget` applies one shared budget to every model call made by a run,
