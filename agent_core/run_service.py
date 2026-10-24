@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections.abc import Callable
+from typing import Any
 from uuid import uuid4
 
 from agent_core.execution_context import ExecutionContext
@@ -360,7 +361,7 @@ class AgentRunService:
         )
         checkpoint.messages.append(tool_message)
         checkpoint.tool_artifact_usage = ToolArtifactUsage.from_any(artifact_runtime.usage)
-        history_item = {
+        history_item: dict[str, Any] = {
             "tool_name": pending.tool_name,
             "tool_call_id": tool_call_id,
             "arguments": arguments,
